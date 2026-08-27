@@ -1,0 +1,39 @@
+name: multica-test
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: multica
+      POSTGRES_USER: multica
+      POSTGRES_PASSWORD: multica
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U multica -d multica"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  test:
+    image: golang:1.26
+    working_dir: /workspace/server
+    volumes:
+      - .:/workspace
+    environment:
+      DATABASE_URL: postgres://multica:multica@postgres:5432/multica?sslmode=disable
+      REDIS_TEST_URL: redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >-
+      sh -c
+      "go run ./cmd/migrate up && bash ../scripts/test-go.sh --race"
