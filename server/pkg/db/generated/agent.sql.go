@@ -5122,6 +5122,8 @@ SELECT
     w.issue_prefix,
     i.number AS issue_number,
     i.title AS issue_title,
+    i.revision AS issue_revision,
+    COALESCE(sub.seen_revision, 0)::bigint AS seen_revision,
     a.name AS agent_name,
     atq.status,
     atq.created_at,
@@ -5130,6 +5132,8 @@ FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 JOIN workspace w ON w.id = i.workspace_id
 JOIN agent a ON a.id = atq.agent_id
+LEFT JOIN issue_context_subscription sub
+  ON sub.task_id = $3 AND sub.peer_issue_id = i.id
 WHERE i.parent_issue_id = $1
   AND i.workspace_id = $2
   AND atq.id <> $3
@@ -5156,6 +5160,8 @@ type ListActiveSiblingIssueTasksRow struct {
 	IssuePrefix string             `json:"issue_prefix"`
 	IssueNumber int32              `json:"issue_number"`
 	IssueTitle  string             `json:"issue_title"`
+	IssueRevision int64            `json:"issue_revision"`
+	SeenRevision int64             `json:"seen_revision"`
 	AgentName   string             `json:"agent_name"`
 	Status      string             `json:"status"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
@@ -5187,6 +5193,8 @@ func (q *Queries) ListActiveSiblingIssueTasks(ctx context.Context, arg ListActiv
 			&i.IssuePrefix,
 			&i.IssueNumber,
 			&i.IssueTitle,
+			&i.IssueRevision,
+			&i.SeenRevision,
 			&i.AgentName,
 			&i.Status,
 			&i.CreatedAt,
