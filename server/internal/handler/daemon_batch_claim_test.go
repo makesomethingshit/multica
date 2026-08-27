@@ -22,9 +22,31 @@ type batchClaimResponse struct {
 			TaskID          string `json:"task_id"`
 			IssueID         string `json:"issue_id"`
 			IssueIdentifier string `json:"issue_identifier"`
+			IssueTitle      string `json:"issue_title"`
+			AgentName       string `json:"agent_name"`
 			Status          string `json:"status"`
+			CreatedAt       string `json:"created_at"`
+			StartedAt       string `json:"started_at"`
 		} `json:"active_sibling_runs"`
 	} `json:"tasks"`
+}
+
+// insertClaimTestIssue inserts a test issue, optionally under the given parent
+// (non-nil for a sub-issue), and registers cleanup. Its number is drawn from the
+// workspace max so the unique-number constraint cannot trip on repeated runs.
+func insertClaimTestIssue(t *testing.T, ctx context.Context, title string, parentID *string) string {
+	t.Helper()
+	var id string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position, parent_issue_id)
+		VALUES ($1, $2, 'todo', 'none', $3, 'member',
+			(SELECT COALESCE(MAX(number), 82649) + 1 FROM issue WHERE workspace_id = $1), 0, $4)
+		RETURNING id
+	`, testWorkspaceID, title, testUserID, parentID).Scan(&id); err != nil {
+		t.Fatalf("insert issue %q: %v", title, err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, id) })
+	return id
 }
 
 func seedQueuedIssueTask(t *testing.T, ctx context.Context, agentID, runtimeID, issueID string) string {
@@ -36,6 +58,21 @@ func seedQueuedIssueTask(t *testing.T, ctx context.Context, agentID, runtimeID, 
 		RETURNING id
 	`, agentID, runtimeID, issueID).Scan(&id); err != nil {
 		t.Fatalf("seed queued task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, id) })
+	return id
+}
+
+func seedActiveIssueTask(t *testing.T, ctx context.Context, agentID, issueID, status, age string) string {
+	t.Helper()
+	var id string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, created_at, started_at)
+		VALUES ($1, (SELECT runtime_id FROM agent WHERE id = $1), $2, $3, 0,
+			now() - ($4::interval), now() - ($4::interval))
+		RETURNING id
+	`, agentID, issueID, status, age).Scan(&id); err != nil {
+		t.Fatalf("seed %s task: %v", status, err)
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, id) })
 	return id
@@ -101,37 +138,38 @@ func TestClaimTasksByRuntime_IncludesActiveSiblingRun(t *testing.T) {
 	}
 	ctx := context.Background()
 	runtimeID := createClaimReclaimRuntime(t, ctx, "Sibling claim runtime")
-	agentID, sourceIssueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Sibling claim agent")
+	agentID, _ := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Sibling claim agent")
 	if _, err := testPool.Exec(ctx, `UPDATE agent SET max_concurrent_tasks = 2 WHERE id = $1`, agentID); err != nil {
 		t.Fatalf("raise concurrency: %v", err)
 	}
-	insertRunningIssueTask(t, agentID, sourceIssueID)
+	peerAgentID := dbfx.Agent(t, "Sibling peer agent", runtimeID)
 
-	var targetIssueID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'sibling target', 'todo', 'none', $2, 'member',
-			(SELECT COALESCE(MAX(number), 82649) + 1 FROM issue WHERE workspace_id = $1), 0)
-		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&targetIssueID); err != nil {
-		t.Fatalf("create target issue: %v", err)
+	// Six active tasks under the same parent exercise cross-agent inclusion,
+	// status priority, newest-first ordering, and the five-result cap.
+	parentID := insertClaimTestIssue(t, ctx, "sibling parent", nil)
+	seeds := []struct {
+		title, status, age string
+	}{
+		{"running new", "running", "1 minute"},
+		{"running old", "running", "2 minutes"},
+		{"waiting new", "waiting_local_directory", "3 minutes"},
+		{"waiting old", "waiting_local_directory", "4 minutes"},
+		{"dispatched new", "dispatched", "5 minutes"},
+		{"dispatched old", "dispatched", "6 minutes"},
 	}
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, targetIssueID) })
+	for _, seed := range seeds {
+		issueID := insertClaimTestIssue(t, ctx, seed.title, &parentID)
+		seedActiveIssueTask(t, ctx, peerAgentID, issueID, seed.status, seed.age)
+	}
+	targetIssueID := insertClaimTestIssue(t, ctx, "sibling target", &parentID)
 	queuedID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, targetIssueID)
 
-	// A queued task cannot coordinate yet and must not dilute the warning. Seed
-	// it after the target so the deterministic claim order still picks queuedID.
-	var queuedSiblingIssueID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'queued sibling', 'todo', 'none', $2, 'member',
-			(SELECT COALESCE(MAX(number), 82649) + 1 FROM issue WHERE workspace_id = $1), 0)
-		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&queuedSiblingIssueID); err != nil {
-		t.Fatalf("create queued sibling issue: %v", err)
-	}
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, queuedSiblingIssueID) })
+	// Queued work and active work under another parent must both be excluded.
+	queuedSiblingIssueID := insertClaimTestIssue(t, ctx, "queued sibling", &parentID)
 	seedQueuedIssueTask(t, ctx, agentID, runtimeID, queuedSiblingIssueID)
+	otherParentID := insertClaimTestIssue(t, ctx, "other parent", nil)
+	otherIssueID := insertClaimTestIssue(t, ctx, "other parent's child", &otherParentID)
+	seedActiveIssueTask(t, ctx, peerAgentID, otherIssueID, "running", "30 seconds")
 
 	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 1)
 	if w.Code != http.StatusOK {
@@ -144,12 +182,54 @@ func TestClaimTasksByRuntime_IncludesActiveSiblingRun(t *testing.T) {
 	if len(resp.Tasks) != 1 || resp.Tasks[0].ID != queuedID {
 		t.Fatalf("claimed task = %+v, want %s", resp.Tasks, queuedID)
 	}
-	if len(resp.Tasks[0].ActiveSiblingRuns) != 1 {
-		t.Fatalf("active_sibling_runs = %+v, want one running sibling", resp.Tasks[0].ActiveSiblingRuns)
+	runs := resp.Tasks[0].ActiveSiblingRuns
+	if len(runs) != 5 {
+		t.Fatalf("active_sibling_runs = %+v, want five", runs)
 	}
-	sibling := resp.Tasks[0].ActiveSiblingRuns[0]
-	if sibling.IssueID != sourceIssueID || sibling.Status != "running" || sibling.IssueIdentifier == "" {
-		t.Fatalf("wrong sibling payload: %+v", sibling)
+	wantTitles := []string{"running new", "running old", "waiting new", "waiting old", "dispatched new"}
+	for i, run := range runs {
+		if run.IssueTitle != wantTitles[i] || run.AgentName != "Sibling peer agent" || run.TaskID == "" ||
+			run.IssueIdentifier == "" || run.CreatedAt == "" {
+			t.Fatalf("active_sibling_runs[%d] = %+v, want title %q with complete peer data", i, run, wantTitles[i])
+		}
+		if i < 2 && (run.Status != "running" || run.StartedAt == "") {
+			t.Fatalf("active_sibling_runs[%d] = %+v, want started running task", i, run)
+		}
+	}
+}
+
+// TestClaimTasksByRuntime_OmitsSiblingRunsForRootIssue pins that a top-level
+// (parentless) issue task does not surface peer awareness at all — there is no
+// same-parent cohort to reveal, so the read is skipped rather than warning
+// about an unrelated top-level issue.
+func TestClaimTasksByRuntime_OmitsSiblingRunsForRootIssue(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Root sibling runtime")
+	agentID, withSiblingRoot := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Root sibling agent")
+	if _, err := testPool.Exec(ctx, `UPDATE agent SET max_concurrent_tasks = 2 WHERE id = $1`, agentID); err != nil {
+		t.Fatalf("raise concurrency: %v", err)
+	}
+	// A running task on a DIFFERENT top-level issue for the same agent.
+	insertRunningIssueTask(t, agentID, withSiblingRoot)
+	targetRootID := insertClaimTestIssue(t, ctx, "root target", nil)
+	queuedID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, targetRootID)
+
+	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 1)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp batchClaimResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tasks) != 1 || resp.Tasks[0].ID != queuedID {
+		t.Fatalf("claimed task = %+v, want %s", resp.Tasks, queuedID)
+	}
+	if len(resp.Tasks[0].ActiveSiblingRuns) != 0 {
+		t.Fatalf("active_sibling_runs = %+v, want none for a root issue task", resp.Tasks[0].ActiveSiblingRuns)
 	}
 }
 

@@ -62,7 +62,7 @@ func backendResumeContinuityNotice(task Task) string {
 // Returns "" when none of the blocks apply.
 func perTurnContextBlocks(task Task, opts promptOpts) string {
 	var b strings.Builder
-	b.WriteString(buildActiveSiblingRunsBlock(task.IssueID, task.ActiveSiblingRuns))
+	b.WriteString(buildActivePeerRunsBlock(task))
 	b.WriteString(buildSharedLocalDirectoryBlock(opts.sharedLocalDirectory))
 	if task.PriorSessionResumeUnavailable {
 		b.WriteString(sessionContinuityNoticeFor(task))
@@ -109,20 +109,19 @@ func buildSharedLocalDirectoryBlock(shared bool) string {
 	return b.String()
 }
 
-func buildActiveSiblingRunsBlock(currentIssueID string, runs []ActiveSiblingRunData) string {
+func buildActivePeerRunsBlock(task Task) string {
 	// Sibling issue work is useful context only for another issue task. Chat,
-	// autopilot, and quick-create tasks have no current target issue whose claim
-	// history they could inspect, so rendering this block there creates an
-	// unactionable warning.
-	if currentIssueID == "" || len(runs) == 0 {
+	// autopilot, and quick-create tasks can carry an IssueID for compatibility,
+	// so their task-kind markers must suppress this issue-only guidance.
+	if task.IssueID == "" || task.ChatSessionID != "" || task.AutopilotRunID != "" || task.QuickCreatePrompt != "" || len(task.ActiveSiblingRuns) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("## Active sibling runs\n\n")
-	b.WriteString("This agent has other in-flight issue tasks. Before starting overlapping code or PR work, check this issue's comment history for a claim or handoff")
-	fmt.Fprintf(&b, " (`multica issue comment list %s --roots-only --summary --compact --output json`)", currentIssueID)
+	b.WriteString("## Active peer runs\n\n")
+	b.WriteString("This parent has other in-flight issue tasks. Before starting overlapping code or PR work, check this issue's comment history for a claim or handoff")
+	fmt.Fprintf(&b, " (`multica issue comment list %s --roots-only --summary --compact --output json`)", task.IssueID)
 	b.WriteString(" and inspect relevant siblings with the `run-messages` commands below — coordinate with existing work instead of opening a second PR. For writes that only record ownership or status of work already underway, use `--no-start` on `multica issue assign`/`update`/`status`.\n\n")
-	for _, run := range runs {
+	for _, run := range task.ActiveSiblingRuns {
 		issueLabel := run.IssueIdentifier
 		if issueLabel == "" {
 			issueLabel = run.IssueID
@@ -132,6 +131,9 @@ func buildActiveSiblingRunsBlock(currentIssueID string, runs []ActiveSiblingRunD
 			fmt.Fprintf(&b, ", started %s", run.StartedAt)
 		} else if run.CreatedAt != "" {
 			fmt.Fprintf(&b, ", created %s", run.CreatedAt)
+		}
+		if run.AgentName != "" {
+			fmt.Fprintf(&b, ", agent `%s`", run.AgentName)
 		}
 		title := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(run.IssueTitle))
 		if title != "" {

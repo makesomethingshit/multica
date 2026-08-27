@@ -1979,6 +1979,12 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
 	var issueNumber int32
+	// Active-peer awareness is scoped to issue tasks whose issue sits under a
+	// parent (a sub-issue). Root issues, chat, autopilot and quick-create tasks
+	// have no same-parent cohort to reveal, so the peer query is skipped for
+	// them — both to avoid a wasteful read and, more importantly, to keep the
+	// prompt from warning about an unrelated top-level issue task.
+	var issueParentID pgtype.UUID
 	// Claim-only capability: this server resolves the squad-leader role on the
 	// wire (is_leader_task / squad_id), so the daemon must not re-derive it
 	// from the briefing text. Set unconditionally — on every claim, leader or
@@ -2241,6 +2247,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		}
 		resp.ThreadName = issue.Title
 		issueNumber = issue.Number
+		issueParentID = issue.ParentIssueID
 
 		// Squad-leader briefing injection: keyed off the task being a
 		// leader-task (is_leader_task) carrying a squad_id — NOT off the
@@ -3014,35 +3021,40 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, failure
 	}
 
-	// Surface a bounded snapshot of the same agent's other in-flight issue
-	// tasks. Queued tasks cannot coordinate yet and are intentionally omitted.
+	// Surface a bounded snapshot of in-flight tasks on sibling issues. Queued
+	// tasks cannot coordinate yet and are intentionally omitted.
 	// This is advisory context, not a queue gate: cross-issue parallelism and
 	// serial handoffs remain valid, while the prompt can stop an unaware second
 	// run from opening a duplicate PR. Scope the query to the already-validated
-	// runtime workspace so corrupt cross-tenant task links never leak.
-	if siblings, err := h.Queries.ListActiveSiblingIssueTasks(r.Context(), db.ListActiveSiblingIssueTasksParams{
-		AgentID:     task.AgentID,
-		TaskID:      task.ID,
-		WorkspaceID: parseUUID(resp.WorkspaceID),
-	}); err == nil {
-		resp.ActiveSiblingRuns = make([]ActiveSiblingRunData, 0, len(siblings))
-		for _, sibling := range siblings {
-			resp.ActiveSiblingRuns = append(resp.ActiveSiblingRuns, ActiveSiblingRunData{
-				TaskID:          uuidToString(sibling.TaskID),
-				IssueID:         uuidToString(sibling.IssueID),
-				IssueIdentifier: fmt.Sprintf("%s-%d", sibling.IssuePrefix, sibling.IssueNumber),
-				IssueTitle:      sibling.IssueTitle,
-				Status:          sibling.Status,
-				CreatedAt:       timestampToString(sibling.CreatedAt),
-				StartedAt:       timestampToString(sibling.StartedAt),
-			})
+	// runtime workspace so corrupt cross-tenant task links never leak. Only
+	// sub-issue tasks qualify — a root issue, chat, autopilot
+	// or quick-create task has no same-parent cohort, so we skip the read.
+	if issueParentID.Valid {
+		if siblings, err := h.Queries.ListActiveSiblingIssueTasks(r.Context(), db.ListActiveSiblingIssueTasksParams{
+			ParentIssueID: issueParentID,
+			WorkspaceID:   parseUUID(resp.WorkspaceID),
+			TaskID:        task.ID,
+		}); err == nil {
+			resp.ActiveSiblingRuns = make([]ActiveSiblingRunData, 0, len(siblings))
+			for _, sibling := range siblings {
+				resp.ActiveSiblingRuns = append(resp.ActiveSiblingRuns, ActiveSiblingRunData{
+					TaskID:          uuidToString(sibling.TaskID),
+					IssueID:         uuidToString(sibling.IssueID),
+					IssueIdentifier: fmt.Sprintf("%s-%d", sibling.IssuePrefix, sibling.IssueNumber),
+					IssueTitle:      sibling.IssueTitle,
+					AgentName:       sibling.AgentName,
+					Status:          sibling.Status,
+					CreatedAt:       timestampToString(sibling.CreatedAt),
+					StartedAt:       timestampToString(sibling.StartedAt),
+				})
+			}
+		} else {
+			slog.Warn("task claim: failed to load active sibling runs",
+				"task_id", uuidToString(task.ID),
+				"agent_id", uuidToString(task.AgentID),
+				"error", err,
+			)
 		}
-	} else {
-		slog.Warn("task claim: failed to load active sibling runs",
-			"task_id", uuidToString(task.ID),
-			"agent_id", uuidToString(task.AgentID),
-			"error", err,
-		)
 	}
 
 	// Workspace-level Context (workspace.context DB column) — the per-workspace
