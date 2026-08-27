@@ -45,6 +45,9 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create subscription: %v", err)
 	}
+	if rows, err := testHandler.Queries.ListIssueContextSubscriptions(ctx, sourceTask); err != nil || len(rows) != 1 || rows[0].PeerIssueID != peerIssue {
+		t.Fatalf("list subscriptions = (%v, %v), want one peer row", rows, err)
+	}
 
 	t.Run("claim does not mark seen", func(t *testing.T) {
 		rows, err := testHandler.Queries.ListActiveSiblingIssueTasks(ctx, db.ListActiveSiblingIssueTasksParams{
@@ -65,19 +68,19 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		req := newRequest(http.MethodGet, "/api/tasks/"+peerTaskID+"/messages", nil)
 		req.Header.Set("X-Actor-Source", "task_token")
 		req.Header.Set("X-Task-ID", sourceTaskID)
-	req = withURLParam(req, "taskId", peerTaskID)
-	req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
-	w := httptest.NewRecorder()
-	testHandler.ListTaskMessagesByUser(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("peer context lookup status = %d: %s", w.Code, w.Body.String())
-	}
+		req = withURLParam(req, "taskId", peerTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("peer context lookup status = %d: %s", w.Code, w.Body.String())
+		}
 
-	var seen, revision int64
-	dbfx.QueryRow(t, `SELECT s.seen_revision, i.revision FROM issue_context_subscription s JOIN issue i ON i.id = s.peer_issue_id WHERE s.task_id = $1 AND s.peer_issue_id = $2`, sourceTaskID, peerIssueID).Scan(&seen, &revision)
-	if seen != revision || seen == 0 {
-		t.Fatalf("seen_revision = %d, issue revision = %d", seen, revision)
-	}
+		var seen, revision int64
+		dbfx.QueryRow(t, `SELECT s.seen_revision, i.revision FROM issue_context_subscription s JOIN issue i ON i.id = s.peer_issue_id WHERE s.task_id = $1 AND s.peer_issue_id = $2`, sourceTaskID, peerIssueID).Scan(&seen, &revision)
+		if seen != revision || seen == 0 {
+			t.Fatalf("seen_revision = %d, issue revision = %d", seen, revision)
+		}
 	})
 
 	t.Run("cross workspace create is 404-equivalent", func(t *testing.T) {
@@ -106,11 +109,11 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		req.Header.Set("X-Task-ID", sourceTaskID)
 		req = withURLParam(req, "taskId", peerTaskID)
 		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
-	w := httptest.NewRecorder()
-	testHandler.ListTaskMessagesByUser(w, req)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("seen write failure status = %d, want 500: %s", w.Code, w.Body.String())
-	}
+		w := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("seen write failure status = %d, want 500: %s", w.Code, w.Body.String())
+		}
 	})
 
 	t.Run("delete removes subscription", func(t *testing.T) {
