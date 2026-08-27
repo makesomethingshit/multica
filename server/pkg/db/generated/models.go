@@ -778,6 +778,14 @@ type Issue struct {
 	LastActivityAt     pgtype.Timestamptz `json:"last_activity_at"`
 }
 
+type IssueContextSubscription struct {
+	TaskID       pgtype.UUID        `json:"task_id"`
+	PeerIssueID  pgtype.UUID        `json:"peer_issue_id"`
+	SeenRevision int64              `json:"seen_revision"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
 type IssueDependency struct {
 	ID               pgtype.UUID `json:"id"`
 	IssueID          pgtype.UUID `json:"issue_id"`
