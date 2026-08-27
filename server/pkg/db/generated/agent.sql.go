@@ -5122,15 +5122,17 @@ SELECT
     w.issue_prefix,
     i.number AS issue_number,
     i.title AS issue_title,
+    a.name AS agent_name,
     atq.status,
     atq.created_at,
     atq.started_at
 FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 JOIN workspace w ON w.id = i.workspace_id
-WHERE atq.agent_id = $1
-  AND atq.id <> $2
-  AND i.workspace_id = $3
+JOIN agent a ON a.id = atq.agent_id
+WHERE i.parent_issue_id = $1
+  AND i.workspace_id = $2
+  AND atq.id <> $3
   AND atq.status IN ('dispatched', 'running', 'waiting_local_directory')
 ORDER BY
     CASE atq.status
@@ -5143,29 +5145,35 @@ LIMIT 5
 `
 
 type ListActiveSiblingIssueTasksParams struct {
-	AgentID     pgtype.UUID `json:"agent_id"`
-	TaskID      pgtype.UUID `json:"task_id"`
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ParentIssueID pgtype.UUID `json:"parent_issue_id"`
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	TaskID        pgtype.UUID `json:"task_id"`
 }
 
 type ListActiveSiblingIssueTasksRow struct {
-	TaskID      pgtype.UUID        `json:"task_id"`
-	IssueID     pgtype.UUID        `json:"issue_id"`
-	IssuePrefix string             `json:"issue_prefix"`
-	IssueNumber int32              `json:"issue_number"`
-	IssueTitle  string             `json:"issue_title"`
-	Status      string             `json:"status"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	TaskID        pgtype.UUID        `json:"task_id"`
+	IssueID       pgtype.UUID        `json:"issue_id"`
+	IssuePrefix   string             `json:"issue_prefix"`
+	IssueNumber   int32              `json:"issue_number"`
+	IssueTitle    string             `json:"issue_title"`
+	AgentName     string             `json:"agent_name"`
+	Status        string             `json:"status"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
 }
 
-// Claim-time context for agents that can work concurrently. Only tasks already
-// handed to a runtime can coordinate with the new claim; queued work is omitted
-// so the warning stays high-signal. Bounded so one heavily-used agent cannot
-// inflate every claim payload; issue-bound rows carry a concrete run-messages
-// lookup target.
+// Claim-time peer awareness for a child issue task. Only tasks whose issue
+// shares the SAME non-null parent_issue_id and the SAME workspace count, and
+// the agent may differ — a newly claimed child run should see sibling work
+// already underway across the workspace instead of duplicating code or PRs.
+// Already-handed-to-a-runtime statuses only (running / waiting_local_directory /
+// dispatched); queued work cannot coordinate yet and is omitted so the warning
+// stays high-signal. Bounded to 5 with running → waiting → dispatched priority,
+// newest first. The caller invokes this only when the claimed task's issue has a
+// non-null parent, so root issues and other parents are naturally excluded;
+// issue-bound rows carry a concrete run-messages lookup target.
 func (q *Queries) ListActiveSiblingIssueTasks(ctx context.Context, arg ListActiveSiblingIssueTasksParams) ([]ListActiveSiblingIssueTasksRow, error) {
-	rows, err := q.db.Query(ctx, listActiveSiblingIssueTasks, arg.AgentID, arg.TaskID, arg.WorkspaceID)
+	rows, err := q.db.Query(ctx, listActiveSiblingIssueTasks, arg.ParentIssueID, arg.WorkspaceID, arg.TaskID)
 	if err != nil {
 		return nil, err
 	}
@@ -5179,6 +5187,7 @@ func (q *Queries) ListActiveSiblingIssueTasks(ctx context.Context, arg ListActiv
 			&i.IssuePrefix,
 			&i.IssueNumber,
 			&i.IssueTitle,
+			&i.AgentName,
 			&i.Status,
 			&i.CreatedAt,
 			&i.StartedAt,
