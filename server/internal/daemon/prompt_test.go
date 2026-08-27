@@ -1076,14 +1076,16 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 			IssueID:         "issue-source",
 			IssueIdentifier: "MUL-6000",
 			IssueTitle:      "Existing work",
+			AgentName:       "Peer agent",
 			Status:          "running",
 			StartedAt:       "2026-08-14T03:00:00Z",
 		}},
 	}
 	out := BuildPrompt(task, "claude")
 	for _, want := range []string{
-		"Active sibling runs",
+		"Active peer runs",
 		"MUL-6000",
+		"Peer agent",
 		"task-existing",
 		"multica issue comment list issue-target --roots-only --summary --compact --output json",
 		"multica issue run-messages task-existing",
@@ -1112,8 +1114,21 @@ func TestBuildPromptOmitsActiveSiblingRunsForChatTask(t *testing.T) {
 		}},
 	}
 	out := BuildPrompt(task, "claude")
-	if strings.Contains(out, "Active sibling runs") || strings.Contains(out, "task-existing") {
+	if strings.Contains(out, "Active peer runs") || strings.Contains(out, "task-existing") {
 		t.Errorf("chat prompt must not include issue sibling guidance\n--- output ---\n%s", out)
+	}
+}
+
+func TestBuildPromptOmitsActivePeerRunsForNonIssueTasks(t *testing.T) {
+	peer := []ActiveSiblingRunData{{TaskID: "task-existing", IssueID: "issue-source", Status: "running"}}
+	for _, task := range []Task{
+		{IssueID: "compat-issue", ChatSessionID: "chat-1", ActiveSiblingRuns: peer},
+		{IssueID: "compat-issue", AutopilotRunID: "autopilot-1", ActiveSiblingRuns: peer},
+		{IssueID: "compat-issue", QuickCreatePrompt: "create an issue", ActiveSiblingRuns: peer},
+	} {
+		if out := BuildPrompt(task, "claude"); strings.Contains(out, "Active peer runs") || strings.Contains(out, "task-existing") {
+			t.Errorf("non-issue prompt leaked peer guidance: %+v\n--- output ---\n%s", task, out)
+		}
 	}
 }
 
