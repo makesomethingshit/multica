@@ -4974,8 +4974,12 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	if r.Header.Get("X-Actor-Source") == "task_token" {
 		if sourceID, err := uuid.Parse(r.Header.Get("X-Task-ID")); err == nil && sourceID != taskUUID && task.IssueID.Valid {
 			if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{TaskID: sourceID, PeerIssueID: task.IssueID}); markErr != nil {
-				if errors.Is(markErr, pgx.ErrNoRows) { writeError(w, http.StatusNotFound, "peer context not found"); return }
-				slog.Warn("mark peer context seen failed", "task_id", sourceID, "peer_issue_id", task.IssueID, "error", markErr)
+				if errors.Is(markErr, pgx.ErrNoRows) {
+					writeError(w, http.StatusNotFound, "peer context not found")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
+				return
 			}
 		}
 	}
