@@ -326,6 +326,7 @@ type ActiveSiblingRunData struct {
 	IssueID         string `json:"issue_id"`
 	IssueIdentifier string `json:"issue_identifier"`
 	IssueTitle      string `json:"issue_title"`
+	AgentName       string `json:"agent_name"`
 	Status          string `json:"status"`
 	CreatedAt       string `json:"created_at"`
 	StartedAt       string `json:"started_at,omitempty"`
