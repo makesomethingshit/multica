@@ -28,7 +28,8 @@ func TestTaskTokenTaskMessagesWorkspaceBoundary(t *testing.T) {
 	seedTaskMessage(t, taskB, "sibling transcript")
 
 	foreignWorkspace := seedTaskMessageWorkspace(t)
-	_, foreignTask := seedTaskMessageTask(t, foreignWorkspace, agentA, "foreign workspace task")
+	foreignAgent := seedTaskMessageAgent(t, foreignWorkspace)
+	_, foreignTask := seedTaskMessageTask(t, foreignWorkspace, foreignAgent, "foreign workspace task")
 	seedTaskMessage(t, foreignTask, "foreign transcript")
 
 	token, err := auth.GenerateAgentTaskToken()
@@ -123,8 +124,8 @@ func seedTaskMessageTask(t *testing.T, workspaceID, agentID, title string) (stri
 		t.Fatalf("seed issue: %v", err)
 	}
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, issue_id, status)
-		VALUES ($1, $2, 'running')
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, started_at)
+		SELECT id, runtime_id, $2, 'running', now() FROM agent WHERE id = $1
 		RETURNING id
 	`, agentID, issueID).Scan(&taskID); err != nil {
 		t.Fatalf("seed task: %v", err)
@@ -133,6 +134,31 @@ func seedTaskMessageTask(t *testing.T, workspaceID, agentID, title string) (stri
 		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
 	})
 	return issueID, taskID
+}
+
+func seedTaskMessageAgent(t *testing.T, workspaceID string) string {
+	t.Helper()
+	ctx := context.Background()
+	var runtimeID, agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (workspace_id, name, runtime_mode, provider, status, device_info, metadata, owner_id, last_seen_at)
+		VALUES ($1, $2, 'cloud', 'task-message-boundary', 'online', '', '{}'::jsonb, $3, now())
+		RETURNING id
+	`, workspaceID, uniqueName("task-message-boundary-runtime"), testUserID).Scan(&runtimeID); err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (workspace_id, name, description, runtime_mode, runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id)
+		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'workspace', 1, $4)
+		RETURNING id
+	`, workspaceID, uniqueName("task-message-boundary-agent"), runtimeID, testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, runtimeID)
+	})
+	return agentID
 }
 
 func seedTaskMessage(t *testing.T, taskID, content string) {

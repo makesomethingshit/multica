@@ -5210,15 +5210,15 @@ type ListActiveSiblingIssueTasksParams struct {
 }
 
 type ListActiveSiblingIssueTasksRow struct {
-	TaskID        pgtype.UUID        `json:"task_id"`
-	IssueID       pgtype.UUID        `json:"issue_id"`
-	IssuePrefix   string             `json:"issue_prefix"`
-	IssueNumber   int32              `json:"issue_number"`
-	IssueTitle    string             `json:"issue_title"`
-	AgentName     string             `json:"agent_name"`
-	Status        string             `json:"status"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	TaskID      pgtype.UUID        `json:"task_id"`
+	IssueID     pgtype.UUID        `json:"issue_id"`
+	IssuePrefix string             `json:"issue_prefix"`
+	IssueNumber int32              `json:"issue_number"`
+	IssueTitle  string             `json:"issue_title"`
+	AgentName   string             `json:"agent_name"`
+	Status      string             `json:"status"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
 }
 
 // Claim-time peer awareness for a child issue task. Only tasks whose issue

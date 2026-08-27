@@ -118,7 +118,7 @@ func buildActivePeerRunsBlock(task Task) string {
 	}
 	var b strings.Builder
 	b.WriteString("## Active peer runs\n\n")
-	b.WriteString("This agent has other in-flight issue tasks. Before starting overlapping code or PR work, check this issue's comment history for a claim or handoff")
+	b.WriteString("This parent has other in-flight issue tasks. Before starting overlapping code or PR work, check this issue's comment history for a claim or handoff")
 	fmt.Fprintf(&b, " (`multica issue comment list %s --roots-only --summary --compact --output json`)", task.IssueID)
 	b.WriteString(" and inspect relevant siblings with the `run-messages` commands below — coordinate with existing work instead of opening a second PR. For writes that only record ownership or status of work already underway, use `--no-start` on `multica issue assign`/`update`/`status`.\n\n")
 	for _, run := range task.ActiveSiblingRuns {

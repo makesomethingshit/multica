@@ -63,6 +63,21 @@ func seedQueuedIssueTask(t *testing.T, ctx context.Context, agentID, runtimeID, 
 	return id
 }
 
+func seedActiveIssueTask(t *testing.T, ctx context.Context, agentID, issueID, status, age string) string {
+	t.Helper()
+	var id string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, created_at, started_at)
+		VALUES ($1, (SELECT runtime_id FROM agent WHERE id = $1), $2, $3, 0,
+			now() - ($4::interval), now() - ($4::interval))
+		RETURNING id
+	`, agentID, issueID, status, age).Scan(&id); err != nil {
+		t.Fatalf("seed %s task: %v", status, err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, id) })
+	return id
+}
+
 func postBatchClaim(t *testing.T, workspaceID string, runtimeIDs []string, maxTasks int) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
@@ -127,19 +142,34 @@ func TestClaimTasksByRuntime_IncludesActiveSiblingRun(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE agent SET max_concurrent_tasks = 2 WHERE id = $1`, agentID); err != nil {
 		t.Fatalf("raise concurrency: %v", err)
 	}
+	peerAgentID := dbfx.Agent(t, "Sibling peer agent", runtimeID)
 
-	// A shared parent makes the two tasks true siblings: only a sub-issue task
-	// claims peer awareness, and only peers under the SAME parent are relevant.
+	// Six active tasks under the same parent exercise cross-agent inclusion,
+	// status priority, newest-first ordering, and the five-result cap.
 	parentID := insertClaimTestIssue(t, ctx, "sibling parent", nil)
-	sourceIssueID := insertClaimTestIssue(t, ctx, "sibling source", &parentID)
-	insertRunningIssueTask(t, agentID, sourceIssueID)
+	seeds := []struct {
+		title, status, age string
+	}{
+		{"running new", "running", "1 minute"},
+		{"running old", "running", "2 minutes"},
+		{"waiting new", "waiting_local_directory", "3 minutes"},
+		{"waiting old", "waiting_local_directory", "4 minutes"},
+		{"dispatched new", "dispatched", "5 minutes"},
+		{"dispatched old", "dispatched", "6 minutes"},
+	}
+	for _, seed := range seeds {
+		issueID := insertClaimTestIssue(t, ctx, seed.title, &parentID)
+		seedActiveIssueTask(t, ctx, peerAgentID, issueID, seed.status, seed.age)
+	}
 	targetIssueID := insertClaimTestIssue(t, ctx, "sibling target", &parentID)
 	queuedID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, targetIssueID)
 
-	// A queued task cannot coordinate yet and must not dilute the warning. Seed
-	// it after the target so the deterministic claim order still picks queuedID.
+	// Queued work and active work under another parent must both be excluded.
 	queuedSiblingIssueID := insertClaimTestIssue(t, ctx, "queued sibling", &parentID)
 	seedQueuedIssueTask(t, ctx, agentID, runtimeID, queuedSiblingIssueID)
+	otherParentID := insertClaimTestIssue(t, ctx, "other parent", nil)
+	otherIssueID := insertClaimTestIssue(t, ctx, "other parent's child", &otherParentID)
+	seedActiveIssueTask(t, ctx, peerAgentID, otherIssueID, "running", "30 seconds")
 
 	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 1)
 	if w.Code != http.StatusOK {
@@ -152,17 +182,19 @@ func TestClaimTasksByRuntime_IncludesActiveSiblingRun(t *testing.T) {
 	if len(resp.Tasks) != 1 || resp.Tasks[0].ID != queuedID {
 		t.Fatalf("claimed task = %+v, want %s", resp.Tasks, queuedID)
 	}
-	if len(resp.Tasks[0].ActiveSiblingRuns) != 1 {
-		t.Fatalf("active_sibling_runs = %+v, want one running sibling", resp.Tasks[0].ActiveSiblingRuns)
+	runs := resp.Tasks[0].ActiveSiblingRuns
+	if len(runs) != 5 {
+		t.Fatalf("active_sibling_runs = %+v, want five", runs)
 	}
-	sibling := resp.Tasks[0].ActiveSiblingRuns[0]
-	if sibling.IssueID != sourceIssueID || sibling.Status != "running" || sibling.IssueIdentifier == "" {
-		t.Fatalf("wrong sibling payload: %+v", sibling)
-	}
-	// The wire contract carries every field the prompt resolves a sibling by.
-	if sibling.TaskID == "" || sibling.IssueTitle != "sibling source" || sibling.AgentName == "" ||
-		sibling.CreatedAt == "" {
-		t.Fatalf("incomplete sibling payload: %+v", sibling)
+	wantTitles := []string{"running new", "running old", "waiting new", "waiting old", "dispatched new"}
+	for i, run := range runs {
+		if run.IssueTitle != wantTitles[i] || run.AgentName != "Sibling peer agent" || run.TaskID == "" ||
+			run.IssueIdentifier == "" || run.CreatedAt == "" {
+			t.Fatalf("active_sibling_runs[%d] = %+v, want title %q with complete peer data", i, run, wantTitles[i])
+		}
+		if i < 2 && (run.Status != "running" || run.StartedAt == "") {
+			t.Fatalf("active_sibling_runs[%d] = %+v, want started running task", i, run)
+		}
 	}
 }
 
