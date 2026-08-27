@@ -63,6 +63,9 @@ type ActiveSiblingRunData struct {
 	IssueID         string `json:"issue_id"`
 	IssueIdentifier string `json:"issue_identifier"`
 	IssueTitle      string `json:"issue_title"`
+	IssueRevision   int64  `json:"issue_revision"`
+	Revision        int64  `json:"revision"`
+	SeenRevision    int64  `json:"seen_revision"`
 	AgentName       string `json:"agent_name"`
 	Status          string `json:"status"`
 	CreatedAt       string `json:"created_at"`

@@ -295,6 +295,8 @@ SELECT
     w.issue_prefix,
     i.number AS issue_number,
     i.title AS issue_title,
+    i.revision AS issue_revision,
+    COALESCE(sub.seen_revision, 0)::bigint AS seen_revision,
     a.name AS agent_name,
     atq.status,
     atq.created_at,
@@ -303,6 +305,8 @@ FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 JOIN workspace w ON w.id = i.workspace_id
 JOIN agent a ON a.id = atq.agent_id
+LEFT JOIN issue_context_subscription sub
+  ON sub.task_id = @task_id AND sub.peer_issue_id = i.id
 WHERE i.parent_issue_id = @parent_issue_id
   AND i.workspace_id = @workspace_id
   AND atq.id <> @task_id

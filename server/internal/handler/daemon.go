@@ -3042,6 +3042,9 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					IssueID:         uuidToString(sibling.IssueID),
 					IssueIdentifier: fmt.Sprintf("%s-%d", sibling.IssuePrefix, sibling.IssueNumber),
 					IssueTitle:      sibling.IssueTitle,
+					IssueRevision:   sibling.IssueRevision,
+					Revision:        sibling.IssueRevision,
+					SeenRevision:    sibling.SeenRevision,
 					AgentName:       sibling.AgentName,
 					Status:          sibling.Status,
 					CreatedAt:       timestampToString(sibling.CreatedAt),
@@ -4965,6 +4968,21 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	}
 
 	issueID := uuidToString(task.IssueID)
+	// A running agent may explicitly inspect a sibling run from the claim
+	// prompt. Record that read only after the messages lookup succeeded; claim
+	// itself never advances this cursor.
+	if r.Header.Get("X-Actor-Source") == "task_token" {
+		if sourceID, err := uuid.Parse(r.Header.Get("X-Task-ID")); err == nil && sourceID != taskUUID && task.IssueID.Valid {
+			if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{TaskID: sourceID, PeerIssueID: task.IssueID}); markErr != nil {
+				if errors.Is(markErr, pgx.ErrNoRows) {
+					writeError(w, http.StatusNotFound, "peer context not found")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
+				return
+			}
+		}
+	}
 
 	resp := make([]protocol.TaskMessagePayload, len(messages))
 	for i, m := range messages {
@@ -4972,6 +4990,110 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+type issueContextSubscriptionRequest struct {
+	PeerIssueID string `json:"peer_issue_id"`
+}
+
+type issueContextSubscriptionResponse struct {
+	TaskID       string `json:"task_id"`
+	PeerIssueID  string `json:"peer_issue_id"`
+	SeenRevision int64  `json:"seen_revision"`
+	Revision     int64  `json:"revision"`
+}
+
+func (h *Handler) issueContextSubscriptionTask(w http.ResponseWriter, r *http.Request) (db.AgentTaskQueue, pgtype.UUID, bool) {
+	taskID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "taskId"), "task_id")
+	if !ok {
+		return db.AgentTaskQueue{}, pgtype.UUID{}, false
+	}
+	task, err := h.Queries.GetAgentTask(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return db.AgentTaskQueue{}, pgtype.UUID{}, false
+	}
+	wsID := h.TaskService.ResolveTaskWorkspaceID(r.Context(), task)
+	if wsID == "" || wsID != middleware.WorkspaceIDFromContext(r.Context()) {
+		writeError(w, http.StatusNotFound, "task not found")
+		return db.AgentTaskQueue{}, pgtype.UUID{}, false
+	}
+	if r.Header.Get("X-Actor-Source") == "task_token" && r.Header.Get("X-Task-ID") != uuidToString(task.ID) {
+		writeError(w, http.StatusNotFound, "task not found")
+		return db.AgentTaskQueue{}, pgtype.UUID{}, false
+	}
+	return task, taskID, true
+}
+
+// ListIssueContextSubscriptions returns the task's explicit peer subscriptions.
+func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.Request) {
+	_, taskID, ok := h.issueContextSubscriptionTask(w, r)
+	if !ok {
+		return
+	}
+	rows, err := h.Queries.ListIssueContextSubscriptions(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list peer subscriptions")
+		return
+	}
+	resp := make([]issueContextSubscriptionResponse, 0, len(rows))
+	for _, row := range rows {
+		revision := int64(0)
+		if issue, err := h.Queries.GetIssue(r.Context(), row.PeerIssueID); err == nil { revision = issue.Revision }
+		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: revision})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// CreateIssueContextSubscription subscribes a task to a same-parent peer issue.
+func (h *Handler) CreateIssueContextSubscription(w http.ResponseWriter, r *http.Request) {
+	_, taskID, ok := h.issueContextSubscriptionTask(w, r)
+	if !ok {
+		return
+	}
+	var req issueContextSubscriptionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	peerID, err := uuid.Parse(strings.TrimSpace(req.PeerIssueID))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
+		return
+	}
+	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "peer issue not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	writeJSON(w, http.StatusCreated, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision})
+}
+
+// DeleteIssueContextSubscription removes an explicit peer subscription.
+func (h *Handler) DeleteIssueContextSubscription(w http.ResponseWriter, r *http.Request) {
+	_, taskID, ok := h.issueContextSubscriptionTask(w, r)
+	if !ok {
+		return
+	}
+	peerID, err := uuid.Parse(chi.URLParam(r, "peerIssueId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
+		return
+	}
+	deleted, err := h.Queries.DeleteIssueContextSubscription(r.Context(), db.DeleteIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete peer subscription")
+		return
+	}
+	if deleted == 0 {
+		writeError(w, http.StatusNotFound, "peer subscription not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // GetIssueUsage returns aggregated token usage for all tasks belonging to an issue.

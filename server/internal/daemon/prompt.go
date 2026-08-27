@@ -120,6 +120,7 @@ func buildActivePeerRunsBlock(task Task) string {
 	b.WriteString("## Active peer runs\n\n")
 	b.WriteString("This parent has other in-flight issue tasks. Before starting overlapping code or PR work, check this issue's comment history for a claim or handoff")
 	fmt.Fprintf(&b, " (`multica issue comment list %s --roots-only --summary --compact --output json`)", task.IssueID)
+	b.WriteString(" Use the revision as a claim-time snapshot: claiming does not mark it seen; an authenticated `run-messages` lookup records this task's `seen_revision`.")
 	b.WriteString(" and inspect relevant siblings with the `run-messages` commands below — coordinate with existing work instead of opening a second PR. For writes that only record ownership or status of work already underway, use `--no-start` on `multica issue assign`/`update`/`status`.\n\n")
 	for _, run := range task.ActiveSiblingRuns {
 		issueLabel := run.IssueIdentifier
@@ -138,6 +139,13 @@ func buildActivePeerRunsBlock(task Task) string {
 		title := strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(run.IssueTitle))
 		if title != "" {
 			fmt.Fprintf(&b, ": %s", title)
+		}
+		if run.Revision > 0 || run.IssueRevision > 0 {
+			revision := run.Revision
+			if revision == 0 {
+				revision = run.IssueRevision
+			}
+			fmt.Fprintf(&b, " (revision %d, seen %d)", revision, run.SeenRevision)
 		}
 		fmt.Fprintf(&b, "; inspect: `multica issue run-messages %s`\n", run.TaskID)
 	}
