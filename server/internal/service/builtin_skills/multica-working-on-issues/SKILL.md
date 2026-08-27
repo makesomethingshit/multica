@@ -242,7 +242,7 @@ multica issue status <issue-id> in_progress --no-start
 ```
 
 Before self-assigning, check the target issue's comment history for an existing
-claim and any `## Active sibling runs` block (its `run-messages` commands show
+claim and any `## Active peer runs` block (its `run-messages` commands show
 work in flight). The server also suppresses a trusted self-assignment when the
 exact target `(issue, agent)` pair already has a non-terminal task, but it
 deliberately keeps same-agent handoffs to a fresh issue starting runs: cross-issue
