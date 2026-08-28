@@ -156,7 +156,7 @@ away, so no task is left orphaned.
 | Update and batch-update apply ownership while skipping dispatch when `suppress_run` is true | `server/internal/handler/issue.go` (`UpdateIssue`, `BatchUpdateIssues`) |
 | Trusted direct self-assignment suppresses enqueue only when the target `(issue, agent)` already has a non-terminal task | `server/internal/service/issue_trigger.go` (`WillEnqueueRun`), `server/internal/handler/issue_trigger.go` (`shouldSuppressActiveSelfAssignment`) |
 | Claim responses expose a bounded snapshot of cross-agent dispatched/running/waiting issue tasks in the same workspace with the same non-null parent; queued tasks are excluded | `server/pkg/db/queries/agent.sql` (`ListActiveSiblingIssueTasks`), `server/internal/handler/daemon.go` (`buildClaimedTaskResponse`) |
-| Daemon prompts point to the target's comment history and concrete peer `run-messages` commands | `server/internal/daemon/prompt.go` (`buildActivePeerRunsBlock`) |
+| Daemon prompts point to the target's comment history and concrete peer `run-messages` commands; stale reads record `peer_context_rebase` in the source task log | `server/internal/daemon/prompt.go` (`buildActivePeerRunsBlock`), `server/internal/handler/daemon.go` (`ListTaskMessagesByUser`) |
 
 The self-assignment guard is intentionally pair-scoped. It does not treat
 "this agent is busy on some other issue" as a reason to suppress a fresh

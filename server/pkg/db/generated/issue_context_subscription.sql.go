@@ -47,6 +47,43 @@ func (q *Queries) CreateIssueContextSubscription(ctx context.Context, arg Create
 	return i, err
 }
 
+const createPeerContextRebaseMessage = `-- name: CreatePeerContextRebaseMessage :one
+INSERT INTO task_message (task_id, seq, type, tool, content)
+VALUES (
+    $1,
+    COALESCE((SELECT MAX(seq) FROM task_message WHERE task_id = $1), 0) + 1,
+    'peer_context_rebase',
+    'peer-context',
+    $2
+)
+RETURNING id, task_id, seq, type, tool, content, input, output, created_at
+`
+
+type CreatePeerContextRebaseMessageParams struct {
+	TaskID  pgtype.UUID `json:"task_id"`
+	Content pgtype.Text `json:"content"`
+}
+
+// Record the first-class rebase marker in the source task's execution log.
+// The lookup that triggered this write is authenticated and has already
+// proved the peer belongs to the same parent/workspace.
+func (q *Queries) CreatePeerContextRebaseMessage(ctx context.Context, arg CreatePeerContextRebaseMessageParams) (TaskMessage, error) {
+	row := q.db.QueryRow(ctx, createPeerContextRebaseMessage, arg.TaskID, arg.Content)
+	var i TaskMessage
+	err := row.Scan(
+		&i.ID,
+		&i.TaskID,
+		&i.Seq,
+		&i.Type,
+		&i.Tool,
+		&i.Content,
+		&i.Input,
+		&i.Output,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteIssueContextSubscription = `-- name: DeleteIssueContextSubscription :execrows
 WITH deleted_seen AS (
     DELETE FROM issue_context_subscription_task_seen seen
@@ -89,6 +126,31 @@ func (q *Queries) GetIssueContextSubscription(ctx context.Context, arg GetIssueC
 		&i.TaskID,
 		&i.PeerIssueID,
 		&i.SeenRevision,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getIssueContextSubscriptionTaskSeen = `-- name: GetIssueContextSubscriptionTaskSeen :one
+SELECT task_id, peer_task_id, seen_revision, seen_task_status, created_at, updated_at
+FROM issue_context_subscription_task_seen
+WHERE task_id = $1 AND peer_task_id = $2
+`
+
+type GetIssueContextSubscriptionTaskSeenParams struct {
+	TaskID     pgtype.UUID `json:"task_id"`
+	PeerTaskID pgtype.UUID `json:"peer_task_id"`
+}
+
+func (q *Queries) GetIssueContextSubscriptionTaskSeen(ctx context.Context, arg GetIssueContextSubscriptionTaskSeenParams) (IssueContextSubscriptionTaskSeen, error) {
+	row := q.db.QueryRow(ctx, getIssueContextSubscriptionTaskSeen, arg.TaskID, arg.PeerTaskID)
+	var i IssueContextSubscriptionTaskSeen
+	err := row.Scan(
+		&i.TaskID,
+		&i.PeerTaskID,
+		&i.SeenRevision,
+		&i.SeenTaskStatus,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

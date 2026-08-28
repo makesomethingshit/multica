@@ -248,6 +248,11 @@ exact target `(issue, agent)` pair already has a non-terminal task, but it
 deliberately keeps same-agent handoffs to a fresh issue starting runs: cross-issue
 serial chains and triage batches rely on that.
 
+When a peer is marked `[stale]`, read its `run-messages` before overlapping
+edits. That authenticated lookup records a `peer_context_rebase` task message
+with the revision/status change; treat the peer output as steering context,
+and ask the user to confirm before a material scope or direction change.
+
 ## Sub-issues: `todo` starts work now, `backlog` parks it
 
 On an agent-assigned issue, create status decides whether the assignee fires

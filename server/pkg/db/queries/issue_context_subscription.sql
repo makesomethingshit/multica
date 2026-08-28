@@ -43,6 +43,25 @@ FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 WHERE atq.id = @task_id;
 
+-- name: GetIssueContextSubscriptionTaskSeen :one
+SELECT task_id, peer_task_id, seen_revision, seen_task_status, created_at, updated_at
+FROM issue_context_subscription_task_seen
+WHERE task_id = @task_id AND peer_task_id = @peer_task_id;
+
+-- name: CreatePeerContextRebaseMessage :one
+-- Record the first-class rebase marker in the source task's execution log.
+-- The lookup that triggered this write is authenticated and has already
+-- proved the peer belongs to the same parent/workspace.
+INSERT INTO task_message (task_id, seq, type, tool, content)
+VALUES (
+    @task_id,
+    COALESCE((SELECT MAX(seq) FROM task_message WHERE task_id = @task_id), 0) + 1,
+    'peer_context_rebase',
+    'peer-context',
+    @content
+)
+RETURNING *;
+
 -- name: MarkIssueContextSubscriptionSeen :one
 WITH valid_peer AS (
     SELECT peer_task.issue_id

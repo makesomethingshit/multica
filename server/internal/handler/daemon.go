@@ -4953,6 +4953,9 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		markPeerSeen   bool
 		seenRevision   int64
 		seenTaskStatus string
+		priorPeerSeen  db.IssueContextSubscriptionTaskSeen
+		priorStatusSet bool
+		rebaseNeeded   bool
 	)
 	if r.Header.Get("X-Actor-Source") == "task_token" {
 		if sourceID, parseErr := uuid.Parse(r.Header.Get("X-Task-ID")); parseErr == nil {
@@ -4977,6 +4980,23 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	queries := h.Queries
 	if queryTx != nil {
 		queries = h.Queries.WithTx(queryTx)
+		if priorPeerSeen, queryErr = queries.GetIssueContextSubscriptionTaskSeen(r.Context(), db.GetIssueContextSubscriptionTaskSeenParams{
+			TaskID: sourceTaskID, PeerTaskID: taskUUID,
+		}); queryErr == nil {
+			priorStatusSet = true
+		} else if errors.Is(queryErr, pgx.ErrNoRows) {
+			if subscription, subscriptionErr := queries.GetIssueContextSubscription(r.Context(), db.GetIssueContextSubscriptionParams{
+				TaskID: sourceTaskID, PeerIssueID: task.IssueID,
+			}); subscriptionErr == nil {
+				priorPeerSeen.SeenRevision = subscription.SeenRevision
+			} else if !errors.Is(subscriptionErr, pgx.ErrNoRows) {
+				writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+				return
+			}
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
 	}
 	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
 		sinceSeq, parseErr := strconv.Atoi(sinceStr)
@@ -5003,6 +5023,12 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		}
 		seenRevision = snapshot.IssueRevision
 		seenTaskStatus = snapshot.TaskStatus
+		// The authenticated lookup is the rebase boundary: compare the
+		// snapshot captured in this transaction with the last snapshot this
+		// source task explicitly read. A first lookup with no cursor is stale
+		// whenever the peer already has a non-zero revision.
+		rebaseNeeded = seenRevision > priorPeerSeen.SeenRevision ||
+			(priorStatusSet && seenTaskStatus != priorPeerSeen.SeenTaskStatus)
 		if err := queryTx.Commit(r.Context()); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
 			return
@@ -5012,7 +5038,9 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	issueID := uuidToString(task.IssueID)
 	// A running agent may explicitly inspect a sibling run from the claim
 	// prompt. Record that read only after the messages lookup succeeded; claim
-	// itself never advances this cursor.
+	// itself never advances this cursor. When the cursor was stale, append a
+	// synthetic execution-log marker so the rebase attempt is auditable without
+	// requiring a second write command from the agent.
 	if markPeerSeen {
 		if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
 			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
@@ -5023,6 +5051,22 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 			}
 			writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
 			return
+		}
+		if rebaseNeeded {
+			content := fmt.Sprintf("Peer context rebase recorded from task %s: revision %d -> %d, status %q -> %q. Check the latest peer decisions against the current plan before continuing.",
+				taskID, priorPeerSeen.SeenRevision, seenRevision, priorPeerSeen.SeenTaskStatus, seenTaskStatus)
+			marker, markerErr := h.Queries.CreatePeerContextRebaseMessage(r.Context(), db.CreatePeerContextRebaseMessageParams{
+				TaskID:  sourceTaskID,
+				Content: pgtype.Text{String: content, Valid: true},
+			})
+			if markerErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to record peer context rebase")
+				return
+			}
+			if sourceTask, sourceErr := h.Queries.GetAgentTask(r.Context(), sourceTaskID); sourceErr == nil {
+				h.publishTask(protocol.EventTaskMessage, wsID, "system", "", uuidToString(sourceTaskID),
+					taskMessageToPayload(marker, uuidToString(sourceTaskID), uuidToString(sourceTask.IssueID)))
+			}
 		}
 	}
 

@@ -102,6 +102,25 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		}
 	})
 
+	t.Run("stale lookup records a rebase task message", func(t *testing.T) {
+		dbfx.Exec(t, `UPDATE issue SET title = title || ' rebase', revision = revision + 1 WHERE id = $1`, peerIssueID)
+		req := newRequest(http.MethodGet, "/api/tasks/"+peerTaskID+"/messages", nil)
+		req.Header.Set("X-Actor-Source", "task_token")
+		req.Header.Set("X-Task-ID", sourceTaskID)
+		req = withURLParam(req, "taskId", peerTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("stale peer context lookup status = %d: %s", w.Code, w.Body.String())
+		}
+		var typ, content string
+		dbfx.QueryRow(t, `SELECT type, content FROM task_message WHERE task_id = $1 AND type = 'peer_context_rebase' ORDER BY created_at DESC LIMIT 1`, sourceTaskID).Scan(&typ, &content)
+		if typ != "peer_context_rebase" || !strings.Contains(content, "revision") || !strings.Contains(content, peerTaskID) {
+			t.Fatalf("rebase task message = (%q, %q)", typ, content)
+		}
+	})
+
 	t.Run("parallel peer tasks keep independent status cursors", func(t *testing.T) {
 		peerTask2ID := dbfx.Task(t, agentID, testutil.Cols{
 			"issue_id":   peerIssueID,
