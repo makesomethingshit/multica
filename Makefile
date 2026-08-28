@@ -349,7 +349,10 @@ test: ## Run Go tests after ensuring the target DB exists and migrations are app
 
 test-docker: ## Run backend tests in a pinned Go/Postgres/Redis Docker environment
 	$(REQUIRE_COMPOSE)
-	$(COMPOSE) -f docker-compose.test.yml run --rm test
+	@project="multica-test-$$(printf '%s' "$$(pwd)" | cksum | awk '{print $$1}')"; \
+	$(COMPOSE) -p "$$project" -f docker-compose.test.yml down -v --remove-orphans >/dev/null 2>&1 || true; \
+	trap 'status=$$?; $(COMPOSE) -p "$$project" -f docker-compose.test.yml down -v --remove-orphans; exit $$status' 0 1 2 3 15; \
+	$(COMPOSE) -p "$$project" -f docker-compose.test.yml up --force-recreate --abort-on-container-exit --exit-code-from test
 
 # Database
 ##@ Database
