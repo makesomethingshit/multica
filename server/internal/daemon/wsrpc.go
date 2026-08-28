@@ -312,7 +312,47 @@ func (c *wsRPCClient) deliver(resp protocol.RPCResponsePayload) {
 // retried over HTTP only after a short safety window. The request/response bodies
 // are identical to the HTTP endpoint so both transports are interchangeable.
 // Wired into the claim poller as part of the poller cutover.
+//
+// When runtimeIDs exceeds batchClaimMaxRuntimeIDs the request is chunked so a
+// machine with >256 runtimes does not have its tail permanently excluded by the
+// server's per-request truncation (PUCK-58 review).
 func (d *Daemon) ClaimTasksWSFirst(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
+	if len(runtimeIDs) > batchClaimMaxRuntimeIDs {
+		numChunks := (len(runtimeIDs) + batchClaimMaxRuntimeIDs - 1) / batchClaimMaxRuntimeIDs
+		startChunk := int(d.claimChunkOffset.Load() % int64(numChunks))
+		d.claimChunkOffset.Add(1)
+		var all []*Task
+		remaining := maxTasks
+		for i := 0; i < numChunks && remaining > 0; i++ {
+			chunkIdx := (startChunk + i) % numChunks
+			start := chunkIdx * batchClaimMaxRuntimeIDs
+			end := start + batchClaimMaxRuntimeIDs
+			if end > len(runtimeIDs) {
+				end = len(runtimeIDs)
+			}
+			chunk := runtimeIDs[start:end]
+			tasks, err := d.claimTasksWSFirstSingle(ctx, daemonID, chunk, remaining)
+			if err != nil {
+				if len(all) == 0 {
+					return nil, err
+				}
+				return all, nil
+			}
+			if tasks == nil && remaining == maxTasks && len(all) == 0 {
+				// Uncertain-outcome backoff: the single-chunk helper returned
+				// nil, nil to signal "skip this cycle and retry after delay".
+				// In chunked mode treat it as an empty result for this poll.
+				return all, nil
+			}
+			all = append(all, tasks...)
+			remaining -= len(tasks)
+		}
+		return all, nil
+	}
+	return d.claimTasksWSFirstSingle(ctx, daemonID, runtimeIDs, maxTasks)
+}
+
+func (d *Daemon) claimTasksWSFirstSingle(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
 	// Un-upgraded server without the batch route: a prior poll already learned
 	// this (via a 404), so go straight to the legacy per-runtime claim and skip
 	// the WS + batch attempts each cycle.

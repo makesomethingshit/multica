@@ -11,6 +11,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countIssueContextSubscriptions = `-- name: CountIssueContextSubscriptions :one
+SELECT COUNT(*)::bigint FROM issue_context_subscription WHERE task_id = $1
+`
+
+func (q *Queries) CountIssueContextSubscriptions(ctx context.Context, taskID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countIssueContextSubscriptions, taskID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const createIssueContextSubscription = `-- name: CreateIssueContextSubscription :one
 INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
 SELECT $1, $2, 0
@@ -24,6 +35,10 @@ WHERE EXISTS (
       AND source_issue.parent_issue_id IS NOT NULL
       AND source_issue.parent_issue_id = peer_issue.parent_issue_id
 )
+AND (
+  EXISTS (SELECT 1 FROM issue_context_subscription WHERE task_id = $1 AND peer_issue_id = $2)
+  OR (SELECT COUNT(*) FROM issue_context_subscription WHERE task_id = $1) < 32
+)
 ON CONFLICT (task_id, peer_issue_id) DO UPDATE
 SET updated_at = now()
 RETURNING task_id, peer_issue_id, seen_revision, created_at, updated_at
@@ -34,6 +49,11 @@ type CreateIssueContextSubscriptionParams struct {
 	PeerIssueID pgtype.UUID `json:"peer_issue_id"`
 }
 
+// Admission is enforced atomically by the caller holding a row lock on the
+// parent task (SELECT ... FOR UPDATE in a separate statement) before this
+// insert. The WHERE clause then sees the latest committed count in the next
+// statement's snapshot, so concurrent creates cannot race past the cap. An
+// existing peer remains updatable even at the cap.
 func (q *Queries) CreateIssueContextSubscription(ctx context.Context, arg CreateIssueContextSubscriptionParams) (IssueContextSubscription, error) {
 	row := q.db.QueryRow(ctx, createIssueContextSubscription, arg.TaskID, arg.PeerIssueID)
 	var i IssueContextSubscription
@@ -186,28 +206,40 @@ func (q *Queries) GetTaskPeerSnapshot(ctx context.Context, taskID pgtype.UUID) (
 }
 
 const listIssueContextSubscriptions = `-- name: ListIssueContextSubscriptions :many
-SELECT s.task_id, s.peer_issue_id, s.seen_revision, s.created_at, s.updated_at
+SELECT s.task_id, s.peer_issue_id, s.seen_revision, s.created_at, s.updated_at, i.revision
 FROM issue_context_subscription s
 JOIN issue i ON i.id = s.peer_issue_id
 WHERE s.task_id = $1
 ORDER BY s.created_at, s.peer_issue_id
 `
 
-func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgtype.UUID) ([]IssueContextSubscription, error) {
+type ListIssueContextSubscriptionsRow struct {
+	TaskID       pgtype.UUID        `json:"task_id"`
+	PeerIssueID  pgtype.UUID        `json:"peer_issue_id"`
+	SeenRevision int64              `json:"seen_revision"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	Revision     int64              `json:"revision"`
+}
+
+// The JOIN carries the peer issue's current revision in the same read so the
+// handler does not need a per-row GetIssue round trip (PUCK-58 review).
+func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgtype.UUID) ([]ListIssueContextSubscriptionsRow, error) {
 	rows, err := q.db.Query(ctx, listIssueContextSubscriptions, taskID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []IssueContextSubscription{}
+	items := []ListIssueContextSubscriptionsRow{}
 	for rows.Next() {
-		var i IssueContextSubscription
+		var i ListIssueContextSubscriptionsRow
 		if err := rows.Scan(
 			&i.TaskID,
 			&i.PeerIssueID,
 			&i.SeenRevision,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Revision,
 		); err != nil {
 			return nil, err
 		}
@@ -282,6 +314,8 @@ WITH valid_peer AS (
     INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
     SELECT $2, issue_id, $3
     FROM valid_peer
+    WHERE EXISTS (SELECT 1 FROM issue_context_subscription WHERE task_id = $2 AND peer_issue_id = valid_peer.issue_id)
+       OR (SELECT COUNT(*) FROM issue_context_subscription WHERE task_id = $2) < 32
     ON CONFLICT (task_id, peer_issue_id) DO UPDATE
     SET seen_revision = GREATEST(issue_context_subscription.seen_revision, EXCLUDED.seen_revision),
         updated_at = now()
@@ -322,4 +356,29 @@ func (q *Queries) MarkIssueContextSubscriptionSeen(ctx context.Context, arg Mark
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const validatePeerIssueForSubscription = `-- name: ValidatePeerIssueForSubscription :one
+SELECT EXISTS (
+    SELECT 1
+    FROM agent_task_queue source_task
+    JOIN issue source_issue ON source_issue.id = source_task.issue_id
+    JOIN issue peer_issue ON peer_issue.id = $1
+    WHERE source_task.id = $2
+      AND source_issue.workspace_id = peer_issue.workspace_id
+      AND source_issue.parent_issue_id IS NOT NULL
+      AND source_issue.parent_issue_id = peer_issue.parent_issue_id
+) AS valid
+`
+
+type ValidatePeerIssueForSubscriptionParams struct {
+	PeerIssueID pgtype.UUID `json:"peer_issue_id"`
+	TaskID      pgtype.UUID `json:"task_id"`
+}
+
+func (q *Queries) ValidatePeerIssueForSubscription(ctx context.Context, arg ValidatePeerIssueForSubscriptionParams) (bool, error) {
+	row := q.db.QueryRow(ctx, validatePeerIssueForSubscription, arg.PeerIssueID, arg.TaskID)
+	var valid bool
+	err := row.Scan(&valid)
+	return valid, err
 }

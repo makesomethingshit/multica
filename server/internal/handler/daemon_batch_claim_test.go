@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -340,6 +342,211 @@ func TestClaimTasksByRuntime_CancelsTaskWhenRuntimeOwnerMissing(t *testing.T) {
 	}
 	if status != "cancelled" {
 		t.Fatalf("task status = %s, want cancelled (owner missing)", status)
+	}
+}
+
+// TestClaimTasksByRuntime_TruncatesOversizedRuntimeIDList pins the input
+// bound (PUCK-58 review): an id list beyond claimBatchMaxRuntimeIDs is
+// truncated rather than rejected, and a valid runtime inside the first
+// claimBatchMaxRuntimeIDs entries still claims normally.
+func TestClaimTasksByRuntime_TruncatesOversizedRuntimeIDList(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Truncation claim rt")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Truncation claim agent")
+	seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+
+	ids := make([]string, claimBatchMaxRuntimeIDs+64)
+	ids[0] = runtimeID
+	for i := 1; i < len(ids); i++ {
+		ids[i] = "not-a-uuid"
+	}
+	w := postBatchClaim(t, testWorkspaceID, ids, 5)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp batchClaimResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tasks) != 1 || resp.Tasks[0].RuntimeID != runtimeID {
+		t.Fatalf("claimed %d tasks, want the valid runtime inside the cap: %s", len(resp.Tasks), w.Body.String())
+	}
+}
+
+// TestClaimTasksByRuntime_RejectsOversizedBody pins the request-body cap
+// (PUCK-58 review): a body beyond claimBatchMaxBodyBytes is rejected with 400
+// before any claim work instead of being decoded in full.
+func TestClaimTasksByRuntime_RejectsOversizedBody(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ids := make([]string, 0, 4096)
+	for i := 0; i < 4096; i++ {
+		ids = append(ids, "0123456789abcdef0123456789abcdef")
+	}
+	body, err := json.Marshal(map[string]any{"daemon_id": batchClaimTestDaemonID, "runtime_ids": ids, "max_tasks": 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(body) <= claimBatchMaxBodyBytes {
+		t.Fatalf("test payload is %d bytes, want > %d to trip the cap", len(body), claimBatchMaxBodyBytes)
+	}
+	req := httptest.NewRequest("POST", "/api/daemon/tasks/claim", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(middleware.WithDaemonContext(req.Context(), testWorkspaceID, batchClaimTestDaemonID))
+	w := httptest.NewRecorder()
+	testHandler.ClaimTasksByRuntime(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized body status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestClaimTasksByRuntime_ChunkedClaimReachesTailRuntime verifies the PUCK-58
+// chunking fix: a runtime at position 257+ is not permanently excluded by the
+// server's per-request truncation. A single oversized request truncates the
+// tail, but chunked requests (as the daemon now sends) still claim it.
+func TestClaimTasksByRuntime_ChunkedClaimReachesTailRuntime(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Tail claim rt")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Tail claim agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+
+	// Build 300 IDs where the valid runtime is at the very end (position 299).
+	ids := make([]string, 300)
+	for i := 0; i < 299; i++ {
+		ids[i] = "not-a-uuid"
+	}
+	ids[299] = runtimeID
+
+	// Single oversized request: server truncates to first 256, so tail task stays queued.
+	w := postBatchClaim(t, testWorkspaceID, ids, 5)
+	if w.Code != http.StatusOK {
+		t.Fatalf("single oversized claim expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp batchClaimResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tasks) != 0 {
+		t.Fatalf("single truncated claim returned %d tasks, want 0 (tail truncated)", len(resp.Tasks))
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task status: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("task status = %s, want still queued after truncated claim", status)
+	}
+
+	// Chunked requests as the daemon now does: two chunks 256 + 44.
+	firstChunk := ids[:256]
+	secondChunk := ids[256:]
+	w1 := postBatchClaim(t, testWorkspaceID, firstChunk, 5)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first chunk expected 200, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var resp1 batchClaimResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("decode first chunk: %v", err)
+	}
+	if len(resp1.Tasks) != 0 {
+		t.Fatalf("first chunk returned %d tasks, want 0", len(resp1.Tasks))
+	}
+
+	w2 := postBatchClaim(t, testWorkspaceID, secondChunk, 5)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second chunk expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp2 batchClaimResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("decode second chunk: %v", err)
+	}
+	if len(resp2.Tasks) != 1 || resp2.Tasks[0].ID != taskID {
+		t.Fatalf("second chunk claimed %d tasks %+v, want tail task %s", len(resp2.Tasks), resp2.Tasks, taskID)
+	}
+}
+
+// TestClaimTasksByRuntime_RotatesWhenHeadSaturated verifies the rotation fix:
+// when the head chunk keeps filling maxTasks, the tail is not permanently
+// starved — the starting chunk rotates each poll so the tail is eventually
+// claimed.
+func TestClaimTasksByRuntime_RotatesWhenHeadSaturated(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	headRT := createClaimReclaimRuntime(t, ctx, "Head saturated rt")
+	tailRT := createClaimReclaimRuntime(t, ctx, "Tail saturated rt")
+	headAgent, headIssue := createClaimReclaimAgentAndIssue(t, ctx, headRT, "Head saturated agent")
+	tailAgent, tailIssue := createClaimReclaimAgentAndIssue(t, ctx, tailRT, "Tail saturated agent")
+	headTaskID := seedQueuedIssueTask(t, ctx, headAgent, headRT, headIssue)
+	tailTaskID := seedQueuedIssueTask(t, ctx, tailAgent, tailRT, tailIssue)
+
+	ids := make([]string, 300)
+	ids[0] = headRT
+	for i := 1; i < 299; i++ {
+		ids[i] = "not-a-uuid"
+	}
+	ids[299] = tailRT
+
+	// Single oversized request would truncate and never reach tail
+	wSingle := postBatchClaim(t, testWorkspaceID, ids, 1)
+	if wSingle.Code != http.StatusOK {
+		t.Fatalf("single oversized expected 200, got %d: %s", wSingle.Code, wSingle.Body.String())
+	}
+	var respSingle batchClaimResponse
+	if err := json.Unmarshal(wSingle.Body.Bytes(), &respSingle); err != nil {
+		t.Fatalf("decode single: %v", err)
+	}
+	// Single request truncates to first 256, so it sees head but not tail.
+	// headTask is claimed, tail remains queued.
+	if len(respSingle.Tasks) != 1 || respSingle.Tasks[0].ID != headTaskID {
+		t.Fatalf("single truncated claim got %+v, want head %s", respSingle.Tasks, headTaskID)
+	}
+	var tailStatus string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, tailTaskID).Scan(&tailStatus); err != nil {
+		t.Fatalf("read tail status: %v", err)
+	}
+	if tailStatus != "queued" {
+		t.Fatalf("tail status = %s, want still queued after truncated single claim", tailStatus)
+	}
+	// Reset head task to queued for the rotation test (re-queue)
+	testPool.Exec(ctx, `UPDATE agent_task_queue SET status='queued' WHERE id=$1`, headTaskID)
+
+	// Simulate daemon rotation: poll1 starts at chunk 0 (head first) -> claims head
+	firstChunk := ids[:256]
+	secondChunk := ids[256:]
+	w1 := postBatchClaim(t, testWorkspaceID, firstChunk, 1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("poll1 chunk0 expected 200, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var r1 batchClaimResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &r1); err != nil {
+		t.Fatalf("decode poll1: %v", err)
+	}
+	if len(r1.Tasks) != 1 || r1.Tasks[0].ID != headTaskID {
+		t.Fatalf("poll1 (offset 0) got %+v, want head %s", r1.Tasks, headTaskID)
+	}
+	// Re-queue head again
+	testPool.Exec(ctx, `UPDATE agent_task_queue SET status='queued' WHERE id=$1`, headTaskID)
+
+	// Poll2 with rotation (tail chunk first) -> should claim tail even though head still has a queued task
+	w2 := postBatchClaim(t, testWorkspaceID, secondChunk, 1)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("poll2 chunk1 expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var r2 batchClaimResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &r2); err != nil {
+		t.Fatalf("decode poll2: %v", err)
+	}
+	if len(r2.Tasks) != 1 || r2.Tasks[0].ID != tailTaskID {
+		t.Fatalf("poll2 (rotated to tail) got %+v, want tail %s (rotation)", r2.Tasks, tailTaskID)
 	}
 }
 

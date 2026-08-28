@@ -1567,6 +1567,23 @@ func (h *Handler) repairStaleCommentPlanIfNeeded(ctx context.Context, task *db.A
 // daemon never asks for more than its free execution-slot count anyway.
 const claimBatchMaxTasksCap = 32
 
+// claimBatchMaxRuntimeIDs bounds how many runtime_ids one batch claim request
+// may carry, so an authenticated caller cannot make the handler allocate an
+// unbounded id map or hand an unbounded array to the runtime lookup query. A
+// machine beyond the cap has its extra ids truncated, never rejected: the
+// claim loop re-runs every poll, and a 400 would give an oversized machine no
+// fallback (the daemon only falls back to the legacy per-runtime claim on
+// 404). Truncation matches the endpoint's existing "unknown id skipped"
+// tolerance — the first claimBatchMaxRuntimeIDs hosts keep claiming.
+const claimBatchMaxRuntimeIDs = 256
+
+// claimBatchMaxBodyBytes bounds the decoded size of one batch claim request.
+// The legitimate payload is daemon_id plus at most claimBatchMaxRuntimeIDs
+// UUID strings plus max_tasks — a few KiB — so 64 KiB is generous headroom.
+// Without the cap any authenticated daemon/PAT/JWT caller could make the JSON
+// decoder allocate the full request body before validation.
+const claimBatchMaxBodyBytes = 64 << 10
+
 // ClaimTasksByRuntime is the machine-level (MUL-4257) batch claim endpoint. A
 // daemon posts every runtime_id it hosts plus its free execution-slot count and
 // receives up to max_tasks already-claimed tasks in ONE round trip — each
@@ -1588,9 +1605,15 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		RuntimeIDs []string `json:"runtime_ids"`
 		MaxTasks   int      `json:"max_tasks"`
 	}
+	// Body-size cap (PUCK-58 review): bound the decode before reading, so an
+	// oversized request fails fast instead of allocating the whole body.
+	r.Body = http.MaxBytesReader(w, r.Body, claimBatchMaxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	if len(req.RuntimeIDs) > claimBatchMaxRuntimeIDs {
+		req.RuntimeIDs = req.RuntimeIDs[:claimBatchMaxRuntimeIDs]
 	}
 
 	// Machine-level ownership (MUL-4257 review): the batch claim is scoped to a
@@ -5049,6 +5072,14 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		}
 		defer writeTx.Rollback(r.Context())
 		txQueries := h.Queries.WithTx(writeTx)
+		// Serialize concurrent admissions for the same source task so the
+		// COUNT in Mark's subscription CTE sees the latest snapshot (PUCK-58
+		// review). Lock in a separate statement before the upsert so the next
+		// statement's snapshot is fresh.
+		if _, err := writeTx.Exec(r.Context(), "SELECT 1 FROM agent_task_queue WHERE id = $1 FOR UPDATE", sourceTaskID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
 		if _, markErr := txQueries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
 			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
 		}); markErr != nil {
@@ -5119,6 +5150,15 @@ func (h *Handler) issueContextSubscriptionTask(w http.ResponseWriter, r *http.Re
 	return task, taskID, true
 }
 
+// maxPeerContextSubscriptionsPerTask bounds the explicit peer subscriptions a
+// single task may hold (PUCK-58 review). Without a cap an authenticated caller
+// could grow one task's subscription set unboundedly, inflating the list
+// response and every claim-time snapshot read against it. Enforcement is
+// application-layer (the repo forbids DB-side constraints for relationships),
+// so concurrent creations can race past the cap by a small margin — this is a
+// resource guard, not an authorization boundary.
+const maxPeerContextSubscriptionsPerTask = 32
+
 // ListIssueContextSubscriptions returns the task's explicit peer subscriptions.
 func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.Request) {
 	_, taskID, ok := h.issueContextSubscriptionTask(w, r)
@@ -5132,11 +5172,7 @@ func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.R
 	}
 	resp := make([]issueContextSubscriptionResponse, 0, len(rows))
 	for _, row := range rows {
-		revision := int64(0)
-		if issue, err := h.Queries.GetIssue(r.Context(), row.PeerIssueID); err == nil {
-			revision = issue.Revision
-		}
-		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: revision})
+		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: row.Revision})
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -5200,12 +5236,46 @@ func (h *Handler) CreateIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: pgtype.UUID{Bytes: peerID, Valid: true}})
+	peerUUID := pgtype.UUID{Bytes: peerID, Valid: true}
+	ctx := r.Context()
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	defer tx.Rollback(ctx)
+	// Serialize concurrent admissions for the same task so the subsequent
+	// COUNT in Create sees the latest committed state (PUCK-58 review).
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM agent_task_queue WHERE id = $1 FOR UPDATE", taskID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	qtx := h.Queries.WithTx(tx)
+	row, err := qtx.CreateIssueContextSubscription(ctx, db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "peer issue not found")
+			// Distinguish invalid peer (404) from cap (400) in the same
+			// snapshot that held the lock, so the admission decision is
+			// atomic and both Create and Mark share it.
+			if valid, vErr := qtx.ValidatePeerIssueForSubscription(ctx, db.ValidatePeerIssueForSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); vErr == nil && !valid {
+				writeError(w, http.StatusNotFound, "peer issue not found")
+				return
+			}
+			if existingRow, existsErr := qtx.GetIssueContextSubscription(ctx, db.GetIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); existsErr == nil {
+				if err := tx.Commit(ctx); err != nil {
+					writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+					return
+				}
+				writeJSON(w, http.StatusOK, issueContextSubscriptionResponse{TaskID: uuidToString(existingRow.TaskID), PeerIssueID: uuidToString(existingRow.PeerIssueID), SeenRevision: existingRow.SeenRevision})
+				return
+			}
+			writeError(w, http.StatusBadRequest, "peer subscription limit reached")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
 		return
 	}

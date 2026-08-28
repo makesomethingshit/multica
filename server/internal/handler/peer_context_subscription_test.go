@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -446,4 +447,319 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 			t.Fatalf("get after delete error = %v, want pgx.ErrNoRows", err)
 		}
 	})
+
+	t.Run("list carries the peer revision from the join", func(t *testing.T) {
+		if _, err := testHandler.Queries.CreateIssueContextSubscription(ctx, db.CreateIssueContextSubscriptionParams{
+			TaskID: sourceTask, PeerIssueID: peerIssue,
+		}); err != nil {
+			t.Fatalf("create subscription: %v", err)
+		}
+		var revision int64
+		dbfx.QueryRow(t, `SELECT revision FROM issue WHERE id = $1`, peerIssueID).Scan(&revision)
+		req := newRequest(http.MethodGet, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", nil)
+		req = withURLParam(req, "taskId", sourceTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListIssueContextSubscriptions(w, req)
+		var subscriptions []issueContextSubscriptionResponse
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &subscriptions) != nil || len(subscriptions) != 1 {
+			t.Fatalf("subscription list = status %d body %s", w.Code, w.Body.String())
+		}
+		if subscriptions[0].Revision != revision {
+			t.Fatalf("subscription revision = %d, want the join-read issue revision %d", subscriptions[0].Revision, revision)
+		}
+	})
+}
+
+// TestIssueContextSubscriptionCapPinsResourceUse pins the per-task
+// subscription cap (PUCK-58 review): once a task holds
+// maxPeerContextSubscriptionsPerTask subscriptions, further creates are
+// rejected instead of growing the set unboundedly.
+func TestIssueContextSubscriptionCapPinsResourceUse(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := handlerTestRuntimeID(t)
+	var agentID string
+	dbfx.QueryRow(t, `SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`, testWorkspaceID).Scan(&agentID)
+
+	parentID := dbfx.Issue(t, "cap parent")
+	sourceTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   dbfx.Issue(t, "cap source", testutil.Cols{"parent_issue_id": parentID}),
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	for i := 0; i < maxPeerContextSubscriptionsPerTask; i++ {
+		dbfx.Exec(t, `INSERT INTO issue_context_subscription (task_id, peer_issue_id) VALUES ($1, $2)`,
+			sourceTaskID, dbfx.Issue(t, fmt.Sprintf("cap peer %d", i), testutil.Cols{"parent_issue_id": parentID}))
+	}
+
+	overflowPeerID := dbfx.Issue(t, "cap overflow peer", testutil.Cols{"parent_issue_id": parentID})
+	req := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": overflowPeerID})
+	req = withURLParam(req, "taskId", sourceTaskID)
+	req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+	w := httptest.NewRecorder()
+	testHandler.CreateIssueContextSubscription(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("over-cap create status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDeleteIssueSweepsPeerContextRebaseLog pins the issue-delete sweep
+// (PUCK-58 review): peer_context_rebase_log has no FK, so DeleteIssue must
+// remove the rebase audit rows of the deleted issue's tasks on both the
+// source and the peer side, or they strand forever.
+func TestDeleteIssueSweepsPeerContextRebaseLog(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := handlerTestRuntimeID(t)
+	var agentID string
+	dbfx.QueryRow(t, `SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`, testWorkspaceID).Scan(&agentID)
+
+	parentID := dbfx.Issue(t, "rebase sweep parent")
+	peerTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   dbfx.Issue(t, "rebase sweep peer", testutil.Cols{"parent_issue_id": parentID}),
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	victimIssueID := dbfx.Issue(t, "rebase sweep victim", testutil.Cols{"parent_issue_id": parentID})
+	victimTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   victimIssueID,
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	// The deleted task appears on both sides of the audit log: as the source
+	// of its own rebase and as the peer of a surviving task's rebase.
+	// peer_context_rebase_log has no FK, so clean up explicitly on teardown.
+	dbfx.Cleanup(t, `DELETE FROM peer_context_rebase_log WHERE task_id = $1 OR peer_task_id = $1 OR task_id = $2 OR peer_task_id = $2`, victimTaskID, peerTaskID)
+	dbfx.Exec(t, `INSERT INTO peer_context_rebase_log (task_id, peer_task_id, to_revision, to_status) VALUES ($1, $2, 1, 'running')`, victimTaskID, peerTaskID)
+	dbfx.Exec(t, `INSERT INTO peer_context_rebase_log (task_id, peer_task_id, to_revision, to_status) VALUES ($1, $2, 1, 'running')`, peerTaskID, victimTaskID)
+
+	if err := testHandler.Queries.DeleteIssue(ctx, db.DeleteIssueParams{ID: parseUUID(victimIssueID), WorkspaceID: parseUUID(testWorkspaceID)}); err != nil {
+		t.Fatalf("delete issue: %v", err)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM peer_context_rebase_log WHERE task_id = $1 OR peer_task_id = $2`, victimTaskID, victimTaskID); got != 0 {
+		t.Fatalf("delete left %d rebase audit rows for the deleted issue's task", got)
+	}
+}
+
+// TestIssueContextSubscriptionConcurrentLimit verifies the atomic admission
+// (PUCK-58 review): concurrent creates for the same task cannot race past the
+// per-task cap. Ten concurrent creates with only two slots left must leave the
+// table at exactly the cap.
+func TestIssueContextSubscriptionConcurrentLimit(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := handlerTestRuntimeID(t)
+	var agentID string
+	dbfx.QueryRow(t, `SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`, testWorkspaceID).Scan(&agentID)
+
+	parentID := dbfx.Issue(t, "concurrent cap parent")
+	sourceTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   dbfx.Issue(t, "concurrent cap source", testutil.Cols{"parent_issue_id": parentID}),
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+
+	// Pre-fill to 30 via the handler so the remaining capacity is 2.
+	for i := 0; i < 30; i++ {
+		peerID := dbfx.Issue(t, fmt.Sprintf("concurrent cap pre %d", i), testutil.Cols{"parent_issue_id": parentID})
+		req := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": peerID})
+		req = withURLParam(req, "taskId", sourceTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.CreateIssueContextSubscription(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("pre-fill %d status = %d, want 201: %s", i, w.Code, w.Body.String())
+		}
+	}
+
+	// Ten distinct new peers contend for the last two slots concurrently.
+	peerIDs := make([]string, 10)
+	for i := range peerIDs {
+		peerIDs[i] = dbfx.Issue(t, fmt.Sprintf("concurrent cap contender %d", i), testutil.Cols{"parent_issue_id": parentID})
+	}
+
+	var wg sync.WaitGroup
+	results := make([]int, len(peerIDs))
+	for i, pid := range peerIDs {
+		wg.Add(1)
+		go func(idx int, peerID string) {
+			defer wg.Done()
+			req := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": peerID})
+			req = withURLParam(req, "taskId", sourceTaskID)
+			req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+			w := httptest.NewRecorder()
+			testHandler.CreateIssueContextSubscription(w, req)
+			results[idx] = w.Code
+		}(i, pid)
+	}
+	wg.Wait()
+
+	successes := 0
+	for _, code := range results {
+		if code == http.StatusCreated || code == http.StatusOK {
+			successes++
+		} else if code != http.StatusBadRequest {
+			t.Fatalf("concurrent create returned %d, want 201/200 or 400", code)
+		}
+	}
+	if successes != 2 {
+		t.Fatalf("concurrent creates succeeded %d, want 2 to reach cap 32", successes)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM issue_context_subscription WHERE task_id = $1`, sourceTaskID); got != 32 {
+		t.Fatalf("subscription count = %d, want exactly 32", got)
+	}
+}
+
+// TestIssueContextSubscriptionDuplicateAtCapSucceeds verifies idempotency
+// at the cap (PUCK-58 review): re-posting an already-subscribed peer when
+// the table is at 32 must not be rejected with 400.
+func TestIssueContextSubscriptionDuplicateAtCapSucceeds(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := handlerTestRuntimeID(t)
+	var agentID string
+	dbfx.QueryRow(t, `SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`, testWorkspaceID).Scan(&agentID)
+
+	parentID := dbfx.Issue(t, "dup cap parent")
+	sourceIssueID := dbfx.Issue(t, "dup cap source", testutil.Cols{"parent_issue_id": parentID})
+	sourceTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   sourceIssueID,
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+
+	var firstPeerID string
+	for i := 0; i < maxPeerContextSubscriptionsPerTask; i++ {
+		peerID := dbfx.Issue(t, fmt.Sprintf("dup cap peer %d", i), testutil.Cols{"parent_issue_id": parentID})
+		if i == 0 {
+			firstPeerID = peerID
+		}
+		req := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": peerID})
+		req = withURLParam(req, "taskId", sourceTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.CreateIssueContextSubscription(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("fill %d status = %d, want 201: %s", i, w.Code, w.Body.String())
+		}
+	}
+
+	// Duplicate of an already-subscribed peer must succeed even at cap.
+	req := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": firstPeerID})
+	req = withURLParam(req, "taskId", sourceTaskID)
+	req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+	w := httptest.NewRecorder()
+	testHandler.CreateIssueContextSubscription(w, req)
+	if w.Code != http.StatusCreated && w.Code != http.StatusOK {
+		t.Fatalf("duplicate at cap status = %d, want 200/201: %s", w.Code, w.Body.String())
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM issue_context_subscription WHERE task_id = $1`, sourceTaskID); got != 32 {
+		t.Fatalf("subscription count after duplicate = %d, want still 32", got)
+	}
+
+	// New peer beyond cap must still be rejected.
+	overflowPeerID := dbfx.Issue(t, "dup cap overflow", testutil.Cols{"parent_issue_id": parentID})
+	req2 := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": overflowPeerID})
+	req2 = withURLParam(req2, "taskId", sourceTaskID)
+	req2 = req2.WithContext(middleware.SetMemberContext(req2.Context(), testWorkspaceID, db.Member{}))
+	w2 := httptest.NewRecorder()
+	testHandler.CreateIssueContextSubscription(w2, req2)
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("overflow at cap status = %d, want 400: %s", w2.Code, w2.Body.String())
+	}
+}
+
+// TestMarkIssueContextSubscriptionSeenRespectsCap verifies the Mark path
+// also respects the cap (PUCK-58 review): when the subscription table is at
+// 32, a ListTaskMessagesByUser that would implicitly create a 33rd
+// subscription via Mark must not grow the table.
+func TestMarkIssueContextSubscriptionSeenRespectsCap(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := handlerTestRuntimeID(t)
+	var agentID string
+	dbfx.QueryRow(t, `SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`, testWorkspaceID).Scan(&agentID)
+
+	parentID := dbfx.Issue(t, "mark cap parent")
+	sourceTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   dbfx.Issue(t, "mark cap source", testutil.Cols{"parent_issue_id": parentID}),
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	// Fill to cap via explicit creates
+	for i := 0; i < maxPeerContextSubscriptionsPerTask; i++ {
+		peerID := dbfx.Issue(t, fmt.Sprintf("mark cap peer %d", i), testutil.Cols{"parent_issue_id": parentID})
+		req := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": peerID})
+		req = withURLParam(req, "taskId", sourceTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.CreateIssueContextSubscription(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("fill %d status = %d, want 201: %s", i, w.Code, w.Body.String())
+		}
+	}
+
+	newPeerIssueID := dbfx.Issue(t, "mark cap new peer", testutil.Cols{"parent_issue_id": parentID})
+	newPeerTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   newPeerIssueID,
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+
+	// Implicit subscription via task_token message lookup
+	req := newRequest(http.MethodGet, "/api/tasks/"+newPeerTaskID+"/messages", nil)
+	req.Header.Set("X-Actor-Source", "task_token")
+	req.Header.Set("X-Task-ID", sourceTaskID)
+	req = withURLParam(req, "taskId", newPeerTaskID)
+	req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+	w := httptest.NewRecorder()
+	testHandler.ListTaskMessagesByUser(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("mark via message lookup status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	if got := dbfx.Count(t, `SELECT count(*) FROM issue_context_subscription WHERE task_id = $1`, sourceTaskID); got != 32 {
+		t.Fatalf("subscription count after mark bypass attempt = %d, want still 32", got)
+	}
+	// Seen should still have been recorded for the peer_task
+	var seenRows int
+	dbfx.QueryRow(t, `SELECT count(*) FROM issue_context_subscription_task_seen WHERE task_id = $1 AND peer_task_id = $2`, sourceTaskID, newPeerTaskID).Scan(&seenRows)
+	if seenRows != 1 {
+		t.Fatalf("seen rows for new peer = %d, want 1 (mark's seen side should still succeed)", seenRows)
+	}
+	// No subscription row for the new peer_issue
+	var subRows int
+	dbfx.QueryRow(t, `SELECT count(*) FROM issue_context_subscription WHERE task_id = $1 AND peer_issue_id = $2`, sourceTaskID, newPeerIssueID).Scan(&subRows)
+	if subRows != 0 {
+		t.Fatalf("subscription unexpectedly created for new peer at cap: %d rows", subRows)
+	}
+
+	// Mark for an already-subscribed peer must still update seen even at cap
+	// Pick an existing subscription's peer issue and create a fresh peer task on it
+	var existingPeerIssueID string
+	dbfx.QueryRow(t, `SELECT peer_issue_id FROM issue_context_subscription WHERE task_id = $1 LIMIT 1`, sourceTaskID).Scan(&existingPeerIssueID)
+	existingPeerTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   existingPeerIssueID,
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	req2 := newRequest(http.MethodGet, "/api/tasks/"+existingPeerTaskID+"/messages", nil)
+	req2.Header.Set("X-Actor-Source", "task_token")
+	req2.Header.Set("X-Task-ID", sourceTaskID)
+	req2 = withURLParam(req2, "taskId", existingPeerTaskID)
+	req2 = req2.WithContext(middleware.SetMemberContext(req2.Context(), testWorkspaceID, db.Member{}))
+	w2 := httptest.NewRecorder()
+	testHandler.ListTaskMessagesByUser(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("mark existing peer at cap status = %d, want 200: %s", w2.Code, w2.Body.String())
+	}
+	_ = ctx
 }

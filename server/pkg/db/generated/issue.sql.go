@@ -383,6 +383,12 @@ cleared_context_seen AS (
     USING agent_task_queue task
     WHERE task.issue_id IN (SELECT target.id FROM target)
       AND (seen.task_id = task.id OR seen.peer_task_id = task.id)
+),
+cleared_context_rebases AS (
+    DELETE FROM peer_context_rebase_log rebase
+    USING agent_task_queue task
+    WHERE task.issue_id IN (SELECT target.id FROM target)
+      AND (rebase.task_id = task.id OR rebase.peer_task_id = task.id)
 )
 DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target)
 `
@@ -408,6 +414,12 @@ type DeleteIssueParams struct {
 // when a caller passes a foreign issue_id with its own workspace_id (the issue
 // itself is correctly untouched, but the links are already gone) — the exact
 // cross-tenant leak the #1661 guard above exists to prevent.
+// issue_context_subscription (migration 433) cascades with its referenced
+// issue/task rows, but peer_context_rebase_log (migration 436) is
+// deliberately FK-free per repo policy, so its rows are swept here — the same
+// task-scoped pattern the seen-table sweep below uses. Without this, deleting
+// a parent issue strands the rebase audit rows of its tasks' peer context
+// forever (PUCK-58 review).
 func (q *Queries) DeleteIssue(ctx context.Context, arg DeleteIssueParams) error {
 	_, err := q.db.Exec(ctx, deleteIssue, arg.ID, arg.WorkspaceID)
 	return err
