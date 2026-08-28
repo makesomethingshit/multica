@@ -674,6 +674,10 @@ RETURNING *;
 -- unique key, so a competing retry or an already-attached context can make
 -- the subsequent attach-authority transfer lose after this row was inserted.
 -- Remove only that still-uncommitted child and let the parent's failure commit.
+WITH deleted_context_seen AS (
+    DELETE FROM issue_context_subscription_task_seen
+    WHERE task_id = sqlc.arg(task_id) OR peer_task_id = sqlc.arg(task_id)
+)
 DELETE FROM agent_task_queue
 WHERE id = sqlc.arg(task_id)
   AND status IN ('queued', 'deferred')

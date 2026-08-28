@@ -3273,6 +3273,10 @@ func (q *Queries) DeleteSystemAgentByID(ctx context.Context, id pgtype.UUID) err
 }
 
 const deleteUnstartedQuickCreateRetryTask = `-- name: DeleteUnstartedQuickCreateRetryTask :execrows
+WITH deleted_context_seen AS (
+    DELETE FROM issue_context_subscription_task_seen
+    WHERE task_id = $1 OR peer_task_id = $1
+)
 DELETE FROM agent_task_queue
 WHERE id = $1
   AND status IN ('queued', 'deferred')

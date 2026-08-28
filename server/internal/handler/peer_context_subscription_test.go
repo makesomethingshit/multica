@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +90,15 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		})
 		if err != nil || len(rows) != 1 || rows[0].Stale {
 			t.Fatalf("seen peer still marked stale: rows=%+v err=%v", rows, err)
+		}
+		subReq := newRequest(http.MethodGet, "/api/tasks/"+sourceTaskID+"/peer-context", nil)
+		subReq = withURLParam(subReq, "taskId", sourceTaskID)
+		subReq = subReq.WithContext(middleware.SetMemberContext(subReq.Context(), testWorkspaceID, db.Member{}))
+		subW := httptest.NewRecorder()
+		testHandler.ListIssueContextSubscriptions(subW, subReq)
+		var subscriptions []issueContextSubscriptionResponse
+		if subW.Code != http.StatusOK || json.Unmarshal(subW.Body.Bytes(), &subscriptions) != nil || len(subscriptions) != 1 || subscriptions[0].SeenRevision != revision {
+			t.Fatalf("subscription API did not expose seen revision: status=%d body=%s", subW.Code, subW.Body.String())
 		}
 	})
 
