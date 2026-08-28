@@ -157,6 +157,52 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		}
 	})
 
+	t.Run("second parallel task on a seen issue records status-only stale marker", func(t *testing.T) {
+		// The subscription cursor already covers this issue's revision (both
+		// earlier lookups marked it), so only the missing status cursor of the
+		// new task can make it stale — the claim shows [stale] and the lookup
+		// must record the rebase even though the revision never moved.
+		peerTask3ID := dbfx.Task(t, agentID, testutil.Cols{
+			"issue_id":   peerIssueID,
+			"runtime_id": runtimeID,
+			"status":     "running",
+		})
+		t.Cleanup(func() {
+			dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed' WHERE id = $1`, peerTask3ID)
+		})
+		rows, err := testHandler.Queries.ListActiveSiblingIssueTasks(ctx, db.ListActiveSiblingIssueTasksParams{
+			TaskID: sourceTask, ParentIssueID: parseUUID(parentID), WorkspaceID: parseUUID(testWorkspaceID),
+		})
+		if err != nil {
+			t.Fatalf("claim snapshot with second parallel task: %v", err)
+		}
+		secondStale := false
+		for _, row := range rows {
+			if uuidToString(row.TaskID) == peerTask3ID {
+				secondStale = row.Stale
+			}
+		}
+		if !secondStale {
+			t.Fatalf("claim did not mark new parallel task stale: %+v", rows)
+		}
+
+		req := newRequest(http.MethodGet, "/api/tasks/"+peerTask3ID+"/messages", nil)
+		req.Header.Set("X-Actor-Source", "task_token")
+		req.Header.Set("X-Task-ID", sourceTaskID)
+		req = withURLParam(req, "taskId", peerTask3ID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("second parallel task lookup status = %d: %s", w.Code, w.Body.String())
+		}
+		var markers int
+		dbfx.QueryRow(t, `SELECT count(*) FROM task_message WHERE task_id = $1 AND type = 'peer_context_rebase' AND content LIKE '%' || $2 || '%'`, sourceTaskID, peerTask3ID).Scan(&markers)
+		if markers != 1 {
+			t.Fatalf("status-only stale lookup recorded %d rebase markers mentioning %s, want 1", markers, peerTask3ID)
+		}
+	})
+
 	t.Run("seen keeps the returned snapshot revision", func(t *testing.T) {
 		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
 		fn, trigger := "peer_seen_snapshot_"+suffix, "peer_seen_snapshot_trg_"+suffix
@@ -238,6 +284,110 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		testHandler.ListTaskMessagesByUser(w, req)
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("seen write failure status = %d, want 500: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("marker write failure rolls back the seen cursor", func(t *testing.T) {
+		// Force only the marker insert to fail while the seen write succeeds.
+		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+		fn, trigger := "peer_marker_fail_"+suffix, "peer_marker_fail_trg_"+suffix
+		dbfx.Exec(t, fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.type = 'peer_context_rebase' THEN RAISE EXCEPTION 'forced marker write failure'; END IF; RETURN NEW; END $$`, fn))
+		dbfx.Exec(t, fmt.Sprintf(`CREATE TRIGGER %s BEFORE INSERT ON task_message FOR EACH ROW EXECUTE FUNCTION %s()`, trigger, fn))
+		t.Cleanup(func() {
+			dbfx.Exec(t, "DROP TRIGGER IF EXISTS "+trigger+" ON task_message")
+			dbfx.Exec(t, "DROP FUNCTION IF EXISTS "+fn+"()")
+		})
+		// Reset the cursor so the next lookup is stale and must record a marker.
+		dbfx.Exec(t, `DELETE FROM issue_context_subscription_task_seen WHERE task_id = $1 AND peer_task_id = $2`, sourceTaskID, peerTaskID)
+
+		req := newRequest(http.MethodGet, "/api/tasks/"+peerTaskID+"/messages", nil)
+		req.Header.Set("X-Actor-Source", "task_token")
+		req.Header.Set("X-Task-ID", sourceTaskID)
+		req = withURLParam(req, "taskId", peerTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w, req)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("marker write failure status = %d, want 500: %s", w.Code, w.Body.String())
+		}
+		var seenRows int
+		dbfx.QueryRow(t, `SELECT count(*) FROM issue_context_subscription_task_seen WHERE task_id = $1 AND peer_task_id = $2`, sourceTaskID, peerTaskID).Scan(&seenRows)
+		if seenRows != 0 {
+			t.Fatalf("seen cursor survived a failed marker write; retry would lose the audit record")
+		}
+
+		dbfx.Exec(t, "DROP TRIGGER IF EXISTS "+trigger+" ON task_message")
+		dbfx.Exec(t, "DROP FUNCTION IF EXISTS "+fn+"()")
+		w2 := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w2, req)
+		if w2.Code != http.StatusOK {
+			t.Fatalf("retry after marker failure status = %d: %s", w2.Code, w2.Body.String())
+		}
+		var markers, seenRows2 int
+		dbfx.QueryRow(t, `SELECT count(*) FROM task_message WHERE task_id = $1 AND type = 'peer_context_rebase'`, sourceTaskID).Scan(&markers)
+		dbfx.QueryRow(t, `SELECT count(*) FROM issue_context_subscription_task_seen WHERE task_id = $1 AND peer_task_id = $2`, sourceTaskID, peerTaskID).Scan(&seenRows2)
+		if markers == 0 || seenRows2 != 1 {
+			t.Fatalf("retry did not persist marker (%d) and seen cursor (%d rows)", markers, seenRows2)
+		}
+	})
+
+	t.Run("marker seq stays outside the daemon seq space", func(t *testing.T) {
+		// Daemon output uses a local positive counter the server never sees.
+		dbfx.Exec(t, `INSERT INTO task_message (task_id, seq, type, content) VALUES ($1, 1, 'text', 'daemon output one'), ($1, 2, 'text', 'daemon output two')`, sourceTaskID)
+		var daemonNext int32
+		dbfx.QueryRow(t, `SELECT COALESCE(MAX(seq), 0) + 1 FROM task_message WHERE task_id = $1 AND seq > 0`, sourceTaskID).Scan(&daemonNext)
+		// Force a fresh stale event.
+		dbfx.Exec(t, `DELETE FROM issue_context_subscription_task_seen WHERE task_id = $1 AND peer_task_id = $2`, sourceTaskID, peerTaskID)
+
+		req := newRequest(http.MethodGet, "/api/tasks/"+peerTaskID+"/messages", nil)
+		req.Header.Set("X-Actor-Source", "task_token")
+		req.Header.Set("X-Task-ID", sourceTaskID)
+		req = withURLParam(req, "taskId", peerTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("stale lookup status = %d: %s", w.Code, w.Body.String())
+		}
+		var markerSeq int32
+		dbfx.QueryRow(t, `SELECT seq FROM task_message WHERE task_id = $1 AND type = 'peer_context_rebase' ORDER BY seq ASC LIMIT 1`, sourceTaskID).Scan(&markerSeq)
+		if markerSeq >= 0 {
+			t.Fatalf("marker seq = %d, want a negative value disjoint from the daemon counter", markerSeq)
+		}
+
+		// The daemon keeps counting from its own counter, unaware of the marker.
+		dbfx.Exec(t, `INSERT INTO task_message (task_id, seq, type, content) VALUES ($1, $2, 'text', 'daemon output after marker')`, sourceTaskID, daemonNext)
+		// The frontend dedupes by seq: no two rows of the task may share one.
+		var dupes int
+		dbfx.QueryRow(t, `SELECT count(*) FROM (SELECT seq FROM task_message WHERE task_id = $1 GROUP BY seq HAVING count(*) > 1) d`, sourceTaskID).Scan(&dupes)
+		if dupes != 0 {
+			t.Fatalf("duplicate seqs in task message log; seq dedupe would drop real output")
+		}
+		messages, err := testHandler.Queries.ListTaskMessages(ctx, sourceTask)
+		if err != nil {
+			t.Fatalf("list task messages: %v", err)
+		}
+		present := map[int32]bool{}
+		for _, m := range messages {
+			present[m.Seq] = true
+		}
+		for _, want := range []int32{1, 2, daemonNext, markerSeq} {
+			if !present[want] {
+				t.Fatalf("task message log lost seq %d after the marker; seqs = %v", want, present)
+			}
+		}
+
+		// A second stale event takes the next disjoint value, not a duplicate.
+		dbfx.Exec(t, `UPDATE issue SET title = title || ' resequenced', revision = revision + 1 WHERE id = $1`, peerIssueID)
+		w2 := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w2, req)
+		if w2.Code != http.StatusOK {
+			t.Fatalf("second stale lookup status = %d: %s", w2.Code, w2.Body.String())
+		}
+		var minSeq int32
+		dbfx.QueryRow(t, `SELECT MIN(seq) FROM task_message WHERE task_id = $1 AND type = 'peer_context_rebase'`, sourceTaskID).Scan(&minSeq)
+		if minSeq >= markerSeq {
+			t.Fatalf("second marker seq = %d, want strictly below the first marker %d", minSeq, markerSeq)
 		}
 	})
 

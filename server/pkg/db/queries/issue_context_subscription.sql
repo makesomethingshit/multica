@@ -48,14 +48,28 @@ SELECT task_id, peer_task_id, seen_revision, seen_task_status, created_at, updat
 FROM issue_context_subscription_task_seen
 WHERE task_id = @task_id AND peer_task_id = @peer_task_id;
 
+-- name: LockPeerContextRebaseWriter :exec
+-- Serialize the seen-cursor advance + audit-marker insert per source task so
+-- two concurrent peer lookups cannot allocate the same marker seq.
+SELECT pg_advisory_xact_lock(hashtextextended(@task_id::text || ':peer_context_rebase', 0));
+
 -- name: CreatePeerContextRebaseMessage :one
 -- Record the first-class rebase marker in the source task's execution log.
 -- The lookup that triggered this write is authenticated and has already
 -- proved the peer belongs to the same parent/workspace.
+--
+-- seq lives in a daemon-disjoint negative space counting down from
+-- MIN(seq)-1: the daemon numbers its messages with a local positive counter
+-- and never reads server rows, so MAX(seq)+1 would collide with the daemon's
+-- next real message and the frontend's seq dedupe would drop one of the two.
+-- Negative seqs also stay below every --since cursor, which tracks the
+-- daemon's max seen seq, so markers can never poison incremental polls.
+-- Callers hold LockPeerContextRebaseWriter, so concurrent markers on the same
+-- task cannot allocate the same value.
 INSERT INTO task_message (task_id, seq, type, tool, content)
 VALUES (
     @task_id,
-    COALESCE((SELECT MAX(seq) FROM task_message WHERE task_id = @task_id), 0) + 1,
+    COALESCE((SELECT MIN(seq) FROM task_message WHERE task_id = @task_id), 0) - 1,
     'peer_context_rebase',
     'peer-context',
     @content

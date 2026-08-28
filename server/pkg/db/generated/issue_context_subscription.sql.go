@@ -51,7 +51,7 @@ const createPeerContextRebaseMessage = `-- name: CreatePeerContextRebaseMessage 
 INSERT INTO task_message (task_id, seq, type, tool, content)
 VALUES (
     $1,
-    COALESCE((SELECT MAX(seq) FROM task_message WHERE task_id = $1), 0) + 1,
+    COALESCE((SELECT MIN(seq) FROM task_message WHERE task_id = $1), 0) - 1,
     'peer_context_rebase',
     'peer-context',
     $2
@@ -67,6 +67,15 @@ type CreatePeerContextRebaseMessageParams struct {
 // Record the first-class rebase marker in the source task's execution log.
 // The lookup that triggered this write is authenticated and has already
 // proved the peer belongs to the same parent/workspace.
+//
+// seq lives in a daemon-disjoint negative space counting down from
+// MIN(seq)-1: the daemon numbers its messages with a local positive counter
+// and never reads server rows, so MAX(seq)+1 would collide with the daemon's
+// next real message and the frontend's seq dedupe would drop one of the two.
+// Negative seqs also stay below every --since cursor, which tracks the
+// daemon's max seen seq, so markers can never poison incremental polls.
+// Callers hold LockPeerContextRebaseWriter, so concurrent markers on the same
+// task cannot allocate the same value.
 func (q *Queries) CreatePeerContextRebaseMessage(ctx context.Context, arg CreatePeerContextRebaseMessageParams) (TaskMessage, error) {
 	row := q.db.QueryRow(ctx, createPeerContextRebaseMessage, arg.TaskID, arg.Content)
 	var i TaskMessage
@@ -208,6 +217,17 @@ func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgty
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockPeerContextRebaseWriter = `-- name: LockPeerContextRebaseWriter :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':peer_context_rebase', 0))
+`
+
+// Serialize the seen-cursor advance + audit-marker insert per source task so
+// two concurrent peer lookups cannot allocate the same marker seq.
+func (q *Queries) LockPeerContextRebaseWriter(ctx context.Context, taskID string) error {
+	_, err := q.db.Exec(ctx, lockPeerContextRebaseWriter, taskID)
+	return err
 }
 
 const markIssueContextSubscriptionSeen = `-- name: MarkIssueContextSubscriptionSeen :one

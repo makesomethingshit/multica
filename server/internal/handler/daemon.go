@@ -4954,7 +4954,6 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		seenRevision   int64
 		seenTaskStatus string
 		priorPeerSeen  db.IssueContextSubscriptionTaskSeen
-		priorStatusSet bool
 		rebaseNeeded   bool
 	)
 	if r.Header.Get("X-Actor-Source") == "task_token" {
@@ -4980,20 +4979,14 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	queries := h.Queries
 	if queryTx != nil {
 		queries = h.Queries.WithTx(queryTx)
+		// Claim-time staleness (ListActiveSiblingIssueTasks) is computed from
+		// the per-task cursor alone; mirror it exactly so the lookup records a
+		// rebase precisely when the claim snapshot showed `[stale]` — including
+		// a new parallel peer task on an issue whose revision was already read
+		// through a sibling task (status cursor absent → stale at claim).
 		if priorPeerSeen, queryErr = queries.GetIssueContextSubscriptionTaskSeen(r.Context(), db.GetIssueContextSubscriptionTaskSeenParams{
 			TaskID: sourceTaskID, PeerTaskID: taskUUID,
-		}); queryErr == nil {
-			priorStatusSet = true
-		} else if errors.Is(queryErr, pgx.ErrNoRows) {
-			if subscription, subscriptionErr := queries.GetIssueContextSubscription(r.Context(), db.GetIssueContextSubscriptionParams{
-				TaskID: sourceTaskID, PeerIssueID: task.IssueID,
-			}); subscriptionErr == nil {
-				priorPeerSeen.SeenRevision = subscription.SeenRevision
-			} else if !errors.Is(subscriptionErr, pgx.ErrNoRows) {
-				writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
-				return
-			}
-		} else {
+		}); queryErr != nil && !errors.Is(queryErr, pgx.ErrNoRows) {
 			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
 			return
 		}
@@ -5023,12 +5016,13 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		}
 		seenRevision = snapshot.IssueRevision
 		seenTaskStatus = snapshot.TaskStatus
-		// The authenticated lookup is the rebase boundary: compare the
-		// snapshot captured in this transaction with the last snapshot this
-		// source task explicitly read. A first lookup with no cursor is stale
-		// whenever the peer already has a non-zero revision.
+		// The authenticated lookup is the rebase boundary: compare the snapshot
+		// captured in this transaction with this source task's per-peer cursor,
+		// using the claim query's exact stale condition — an unseen peer keeps
+		// zero-value cursors, so a first lookup of a peer whose revision or
+		// status is already non-empty is stale just like the claim snapshot.
 		rebaseNeeded = seenRevision > priorPeerSeen.SeenRevision ||
-			(priorStatusSet && seenTaskStatus != priorPeerSeen.SeenTaskStatus)
+			seenTaskStatus != priorPeerSeen.SeenTaskStatus
 		if err := queryTx.Commit(r.Context()); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
 			return
@@ -5042,7 +5036,23 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	// synthetic execution-log marker so the rebase attempt is auditable without
 	// requiring a second write command from the agent.
 	if markPeerSeen {
-		if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
+		// The cursor advance and the audit marker must land together: if the
+		// marker insert failed while the cursor survived, every retry would see
+		// the stale event as already consumed and the audit record would be
+		// lost permanently. One transaction + advisory lock also serializes
+		// concurrent peer lookups so marker seq allocation stays unique.
+		writeTx, writeErr := h.TxStarter.Begin(r.Context())
+		if writeErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
+		defer writeTx.Rollback(r.Context())
+		txQueries := h.Queries.WithTx(writeTx)
+		if lockErr := txQueries.LockPeerContextRebaseWriter(r.Context(), uuidToString(sourceTaskID)); lockErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
+		if _, markErr := txQueries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
 			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
 		}); markErr != nil {
 			if errors.Is(markErr, pgx.ErrNoRows) {
@@ -5052,17 +5062,26 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
 			return
 		}
+		var marker db.TaskMessage
+		markerRecorded := false
 		if rebaseNeeded {
 			content := fmt.Sprintf("Peer context rebase recorded from task %s: revision %d -> %d, status %q -> %q. Check the latest peer decisions against the current plan before continuing.",
 				taskID, priorPeerSeen.SeenRevision, seenRevision, priorPeerSeen.SeenTaskStatus, seenTaskStatus)
-			marker, markerErr := h.Queries.CreatePeerContextRebaseMessage(r.Context(), db.CreatePeerContextRebaseMessageParams{
+			var markerErr error
+			if marker, markerErr = txQueries.CreatePeerContextRebaseMessage(r.Context(), db.CreatePeerContextRebaseMessageParams{
 				TaskID:  sourceTaskID,
 				Content: pgtype.Text{String: content, Valid: true},
-			})
-			if markerErr != nil {
+			}); markerErr != nil {
 				writeError(w, http.StatusInternalServerError, "failed to record peer context rebase")
 				return
 			}
+			markerRecorded = true
+		}
+		if err := writeTx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
+		if markerRecorded {
 			if sourceTask, sourceErr := h.Queries.GetAgentTask(r.Context(), sourceTaskID); sourceErr == nil {
 				h.publishTask(protocol.EventTaskMessage, wsID, "system", "", uuidToString(sourceTaskID),
 					taskMessageToPayload(marker, uuidToString(sourceTaskID), uuidToString(sourceTask.IssueID)))
