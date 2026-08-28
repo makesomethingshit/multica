@@ -147,6 +147,9 @@ func buildActivePeerRunsBlock(task Task) string {
 			}
 			fmt.Fprintf(&b, " (revision %d, seen %d)", revision, run.SeenRevision)
 		}
+		if run.Stale {
+			b.WriteString(" [stale]")
+		}
 		fmt.Fprintf(&b, "; inspect: `multica issue run-messages %s`\n", run.TaskID)
 	}
 	b.WriteString("\n")

@@ -3045,6 +3045,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					IssueRevision:   sibling.IssueRevision,
 					Revision:        sibling.IssueRevision,
 					SeenRevision:    sibling.SeenRevision,
+					Stale:           sibling.Stale,
 					AgentName:       sibling.AgentName,
 					Status:          sibling.Status,
 					CreatedAt:       timestampToString(sibling.CreatedAt),
@@ -4972,14 +4973,17 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	// prompt. Record that read only after the messages lookup succeeded; claim
 	// itself never advances this cursor.
 	if r.Header.Get("X-Actor-Source") == "task_token" {
-		if sourceID, err := uuid.Parse(r.Header.Get("X-Task-ID")); err == nil && sourceID != taskUUID && task.IssueID.Valid {
-			if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{TaskID: sourceID, PeerIssueID: task.IssueID}); markErr != nil {
-				if errors.Is(markErr, pgx.ErrNoRows) {
-					writeError(w, http.StatusNotFound, "peer context not found")
+		if sourceID, err := uuid.Parse(r.Header.Get("X-Task-ID")); err == nil && task.IssueID.Valid {
+			sourceTaskID := pgtype.UUID{Bytes: sourceID, Valid: true}
+			if sourceTaskID != taskUUID {
+				if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{TaskID: sourceTaskID, PeerIssueID: task.IssueID}); markErr != nil {
+					if errors.Is(markErr, pgx.ErrNoRows) {
+						writeError(w, http.StatusNotFound, "peer context not found")
+						return
+					}
+					writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
 					return
 				}
-				writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
-				return
 			}
 		}
 	}
@@ -5061,7 +5065,7 @@ func (h *Handler) CreateIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: pgtype.UUID{Bytes: peerID, Valid: true}})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "peer issue not found")
@@ -5084,7 +5088,7 @@ func (h *Handler) DeleteIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	deleted, err := h.Queries.DeleteIssueContextSubscription(r.Context(), db.DeleteIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	deleted, err := h.Queries.DeleteIssueContextSubscription(r.Context(), db.DeleteIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: pgtype.UUID{Bytes: peerID, Valid: true}})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete peer subscription")
 		return

@@ -62,6 +62,9 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		if rows[0].SeenRevision != 0 {
 			t.Fatalf("claim changed seen_revision to %d", rows[0].SeenRevision)
 		}
+		if !rows[0].Stale {
+			t.Fatalf("claim did not mark unseen peer revision stale: %+v", rows[0])
+		}
 	})
 
 	t.Run("explicit lookup marks seen", func(t *testing.T) {
@@ -80,6 +83,22 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		dbfx.QueryRow(t, `SELECT s.seen_revision, i.revision FROM issue_context_subscription s JOIN issue i ON i.id = s.peer_issue_id WHERE s.task_id = $1 AND s.peer_issue_id = $2`, sourceTaskID, peerIssueID).Scan(&seen, &revision)
 		if seen != revision || seen == 0 {
 			t.Fatalf("seen_revision = %d, issue revision = %d", seen, revision)
+		}
+		rows, err := testHandler.Queries.ListActiveSiblingIssueTasks(ctx, db.ListActiveSiblingIssueTasksParams{
+			TaskID: sourceTask, ParentIssueID: parseUUID(parentID), WorkspaceID: parseUUID(testWorkspaceID),
+		})
+		if err != nil || len(rows) != 1 || rows[0].Stale {
+			t.Fatalf("seen peer still marked stale: rows=%+v err=%v", rows, err)
+		}
+	})
+
+	t.Run("revision bump marks stale", func(t *testing.T) {
+		dbfx.Exec(t, `UPDATE issue SET title = title || ' changed', revision = revision + 1 WHERE id = $1`, peerIssueID)
+		rows, err := testHandler.Queries.ListActiveSiblingIssueTasks(ctx, db.ListActiveSiblingIssueTasksParams{
+			TaskID: sourceTask, ParentIssueID: parseUUID(parentID), WorkspaceID: parseUUID(testWorkspaceID),
+		})
+		if err != nil || len(rows) != 1 || !rows[0].Stale || rows[0].IssueRevision <= rows[0].SeenRevision {
+			t.Fatalf("revision bump did not mark peer stale: rows=%+v err=%v", rows, err)
 		}
 	})
 

@@ -5124,6 +5124,7 @@ SELECT
     i.title AS issue_title,
     i.revision AS issue_revision,
     COALESCE(sub.seen_revision, 0)::bigint AS seen_revision,
+    (i.revision > COALESCE(sub.seen_revision, 0)) AS stale,
     a.name AS agent_name,
     atq.status,
     atq.created_at,
@@ -5162,6 +5163,7 @@ type ListActiveSiblingIssueTasksRow struct {
 	IssueTitle    string             `json:"issue_title"`
 	IssueRevision int64              `json:"issue_revision"`
 	SeenRevision  int64              `json:"seen_revision"`
+	Stale         bool               `json:"stale"`
 	AgentName     string             `json:"agent_name"`
 	Status        string             `json:"status"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
@@ -5195,6 +5197,7 @@ func (q *Queries) ListActiveSiblingIssueTasks(ctx context.Context, arg ListActiv
 			&i.IssueTitle,
 			&i.IssueRevision,
 			&i.SeenRevision,
+			&i.Stale,
 			&i.AgentName,
 			&i.Status,
 			&i.CreatedAt,

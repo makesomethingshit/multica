@@ -23,6 +23,7 @@ type batchClaimResponse struct {
 			IssueID         string `json:"issue_id"`
 			IssueIdentifier string `json:"issue_identifier"`
 			IssueTitle      string `json:"issue_title"`
+			Stale           bool   `json:"stale"`
 			AgentName       string `json:"agent_name"`
 			Status          string `json:"status"`
 			CreatedAt       string `json:"created_at"`
@@ -194,6 +195,9 @@ func TestClaimTasksByRuntime_IncludesActiveSiblingRun(t *testing.T) {
 		}
 		if i < 2 && (run.Status != "running" || run.StartedAt == "") {
 			t.Fatalf("active_sibling_runs[%d] = %+v, want started running task", i, run)
+		}
+		if !run.Stale {
+			t.Fatalf("active_sibling_runs[%d] = %+v, want unseen peer marked stale", i, run)
 		}
 	}
 }
