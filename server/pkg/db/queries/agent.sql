@@ -297,6 +297,9 @@ SELECT
     i.title AS issue_title,
     i.revision AS issue_revision,
     COALESCE(sub.seen_revision, 0)::bigint AS seen_revision,
+    COALESCE(sub.seen_task_status, '') AS seen_task_status,
+    CASE WHEN i.revision > COALESCE(sub.seen_revision, 0)
+        OR atq.status <> COALESCE(sub.seen_task_status, '') THEN TRUE ELSE FALSE END AS stale,
     a.name AS agent_name,
     atq.status,
     atq.created_at,
@@ -305,8 +308,8 @@ FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 JOIN workspace w ON w.id = i.workspace_id
 JOIN agent a ON a.id = atq.agent_id
-LEFT JOIN issue_context_subscription sub
-  ON sub.task_id = @task_id AND sub.peer_issue_id = i.id
+LEFT JOIN issue_context_subscription_task_seen sub
+  ON sub.task_id = @task_id AND sub.peer_task_id = atq.id
 WHERE i.parent_issue_id = @parent_issue_id
   AND i.workspace_id = @workspace_id
   AND atq.id <> @task_id
@@ -671,6 +674,10 @@ RETURNING *;
 -- unique key, so a competing retry or an already-attached context can make
 -- the subsequent attach-authority transfer lose after this row was inserted.
 -- Remove only that still-uncommitted child and let the parent's failure commit.
+WITH deleted_context_seen AS (
+    DELETE FROM issue_context_subscription_task_seen
+    WHERE task_id = sqlc.arg(task_id) OR peer_task_id = sqlc.arg(task_id)
+)
 DELETE FROM agent_task_queue
 WHERE id = sqlc.arg(task_id)
   AND status IN ('queued', 'deferred')

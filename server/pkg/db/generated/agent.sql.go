@@ -3273,6 +3273,10 @@ func (q *Queries) DeleteSystemAgentByID(ctx context.Context, id pgtype.UUID) err
 }
 
 const deleteUnstartedQuickCreateRetryTask = `-- name: DeleteUnstartedQuickCreateRetryTask :execrows
+WITH deleted_context_seen AS (
+    DELETE FROM issue_context_subscription_task_seen
+    WHERE task_id = $1 OR peer_task_id = $1
+)
 DELETE FROM agent_task_queue
 WHERE id = $1
   AND status IN ('queued', 'deferred')
@@ -5124,6 +5128,9 @@ SELECT
     i.title AS issue_title,
     i.revision AS issue_revision,
     COALESCE(sub.seen_revision, 0)::bigint AS seen_revision,
+    COALESCE(sub.seen_task_status, '') AS seen_task_status,
+    CASE WHEN i.revision > COALESCE(sub.seen_revision, 0)
+        OR atq.status <> COALESCE(sub.seen_task_status, '') THEN TRUE ELSE FALSE END AS stale,
     a.name AS agent_name,
     atq.status,
     atq.created_at,
@@ -5132,8 +5139,8 @@ FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 JOIN workspace w ON w.id = i.workspace_id
 JOIN agent a ON a.id = atq.agent_id
-LEFT JOIN issue_context_subscription sub
-  ON sub.task_id = $1 AND sub.peer_issue_id = i.id
+LEFT JOIN issue_context_subscription_task_seen sub
+  ON sub.task_id = $1 AND sub.peer_task_id = atq.id
 WHERE i.parent_issue_id = $2
   AND i.workspace_id = $3
   AND atq.id <> $1
@@ -5155,17 +5162,19 @@ type ListActiveSiblingIssueTasksParams struct {
 }
 
 type ListActiveSiblingIssueTasksRow struct {
-	TaskID        pgtype.UUID        `json:"task_id"`
-	IssueID       pgtype.UUID        `json:"issue_id"`
-	IssuePrefix   string             `json:"issue_prefix"`
-	IssueNumber   int32              `json:"issue_number"`
-	IssueTitle    string             `json:"issue_title"`
-	IssueRevision int64              `json:"issue_revision"`
-	SeenRevision  int64              `json:"seen_revision"`
-	AgentName     string             `json:"agent_name"`
-	Status        string             `json:"status"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	TaskID         pgtype.UUID        `json:"task_id"`
+	IssueID        pgtype.UUID        `json:"issue_id"`
+	IssuePrefix    string             `json:"issue_prefix"`
+	IssueNumber    int32              `json:"issue_number"`
+	IssueTitle     string             `json:"issue_title"`
+	IssueRevision  int64              `json:"issue_revision"`
+	SeenRevision   int64              `json:"seen_revision"`
+	SeenTaskStatus string             `json:"seen_task_status"`
+	Stale          bool               `json:"stale"`
+	AgentName      string             `json:"agent_name"`
+	Status         string             `json:"status"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
 }
 
 // Claim-time peer awareness for a child issue task. Only tasks whose issue
@@ -5195,6 +5204,8 @@ func (q *Queries) ListActiveSiblingIssueTasks(ctx context.Context, arg ListActiv
 			&i.IssueTitle,
 			&i.IssueRevision,
 			&i.SeenRevision,
+			&i.SeenTaskStatus,
+			&i.Stale,
 			&i.AgentName,
 			&i.Status,
 			&i.CreatedAt,

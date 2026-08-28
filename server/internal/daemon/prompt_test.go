@@ -1076,6 +1076,9 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 			IssueID:         "issue-source",
 			IssueIdentifier: "MUL-6000",
 			IssueTitle:      "Existing work",
+			IssueRevision:   5,
+			SeenRevision:    3,
+			Stale:           true,
 			AgentName:       "Peer agent",
 			Status:          "running",
 			StartedAt:       "2026-08-14T03:00:00Z",
@@ -1090,6 +1093,7 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 		"multica issue comment list issue-target --roots-only --summary --compact --output json",
 		"multica issue run-messages task-existing",
 		"--no-start",
+		"[stale]",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("prompt missing %q\n--- output ---\n%s", want, out)
@@ -1100,6 +1104,20 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 	}
 	if strings.Contains(out, "run-messages task-existing --issue") {
 		t.Errorf("prompt must not resolve the issue when the task id is already complete\n--- output ---\n%s", out)
+	}
+}
+
+func TestBuildPromptOmitsStaleMarkerWhenPeerIsCurrent(t *testing.T) {
+	task := Task{
+		IssueID: "issue-target",
+		ActiveSiblingRuns: []ActiveSiblingRunData{{
+			TaskID:        "task-existing",
+			IssueRevision: 4,
+			SeenRevision:  4,
+		}},
+	}
+	if out := BuildPrompt(task, "claude"); strings.Contains(out, "[stale]") {
+		t.Fatalf("current peer unexpectedly marked stale:\n%s", out)
 	}
 }
 

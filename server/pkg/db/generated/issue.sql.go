@@ -377,6 +377,12 @@ WITH target AS (
 ),
 cleared_vcs_pr_links AS (
     DELETE FROM issue_vcs_pull_request WHERE issue_id IN (SELECT target.id FROM target)
+),
+cleared_context_seen AS (
+    DELETE FROM issue_context_subscription_task_seen seen
+    USING agent_task_queue task
+    WHERE task.issue_id IN (SELECT target.id FROM target)
+      AND (seen.task_id = task.id OR seen.peer_task_id = task.id)
 )
 DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target)
 `

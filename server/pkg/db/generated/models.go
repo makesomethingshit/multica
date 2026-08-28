@@ -786,6 +786,15 @@ type IssueContextSubscription struct {
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 }
 
+type IssueContextSubscriptionTaskSeen struct {
+	TaskID         pgtype.UUID        `json:"task_id"`
+	PeerTaskID     pgtype.UUID        `json:"peer_task_id"`
+	SeenRevision   int64              `json:"seen_revision"`
+	SeenTaskStatus string             `json:"seen_task_status"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
 type IssueDependency struct {
 	ID               pgtype.UUID `json:"id"`
 	IssueID          pgtype.UUID `json:"issue_id"`

@@ -3045,6 +3045,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					IssueRevision:   sibling.IssueRevision,
 					Revision:        sibling.IssueRevision,
 					SeenRevision:    sibling.SeenRevision,
+					Stale:           sibling.Stale,
 					AgentName:       sibling.AgentName,
 					Status:          sibling.Status,
 					CreatedAt:       timestampToString(sibling.CreatedAt),
@@ -4946,41 +4947,82 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	}
 
 	var (
-		messages []db.TaskMessage
-		queryErr error
+		messages       []db.TaskMessage
+		queryErr       error
+		sourceTaskID   pgtype.UUID
+		markPeerSeen   bool
+		seenRevision   int64
+		seenTaskStatus string
 	)
+	if r.Header.Get("X-Actor-Source") == "task_token" {
+		if sourceID, parseErr := uuid.Parse(r.Header.Get("X-Task-ID")); parseErr == nil {
+			sourceTaskID = pgtype.UUID{Bytes: sourceID, Valid: true}
+			markPeerSeen = sourceTaskID != taskUUID && task.IssueID.Valid
+		}
+	}
+	var queryTx pgx.Tx
+	if markPeerSeen {
+		queryTx, queryErr = h.TxStarter.Begin(r.Context())
+		if queryErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+		defer queryTx.Rollback(r.Context())
+		_, queryErr = queryTx.Exec(r.Context(), "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+		if queryErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+	}
+	queries := h.Queries
+	if queryTx != nil {
+		queries = h.Queries.WithTx(queryTx)
+	}
 	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
 		sinceSeq, parseErr := strconv.Atoi(sinceStr)
 		if parseErr != nil {
 			writeError(w, http.StatusBadRequest, "invalid since parameter")
 			return
 		}
-		messages, queryErr = h.Queries.ListTaskMessagesSince(r.Context(), db.ListTaskMessagesSinceParams{
+		messages, queryErr = queries.ListTaskMessagesSince(r.Context(), db.ListTaskMessagesSinceParams{
 			TaskID: taskUUID,
 			Seq:    int32(sinceSeq),
 		})
 	} else {
-		messages, queryErr = h.Queries.ListTaskMessages(r.Context(), taskUUID)
+		messages, queryErr = queries.ListTaskMessages(r.Context(), taskUUID)
 	}
 	if queryErr != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list task messages")
 		return
+	}
+	if markPeerSeen {
+		snapshot, snapshotErr := queries.GetTaskPeerSnapshot(r.Context(), taskUUID)
+		if snapshotErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+		seenRevision = snapshot.IssueRevision
+		seenTaskStatus = snapshot.TaskStatus
+		if err := queryTx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
 	}
 
 	issueID := uuidToString(task.IssueID)
 	// A running agent may explicitly inspect a sibling run from the claim
 	// prompt. Record that read only after the messages lookup succeeded; claim
 	// itself never advances this cursor.
-	if r.Header.Get("X-Actor-Source") == "task_token" {
-		if sourceID, err := uuid.Parse(r.Header.Get("X-Task-ID")); err == nil && sourceID != taskUUID && task.IssueID.Valid {
-			if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{TaskID: sourceID, PeerIssueID: task.IssueID}); markErr != nil {
-				if errors.Is(markErr, pgx.ErrNoRows) {
-					writeError(w, http.StatusNotFound, "peer context not found")
-					return
-				}
-				writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
+	if markPeerSeen {
+		if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
+			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
+		}); markErr != nil {
+			if errors.Is(markErr, pgx.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "peer context not found")
 				return
 			}
+			writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
+			return
 		}
 	}
 
@@ -5039,7 +5081,9 @@ func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.R
 	resp := make([]issueContextSubscriptionResponse, 0, len(rows))
 	for _, row := range rows {
 		revision := int64(0)
-		if issue, err := h.Queries.GetIssue(r.Context(), row.PeerIssueID); err == nil { revision = issue.Revision }
+		if issue, err := h.Queries.GetIssue(r.Context(), row.PeerIssueID); err == nil {
+			revision = issue.Revision
+		}
 		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: revision})
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -5061,7 +5105,7 @@ func (h *Handler) CreateIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: pgtype.UUID{Bytes: peerID, Valid: true}})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "peer issue not found")
@@ -5084,7 +5128,7 @@ func (h *Handler) DeleteIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	deleted, err := h.Queries.DeleteIssueContextSubscription(r.Context(), db.DeleteIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	deleted, err := h.Queries.DeleteIssueContextSubscription(r.Context(), db.DeleteIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: pgtype.UUID{Bytes: peerID, Valid: true}})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete peer subscription")
 		return
