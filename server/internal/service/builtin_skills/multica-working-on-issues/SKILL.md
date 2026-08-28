@@ -249,8 +249,9 @@ deliberately keeps same-agent handoffs to a fresh issue starting runs: cross-iss
 serial chains and triage batches rely on that.
 
 When a peer is marked `[stale]`, read its `run-messages` before overlapping
-edits. That authenticated lookup records a `peer_context_rebase` task message
-with the revision/status change; treat the peer output as steering context,
+edits. That authenticated lookup appends the rebase (revision/status change)
+to the task's peer context audit log, readable with `multica issue run-rebases
+<task-id>`; treat the peer output as steering context,
 and ask the user to confirm before a material scope or direction change.
 
 ## Sub-issues: `todo` starts work now, `backlog` parks it

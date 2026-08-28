@@ -1039,6 +1039,17 @@ type NotificationPreference struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type PeerContextRebaseLog struct {
+	Seq          int64              `json:"seq"`
+	TaskID       pgtype.UUID        `json:"task_id"`
+	PeerTaskID   pgtype.UUID        `json:"peer_task_id"`
+	FromRevision int64              `json:"from_revision"`
+	ToRevision   int64              `json:"to_revision"`
+	FromStatus   string             `json:"from_status"`
+	ToStatus     string             `json:"to_status"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type PersonalAccessToken struct {
 	ID          pgtype.UUID        `json:"id"`
 	UserID      pgtype.UUID        `json:"user_id"`

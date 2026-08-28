@@ -330,6 +330,13 @@ var issueRunMessagesCmd = &cobra.Command{
 	RunE:  runIssueRunMessages,
 }
 
+var issueRunRebasesCmd = &cobra.Command{
+	Use:   "run-rebases <task-id>",
+	Short: "List an execution's peer context rebase audit log in occurrence order",
+	Args:  exactArgs(1),
+	RunE:  runIssueRunRebases,
+}
+
 var issueUsageCmd = &cobra.Command{
 	Use:   "usage <issue-id>",
 	Short: "Show aggregated token usage for an issue",
@@ -457,6 +464,7 @@ func init() {
 	issueCmd.AddCommand(issueSubscriberCmd)
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
+	issueCmd.AddCommand(issueRunRebasesCmd)
 	issueCmd.AddCommand(issueUsageCmd)
 	issueCmd.AddCommand(issueRerunCmd)
 	issueCmd.AddCommand(issueCancelTaskCmd)
@@ -577,6 +585,8 @@ func init() {
 	issueRunMessagesCmd.Flags().String("output", "json", "Output format: table or json")
 	issueRunMessagesCmd.Flags().Int("since", 0, "Only return messages after this sequence number")
 	issueRunMessagesCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
+	issueRunRebasesCmd.Flags().String("output", "json", "Output format: table or json")
+	issueRunRebasesCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
 
 	// issue comment add
 	issueCommentAddCmd.Flags().String("content", "", "Comment content (decodes \\n, \\r, \\t, \\\\; pipe via --content-stdin for multi-line bodies or to preserve literal backslashes)")
@@ -2280,6 +2290,55 @@ func runIssueRunMessages(cmd *cobra.Command, args []string) error {
 			strVal(m, "type"),
 			strVal(m, "tool"),
 			content,
+		})
+	}
+	cli.PrintTable(os.Stdout, headers, rows)
+	return nil
+}
+
+func runIssueRunRebases(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueID := ""
+	if issueInput, _ := cmd.Flags().GetString("issue"); issueInput != "" {
+		issueRef, err := resolveIssueRef(ctx, client, issueInput)
+		if err != nil {
+			return fmt.Errorf("resolve issue: %w", err)
+		}
+		issueID = issueRef.ID
+	}
+	taskRef, err := resolveTaskRunID(ctx, client, issueID, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve task run: %w", err)
+	}
+
+	path := "/api/tasks/" + url.PathEscape(taskRef.ID) + "/peer-context/rebases"
+
+	var rebases []map[string]any
+	if err := client.GetJSON(ctx, path, &rebases); err != nil {
+		return fmt.Errorf("list peer context rebases: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, rebases)
+	}
+
+	headers := []string{"SEQ", "PEER TASK", "REVISION", "STATUS", "RECORDED AT"}
+	rows := make([][]string, 0, len(rebases))
+	for _, r := range rebases {
+		rows = append(rows, []string{
+			fmt.Sprintf("%v", r["seq"]),
+			strVal(r, "peer_task_id"),
+			fmt.Sprintf("%v -> %v", r["from_revision"], r["to_revision"]),
+			fmt.Sprintf("%q -> %q", r["from_status"], r["to_status"]),
+			strVal(r, "created_at"),
 		})
 	}
 	cli.PrintTable(os.Stdout, headers, rows)

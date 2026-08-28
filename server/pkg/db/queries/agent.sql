@@ -677,6 +677,10 @@ RETURNING *;
 WITH deleted_context_seen AS (
     DELETE FROM issue_context_subscription_task_seen
     WHERE task_id = sqlc.arg(task_id) OR peer_task_id = sqlc.arg(task_id)
+),
+deleted_context_rebases AS (
+    DELETE FROM peer_context_rebase_log
+    WHERE task_id = sqlc.arg(task_id) OR peer_task_id = sqlc.arg(task_id)
 )
 DELETE FROM agent_task_queue
 WHERE id = sqlc.arg(task_id)

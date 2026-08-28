@@ -3276,6 +3276,10 @@ const deleteUnstartedQuickCreateRetryTask = `-- name: DeleteUnstartedQuickCreate
 WITH deleted_context_seen AS (
     DELETE FROM issue_context_subscription_task_seen
     WHERE task_id = $1 OR peer_task_id = $1
+),
+deleted_context_rebases AS (
+    DELETE FROM peer_context_rebase_log
+    WHERE task_id = $1 OR peer_task_id = $1
 )
 DELETE FROM agent_task_queue
 WHERE id = $1

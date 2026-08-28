@@ -1095,7 +1095,7 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 		"--no-start",
 		"[stale]",
 		"context-rebase event",
-		"peer_context_rebase",
+		"run-rebases",
 		"wait for user confirmation",
 		"steering input",
 	} {

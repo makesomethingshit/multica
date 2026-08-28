@@ -47,47 +47,47 @@ func (q *Queries) CreateIssueContextSubscription(ctx context.Context, arg Create
 	return i, err
 }
 
-const createPeerContextRebaseMessage = `-- name: CreatePeerContextRebaseMessage :one
-INSERT INTO task_message (task_id, seq, type, tool, content)
-VALUES (
-    $1,
-    COALESCE((SELECT MIN(seq) FROM task_message WHERE task_id = $1), 0) - 1,
-    'peer_context_rebase',
-    'peer-context',
-    $2
-)
-RETURNING id, task_id, seq, type, tool, content, input, output, created_at
+const createPeerContextRebaseLog = `-- name: CreatePeerContextRebaseLog :one
+INSERT INTO peer_context_rebase_log (task_id, peer_task_id, from_revision, to_revision, from_status, to_status)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING seq, task_id, peer_task_id, from_revision, to_revision, from_status, to_status, created_at
 `
 
-type CreatePeerContextRebaseMessageParams struct {
-	TaskID  pgtype.UUID `json:"task_id"`
-	Content pgtype.Text `json:"content"`
+type CreatePeerContextRebaseLogParams struct {
+	TaskID       pgtype.UUID `json:"task_id"`
+	PeerTaskID   pgtype.UUID `json:"peer_task_id"`
+	FromRevision int64       `json:"from_revision"`
+	ToRevision   int64       `json:"to_revision"`
+	FromStatus   string      `json:"from_status"`
+	ToStatus     string      `json:"to_status"`
 }
 
-// Record the first-class rebase marker in the source task's execution log.
-// The lookup that triggered this write is authenticated and has already
-// proved the peer belongs to the same parent/workspace.
-//
-// seq lives in a daemon-disjoint negative space counting down from
-// MIN(seq)-1: the daemon numbers its messages with a local positive counter
-// and never reads server rows, so MAX(seq)+1 would collide with the daemon's
-// next real message and the frontend's seq dedupe would drop one of the two.
-// Negative seqs also stay below every --since cursor, which tracks the
-// daemon's max seen seq, so markers can never poison incremental polls.
-// Callers hold LockPeerContextRebaseWriter, so concurrent markers on the same
-// task cannot allocate the same value.
-func (q *Queries) CreatePeerContextRebaseMessage(ctx context.Context, arg CreatePeerContextRebaseMessageParams) (TaskMessage, error) {
-	row := q.db.QueryRow(ctx, createPeerContextRebaseMessage, arg.TaskID, arg.Content)
-	var i TaskMessage
+// Append the rebase event to the source task's dedicated audit log. The
+// daemon-owned task_message seq space stays untouched (the daemon numbers
+// messages with a local counter the server never sees, so any server-side
+// task_message insert would either collide or sort out of order), and the
+// identity seq gives the trail a true occurrence order. No FK: task
+// teardown deletes these rows explicitly (DeleteUnstartedQuickCreateRetryTask,
+// DeleteTaskBatch), matching the issue_context_subscription_task_seen
+// cleanup pattern.
+func (q *Queries) CreatePeerContextRebaseLog(ctx context.Context, arg CreatePeerContextRebaseLogParams) (PeerContextRebaseLog, error) {
+	row := q.db.QueryRow(ctx, createPeerContextRebaseLog,
+		arg.TaskID,
+		arg.PeerTaskID,
+		arg.FromRevision,
+		arg.ToRevision,
+		arg.FromStatus,
+		arg.ToStatus,
+	)
+	var i PeerContextRebaseLog
 	err := row.Scan(
-		&i.ID,
-		&i.TaskID,
 		&i.Seq,
-		&i.Type,
-		&i.Tool,
-		&i.Content,
-		&i.Input,
-		&i.Output,
+		&i.TaskID,
+		&i.PeerTaskID,
+		&i.FromRevision,
+		&i.ToRevision,
+		&i.FromStatus,
+		&i.ToStatus,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -219,15 +219,39 @@ func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgty
 	return items, nil
 }
 
-const lockPeerContextRebaseWriter = `-- name: LockPeerContextRebaseWriter :exec
-SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':peer_context_rebase', 0))
+const listPeerContextRebaseLog = `-- name: ListPeerContextRebaseLog :many
+SELECT seq, task_id, peer_task_id, from_revision, to_revision, from_status, to_status, created_at FROM peer_context_rebase_log
+WHERE task_id = $1
+ORDER BY seq ASC
 `
 
-// Serialize the seen-cursor advance + audit-marker insert per source task so
-// two concurrent peer lookups cannot allocate the same marker seq.
-func (q *Queries) LockPeerContextRebaseWriter(ctx context.Context, taskID string) error {
-	_, err := q.db.Exec(ctx, lockPeerContextRebaseWriter, taskID)
-	return err
+func (q *Queries) ListPeerContextRebaseLog(ctx context.Context, taskID pgtype.UUID) ([]PeerContextRebaseLog, error) {
+	rows, err := q.db.Query(ctx, listPeerContextRebaseLog, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PeerContextRebaseLog{}
+	for rows.Next() {
+		var i PeerContextRebaseLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.TaskID,
+			&i.PeerTaskID,
+			&i.FromRevision,
+			&i.ToRevision,
+			&i.FromStatus,
+			&i.ToStatus,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const markIssueContextSubscriptionSeen = `-- name: MarkIssueContextSubscriptionSeen :one
