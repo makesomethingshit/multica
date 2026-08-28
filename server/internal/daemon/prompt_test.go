@@ -1094,6 +1094,10 @@ func TestBuildPromptWarnsAboutActiveSiblingRuns(t *testing.T) {
 		"multica issue run-messages task-existing",
 		"--no-start",
 		"[stale]",
+		"context-rebase event",
+		"run-rebases",
+		"wait for user confirmation",
+		"steering input",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("prompt missing %q\n--- output ---\n%s", want, out)

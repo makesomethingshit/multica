@@ -4953,6 +4953,8 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		markPeerSeen   bool
 		seenRevision   int64
 		seenTaskStatus string
+		priorPeerSeen  db.IssueContextSubscriptionTaskSeen
+		rebaseNeeded   bool
 	)
 	if r.Header.Get("X-Actor-Source") == "task_token" {
 		if sourceID, parseErr := uuid.Parse(r.Header.Get("X-Task-ID")); parseErr == nil {
@@ -4977,6 +4979,17 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	queries := h.Queries
 	if queryTx != nil {
 		queries = h.Queries.WithTx(queryTx)
+		// Claim-time staleness (ListActiveSiblingIssueTasks) is computed from
+		// the per-task cursor alone; mirror it exactly so the lookup records a
+		// rebase precisely when the claim snapshot showed `[stale]` — including
+		// a new parallel peer task on an issue whose revision was already read
+		// through a sibling task (status cursor absent → stale at claim).
+		if priorPeerSeen, queryErr = queries.GetIssueContextSubscriptionTaskSeen(r.Context(), db.GetIssueContextSubscriptionTaskSeenParams{
+			TaskID: sourceTaskID, PeerTaskID: taskUUID,
+		}); queryErr != nil && !errors.Is(queryErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
 	}
 	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
 		sinceSeq, parseErr := strconv.Atoi(sinceStr)
@@ -5003,6 +5016,13 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		}
 		seenRevision = snapshot.IssueRevision
 		seenTaskStatus = snapshot.TaskStatus
+		// The authenticated lookup is the rebase boundary: compare the snapshot
+		// captured in this transaction with this source task's per-peer cursor,
+		// using the claim query's exact stale condition — an unseen peer keeps
+		// zero-value cursors, so a first lookup of a peer whose revision or
+		// status is already non-empty is stale just like the claim snapshot.
+		rebaseNeeded = seenRevision > priorPeerSeen.SeenRevision ||
+			seenTaskStatus != priorPeerSeen.SeenTaskStatus
 		if err := queryTx.Commit(r.Context()); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
 			return
@@ -5012,9 +5032,24 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	issueID := uuidToString(task.IssueID)
 	// A running agent may explicitly inspect a sibling run from the claim
 	// prompt. Record that read only after the messages lookup succeeded; claim
-	// itself never advances this cursor.
+	// itself never advances this cursor. When the cursor was stale, append the
+	// rebase event to the task's dedicated audit log (never to task_message —
+	// the daemon owns that seq space and the transcript is daemon output) so
+	// the rebase attempt is auditable without requiring a second write command
+	// from the agent.
 	if markPeerSeen {
-		if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
+		// The cursor advance and the audit record must land together: if the
+		// audit insert failed while the cursor survived, every retry would see
+		// the stale event as already consumed and the audit trail would lose
+		// the rebase permanently.
+		writeTx, writeErr := h.TxStarter.Begin(r.Context())
+		if writeErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
+		defer writeTx.Rollback(r.Context())
+		txQueries := h.Queries.WithTx(writeTx)
+		if _, markErr := txQueries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
 			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
 		}); markErr != nil {
 			if errors.Is(markErr, pgx.ErrNoRows) {
@@ -5022,6 +5057,23 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
+			return
+		}
+		if rebaseNeeded {
+			if _, auditErr := txQueries.CreatePeerContextRebaseLog(r.Context(), db.CreatePeerContextRebaseLogParams{
+				TaskID:       sourceTaskID,
+				PeerTaskID:   taskUUID,
+				FromRevision: priorPeerSeen.SeenRevision,
+				ToRevision:   seenRevision,
+				FromStatus:   priorPeerSeen.SeenTaskStatus,
+				ToStatus:     seenTaskStatus,
+			}); auditErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to record peer context rebase")
+				return
+			}
+		}
+		if err := writeTx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
 			return
 		}
 	}
@@ -5085,6 +5137,49 @@ func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.R
 			revision = issue.Revision
 		}
 		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: revision})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type peerContextRebaseResponse struct {
+	Seq          int64     `json:"seq"`
+	TaskID       string    `json:"task_id"`
+	PeerTaskID   string    `json:"peer_task_id"`
+	FromRevision int64     `json:"from_revision"`
+	ToRevision   int64     `json:"to_revision"`
+	FromStatus   string    `json:"from_status"`
+	ToStatus     string    `json:"to_status"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// ListPeerContextRebaseLog returns the task's rebase audit trail in true
+// occurrence order. Rebase events live in their own log rather than in
+// task_message: the daemon owns that table's seq space with a local counter,
+// so server-side inserts would either collide with daemon output or sort out
+// of chronological position, and the transcript renderers only know daemon
+// message types.
+func (h *Handler) ListPeerContextRebaseLog(w http.ResponseWriter, r *http.Request) {
+	_, taskID, ok := h.issueContextSubscriptionTask(w, r)
+	if !ok {
+		return
+	}
+	rows, err := h.Queries.ListPeerContextRebaseLog(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list peer context rebases")
+		return
+	}
+	resp := make([]peerContextRebaseResponse, 0, len(rows))
+	for _, row := range rows {
+		resp = append(resp, peerContextRebaseResponse{
+			Seq:          row.Seq,
+			TaskID:       uuidToString(row.TaskID),
+			PeerTaskID:   uuidToString(row.PeerTaskID),
+			FromRevision: row.FromRevision,
+			ToRevision:   row.ToRevision,
+			FromStatus:   row.FromStatus,
+			ToStatus:     row.ToStatus,
+			CreatedAt:    row.CreatedAt.Time,
+		})
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

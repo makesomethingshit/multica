@@ -47,6 +47,52 @@ func (q *Queries) CreateIssueContextSubscription(ctx context.Context, arg Create
 	return i, err
 }
 
+const createPeerContextRebaseLog = `-- name: CreatePeerContextRebaseLog :one
+INSERT INTO peer_context_rebase_log (task_id, peer_task_id, from_revision, to_revision, from_status, to_status)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING seq, task_id, peer_task_id, from_revision, to_revision, from_status, to_status, created_at
+`
+
+type CreatePeerContextRebaseLogParams struct {
+	TaskID       pgtype.UUID `json:"task_id"`
+	PeerTaskID   pgtype.UUID `json:"peer_task_id"`
+	FromRevision int64       `json:"from_revision"`
+	ToRevision   int64       `json:"to_revision"`
+	FromStatus   string      `json:"from_status"`
+	ToStatus     string      `json:"to_status"`
+}
+
+// Append the rebase event to the source task's dedicated audit log. The
+// daemon-owned task_message seq space stays untouched (the daemon numbers
+// messages with a local counter the server never sees, so any server-side
+// task_message insert would either collide or sort out of order), and the
+// identity seq gives the trail a true occurrence order. No FK: task
+// teardown deletes these rows explicitly (DeleteUnstartedQuickCreateRetryTask,
+// DeleteTaskBatch), matching the issue_context_subscription_task_seen
+// cleanup pattern.
+func (q *Queries) CreatePeerContextRebaseLog(ctx context.Context, arg CreatePeerContextRebaseLogParams) (PeerContextRebaseLog, error) {
+	row := q.db.QueryRow(ctx, createPeerContextRebaseLog,
+		arg.TaskID,
+		arg.PeerTaskID,
+		arg.FromRevision,
+		arg.ToRevision,
+		arg.FromStatus,
+		arg.ToStatus,
+	)
+	var i PeerContextRebaseLog
+	err := row.Scan(
+		&i.Seq,
+		&i.TaskID,
+		&i.PeerTaskID,
+		&i.FromRevision,
+		&i.ToRevision,
+		&i.FromStatus,
+		&i.ToStatus,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteIssueContextSubscription = `-- name: DeleteIssueContextSubscription :execrows
 WITH deleted_seen AS (
     DELETE FROM issue_context_subscription_task_seen seen
@@ -95,6 +141,31 @@ func (q *Queries) GetIssueContextSubscription(ctx context.Context, arg GetIssueC
 	return i, err
 }
 
+const getIssueContextSubscriptionTaskSeen = `-- name: GetIssueContextSubscriptionTaskSeen :one
+SELECT task_id, peer_task_id, seen_revision, seen_task_status, created_at, updated_at
+FROM issue_context_subscription_task_seen
+WHERE task_id = $1 AND peer_task_id = $2
+`
+
+type GetIssueContextSubscriptionTaskSeenParams struct {
+	TaskID     pgtype.UUID `json:"task_id"`
+	PeerTaskID pgtype.UUID `json:"peer_task_id"`
+}
+
+func (q *Queries) GetIssueContextSubscriptionTaskSeen(ctx context.Context, arg GetIssueContextSubscriptionTaskSeenParams) (IssueContextSubscriptionTaskSeen, error) {
+	row := q.db.QueryRow(ctx, getIssueContextSubscriptionTaskSeen, arg.TaskID, arg.PeerTaskID)
+	var i IssueContextSubscriptionTaskSeen
+	err := row.Scan(
+		&i.TaskID,
+		&i.PeerTaskID,
+		&i.SeenRevision,
+		&i.SeenTaskStatus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTaskPeerSnapshot = `-- name: GetTaskPeerSnapshot :one
 SELECT i.revision AS issue_revision, atq.status AS task_status
 FROM agent_task_queue atq
@@ -137,6 +208,41 @@ func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgty
 			&i.SeenRevision,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPeerContextRebaseLog = `-- name: ListPeerContextRebaseLog :many
+SELECT seq, task_id, peer_task_id, from_revision, to_revision, from_status, to_status, created_at FROM peer_context_rebase_log
+WHERE task_id = $1
+ORDER BY seq ASC
+`
+
+func (q *Queries) ListPeerContextRebaseLog(ctx context.Context, taskID pgtype.UUID) ([]PeerContextRebaseLog, error) {
+	rows, err := q.db.Query(ctx, listPeerContextRebaseLog, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PeerContextRebaseLog{}
+	for rows.Next() {
+		var i PeerContextRebaseLog
+		if err := rows.Scan(
+			&i.Seq,
+			&i.TaskID,
+			&i.PeerTaskID,
+			&i.FromRevision,
+			&i.ToRevision,
+			&i.FromStatus,
+			&i.ToStatus,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

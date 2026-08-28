@@ -1861,6 +1861,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Get("/api/tasks/{taskId}/peer-context/subscriptions", h.ListIssueContextSubscriptions)
 			r.Post("/api/tasks/{taskId}/peer-context/subscriptions", h.CreateIssueContextSubscription)
 			r.Delete("/api/tasks/{taskId}/peer-context/subscriptions/{peerIssueId}", h.DeleteIssueContextSubscription)
+			r.Get("/api/tasks/{taskId}/peer-context/rebases", h.ListPeerContextRebaseLog)
 			r.With(handler.RequireHumanActor).Post("/api/tasks/{taskId}/retry-source-context", h.RetrySourceContextQuickCreate)
 
 			// Issue quick actions (definitions; running one lives under

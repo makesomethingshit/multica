@@ -41,6 +41,11 @@ deleted_context_seen AS (
     DELETE FROM issue_context_subscription_task_seen
     WHERE task_id IN (SELECT id FROM batch)
        OR peer_task_id IN (SELECT id FROM batch)
+),
+deleted_context_rebases AS (
+    DELETE FROM peer_context_rebase_log
+    WHERE task_id IN (SELECT id FROM batch)
+       OR peer_task_id IN (SELECT id FROM batch)
 )
 DELETE FROM agent_task_queue WHERE id IN (SELECT id FROM batch)
 `

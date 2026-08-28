@@ -43,6 +43,29 @@ FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 WHERE atq.id = @task_id;
 
+-- name: GetIssueContextSubscriptionTaskSeen :one
+SELECT task_id, peer_task_id, seen_revision, seen_task_status, created_at, updated_at
+FROM issue_context_subscription_task_seen
+WHERE task_id = @task_id AND peer_task_id = @peer_task_id;
+
+-- name: CreatePeerContextRebaseLog :one
+-- Append the rebase event to the source task's dedicated audit log. The
+-- daemon-owned task_message seq space stays untouched (the daemon numbers
+-- messages with a local counter the server never sees, so any server-side
+-- task_message insert would either collide or sort out of order), and the
+-- identity seq gives the trail a true occurrence order. No FK: task
+-- teardown deletes these rows explicitly (DeleteUnstartedQuickCreateRetryTask,
+-- DeleteTaskBatch), matching the issue_context_subscription_task_seen
+-- cleanup pattern.
+INSERT INTO peer_context_rebase_log (task_id, peer_task_id, from_revision, to_revision, from_status, to_status)
+VALUES (@task_id, @peer_task_id, @from_revision, @to_revision, @from_status, @to_status)
+RETURNING *;
+
+-- name: ListPeerContextRebaseLog :many
+SELECT * FROM peer_context_rebase_log
+WHERE task_id = @task_id
+ORDER BY seq ASC;
+
 -- name: MarkIssueContextSubscriptionSeen :one
 WITH valid_peer AS (
     SELECT peer_task.issue_id
