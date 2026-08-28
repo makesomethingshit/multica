@@ -20,7 +20,9 @@ SELECT * FROM issue_context_subscription
 WHERE task_id = @task_id AND peer_issue_id = @peer_issue_id;
 
 -- name: ListIssueContextSubscriptions :many
-SELECT s.*
+-- The JOIN carries the peer issue's current revision in the same read so the
+-- handler does not need a per-row GetIssue round trip (PUCK-58 review).
+SELECT s.*, i.revision
 FROM issue_context_subscription s
 JOIN issue i ON i.id = s.peer_issue_id
 WHERE s.task_id = @task_id

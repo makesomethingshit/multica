@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -340,6 +342,65 @@ func TestClaimTasksByRuntime_CancelsTaskWhenRuntimeOwnerMissing(t *testing.T) {
 	}
 	if status != "cancelled" {
 		t.Fatalf("task status = %s, want cancelled (owner missing)", status)
+	}
+}
+
+// TestClaimTasksByRuntime_TruncatesOversizedRuntimeIDList pins the input
+// bound (PUCK-58 review): an id list beyond claimBatchMaxRuntimeIDs is
+// truncated rather than rejected, and a valid runtime inside the first
+// claimBatchMaxRuntimeIDs entries still claims normally.
+func TestClaimTasksByRuntime_TruncatesOversizedRuntimeIDList(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Truncation claim rt")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Truncation claim agent")
+	seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+
+	ids := make([]string, claimBatchMaxRuntimeIDs+64)
+	ids[0] = runtimeID
+	for i := 1; i < len(ids); i++ {
+		ids[i] = "not-a-uuid"
+	}
+	w := postBatchClaim(t, testWorkspaceID, ids, 5)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp batchClaimResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tasks) != 1 || resp.Tasks[0].RuntimeID != runtimeID {
+		t.Fatalf("claimed %d tasks, want the valid runtime inside the cap: %s", len(resp.Tasks), w.Body.String())
+	}
+}
+
+// TestClaimTasksByRuntime_RejectsOversizedBody pins the request-body cap
+// (PUCK-58 review): a body beyond claimBatchMaxBodyBytes is rejected with 400
+// before any claim work instead of being decoded in full.
+func TestClaimTasksByRuntime_RejectsOversizedBody(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ids := make([]string, 0, 4096)
+	for i := 0; i < 4096; i++ {
+		ids = append(ids, "0123456789abcdef0123456789abcdef")
+	}
+	body, err := json.Marshal(map[string]any{"daemon_id": batchClaimTestDaemonID, "runtime_ids": ids, "max_tasks": 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(body) <= claimBatchMaxBodyBytes {
+		t.Fatalf("test payload is %d bytes, want > %d to trip the cap", len(body), claimBatchMaxBodyBytes)
+	}
+	req := httptest.NewRequest("POST", "/api/daemon/tasks/claim", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(middleware.WithDaemonContext(req.Context(), testWorkspaceID, batchClaimTestDaemonID))
+	w := httptest.NewRecorder()
+	testHandler.ClaimTasksByRuntime(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized body status = %d, want 400: %s", w.Code, w.Body.String())
 	}
 }
 

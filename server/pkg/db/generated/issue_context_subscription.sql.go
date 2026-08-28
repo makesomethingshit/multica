@@ -186,28 +186,40 @@ func (q *Queries) GetTaskPeerSnapshot(ctx context.Context, taskID pgtype.UUID) (
 }
 
 const listIssueContextSubscriptions = `-- name: ListIssueContextSubscriptions :many
-SELECT s.task_id, s.peer_issue_id, s.seen_revision, s.created_at, s.updated_at
+SELECT s.task_id, s.peer_issue_id, s.seen_revision, s.created_at, s.updated_at, i.revision
 FROM issue_context_subscription s
 JOIN issue i ON i.id = s.peer_issue_id
 WHERE s.task_id = $1
 ORDER BY s.created_at, s.peer_issue_id
 `
 
-func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgtype.UUID) ([]IssueContextSubscription, error) {
+type ListIssueContextSubscriptionsRow struct {
+	TaskID       pgtype.UUID        `json:"task_id"`
+	PeerIssueID  pgtype.UUID        `json:"peer_issue_id"`
+	SeenRevision int64              `json:"seen_revision"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	Revision     int64              `json:"revision"`
+}
+
+// The JOIN carries the peer issue's current revision in the same read so the
+// handler does not need a per-row GetIssue round trip (PUCK-58 review).
+func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgtype.UUID) ([]ListIssueContextSubscriptionsRow, error) {
 	rows, err := q.db.Query(ctx, listIssueContextSubscriptions, taskID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []IssueContextSubscription{}
+	items := []ListIssueContextSubscriptionsRow{}
 	for rows.Next() {
-		var i IssueContextSubscription
+		var i ListIssueContextSubscriptionsRow
 		if err := rows.Scan(
 			&i.TaskID,
 			&i.PeerIssueID,
 			&i.SeenRevision,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Revision,
 		); err != nil {
 			return nil, err
 		}

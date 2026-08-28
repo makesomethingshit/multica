@@ -446,4 +446,100 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 			t.Fatalf("get after delete error = %v, want pgx.ErrNoRows", err)
 		}
 	})
+
+	t.Run("list carries the peer revision from the join", func(t *testing.T) {
+		if _, err := testHandler.Queries.CreateIssueContextSubscription(ctx, db.CreateIssueContextSubscriptionParams{
+			TaskID: sourceTask, PeerIssueID: peerIssue,
+		}); err != nil {
+			t.Fatalf("create subscription: %v", err)
+		}
+		var revision int64
+		dbfx.QueryRow(t, `SELECT revision FROM issue WHERE id = $1`, peerIssueID).Scan(&revision)
+		req := newRequest(http.MethodGet, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", nil)
+		req = withURLParam(req, "taskId", sourceTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListIssueContextSubscriptions(w, req)
+		var subscriptions []issueContextSubscriptionResponse
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &subscriptions) != nil || len(subscriptions) != 1 {
+			t.Fatalf("subscription list = status %d body %s", w.Code, w.Body.String())
+		}
+		if subscriptions[0].Revision != revision {
+			t.Fatalf("subscription revision = %d, want the join-read issue revision %d", subscriptions[0].Revision, revision)
+		}
+	})
+}
+
+// TestIssueContextSubscriptionCapPinsResourceUse pins the per-task
+// subscription cap (PUCK-58 review): once a task holds
+// maxPeerContextSubscriptionsPerTask subscriptions, further creates are
+// rejected instead of growing the set unboundedly.
+func TestIssueContextSubscriptionCapPinsResourceUse(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := handlerTestRuntimeID(t)
+	var agentID string
+	dbfx.QueryRow(t, `SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`, testWorkspaceID).Scan(&agentID)
+
+	parentID := dbfx.Issue(t, "cap parent")
+	sourceTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   dbfx.Issue(t, "cap source", testutil.Cols{"parent_issue_id": parentID}),
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	for i := 0; i < maxPeerContextSubscriptionsPerTask; i++ {
+		dbfx.Exec(t, `INSERT INTO issue_context_subscription (task_id, peer_issue_id) VALUES ($1, $2)`,
+			sourceTaskID, dbfx.Issue(t, fmt.Sprintf("cap peer %d", i), testutil.Cols{"parent_issue_id": parentID}))
+	}
+
+	overflowPeerID := dbfx.Issue(t, "cap overflow peer", testutil.Cols{"parent_issue_id": parentID})
+	req := newRequest(http.MethodPost, "/api/tasks/"+sourceTaskID+"/peer-context/subscriptions", map[string]any{"peer_issue_id": overflowPeerID})
+	req = withURLParam(req, "taskId", sourceTaskID)
+	req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+	w := httptest.NewRecorder()
+	testHandler.CreateIssueContextSubscription(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("over-cap create status = %d, want 400: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDeleteIssueSweepsPeerContextRebaseLog pins the issue-delete sweep
+// (PUCK-58 review): peer_context_rebase_log has no FK, so DeleteIssue must
+// remove the rebase audit rows of the deleted issue's tasks on both the
+// source and the peer side, or they strand forever.
+func TestDeleteIssueSweepsPeerContextRebaseLog(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := handlerTestRuntimeID(t)
+	var agentID string
+	dbfx.QueryRow(t, `SELECT id FROM agent WHERE workspace_id = $1 ORDER BY created_at ASC LIMIT 1`, testWorkspaceID).Scan(&agentID)
+
+	parentID := dbfx.Issue(t, "rebase sweep parent")
+	peerTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   dbfx.Issue(t, "rebase sweep peer", testutil.Cols{"parent_issue_id": parentID}),
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	victimIssueID := dbfx.Issue(t, "rebase sweep victim", testutil.Cols{"parent_issue_id": parentID})
+	victimTaskID := dbfx.Task(t, agentID, testutil.Cols{
+		"issue_id":   victimIssueID,
+		"runtime_id": runtimeID,
+		"status":     "running",
+	})
+	// The deleted task appears on both sides of the audit log: as the source
+	// of its own rebase and as the peer of a surviving task's rebase.
+	// peer_context_rebase_log has no FK, so clean up explicitly on teardown.
+	dbfx.Cleanup(t, `DELETE FROM peer_context_rebase_log WHERE task_id = $1 OR peer_task_id = $1 OR task_id = $2 OR peer_task_id = $2`, victimTaskID, peerTaskID)
+	dbfx.Exec(t, `INSERT INTO peer_context_rebase_log (task_id, peer_task_id, to_revision, to_status) VALUES ($1, $2, 1, 'running')`, victimTaskID, peerTaskID)
+	dbfx.Exec(t, `INSERT INTO peer_context_rebase_log (task_id, peer_task_id, to_revision, to_status) VALUES ($1, $2, 1, 'running')`, peerTaskID, victimTaskID)
+
+	if err := testHandler.Queries.DeleteIssue(ctx, db.DeleteIssueParams{ID: parseUUID(victimIssueID), WorkspaceID: parseUUID(testWorkspaceID)}); err != nil {
+		t.Fatalf("delete issue: %v", err)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM peer_context_rebase_log WHERE task_id = $1 OR peer_task_id = $2`, victimTaskID, victimTaskID); got != 0 {
+		t.Fatalf("delete left %d rebase audit rows for the deleted issue's task", got)
+	}
 }
