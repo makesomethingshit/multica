@@ -92,6 +92,34 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		}
 	})
 
+	t.Run("seen keeps the returned snapshot revision", func(t *testing.T) {
+		suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+		fn, trigger := "peer_seen_snapshot_"+suffix, "peer_seen_snapshot_trg_"+suffix
+		dbfx.Exec(t, fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE issue SET revision = revision + 1 WHERE id = NEW.peer_issue_id; RETURN NEW; END $$`, fn))
+		dbfx.Exec(t, fmt.Sprintf(`CREATE TRIGGER %s BEFORE INSERT OR UPDATE ON issue_context_subscription FOR EACH ROW EXECUTE FUNCTION %s()`, trigger, fn))
+		t.Cleanup(func() {
+			dbfx.Exec(t, "DROP TRIGGER IF EXISTS "+trigger+" ON issue_context_subscription")
+			dbfx.Exec(t, "DROP FUNCTION IF EXISTS "+fn+"()")
+		})
+
+		req := newRequest(http.MethodGet, "/api/tasks/"+peerTaskID+"/messages", nil)
+		req.Header.Set("X-Actor-Source", "task_token")
+		req.Header.Set("X-Task-ID", sourceTaskID)
+		req = withURLParam(req, "taskId", peerTaskID)
+		req = req.WithContext(middleware.SetMemberContext(req.Context(), testWorkspaceID, db.Member{}))
+		w := httptest.NewRecorder()
+		testHandler.ListTaskMessagesByUser(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("snapshot lookup status = %d: %s", w.Code, w.Body.String())
+		}
+
+		var seen, revision int64
+		dbfx.QueryRow(t, `SELECT s.seen_revision, i.revision FROM issue_context_subscription s JOIN issue i ON i.id = s.peer_issue_id WHERE s.task_id = $1 AND s.peer_issue_id = $2`, sourceTaskID, peerIssueID).Scan(&seen, &revision)
+		if seen >= revision {
+			t.Fatalf("seen_revision = %d, issue revision = %d; future revision was marked seen", seen, revision)
+		}
+	})
+
 	t.Run("revision bump marks stale", func(t *testing.T) {
 		dbfx.Exec(t, `UPDATE issue SET title = title || ' changed', revision = revision + 1 WHERE id = $1`, peerIssueID)
 		rows, err := testHandler.Queries.ListActiveSiblingIssueTasks(ctx, db.ListActiveSiblingIssueTasksParams{
@@ -99,6 +127,19 @@ func TestIssueContextSubscriptionBoundaries(t *testing.T) {
 		})
 		if err != nil || len(rows) != 1 || !rows[0].Stale || rows[0].IssueRevision <= rows[0].SeenRevision {
 			t.Fatalf("revision bump did not mark peer stale: rows=%+v err=%v", rows, err)
+		}
+	})
+
+	t.Run("task status bump marks stale", func(t *testing.T) {
+		var revision int64
+		dbfx.QueryRow(t, `SELECT revision FROM issue WHERE id = $1`, peerIssueID).Scan(&revision)
+		dbfx.Exec(t, `UPDATE issue_context_subscription SET seen_revision = $2, seen_task_status = 'running' WHERE task_id = $1 AND peer_issue_id = $3`, sourceTaskID, revision, peerIssueID)
+		dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'waiting_local_directory' WHERE id = $1`, peerTaskID)
+		rows, err := testHandler.Queries.ListActiveSiblingIssueTasks(ctx, db.ListActiveSiblingIssueTasksParams{
+			TaskID: sourceTask, ParentIssueID: parseUUID(parentID), WorkspaceID: parseUUID(testWorkspaceID),
+		})
+		if err != nil || len(rows) != 1 || rows[0].IssueRevision != rows[0].SeenRevision || !rows[0].Stale {
+			t.Fatalf("task status bump did not mark peer stale: rows=%+v err=%v", rows, err)
 		}
 	})
 
