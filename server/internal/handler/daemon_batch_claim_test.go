@@ -404,6 +404,74 @@ func TestClaimTasksByRuntime_RejectsOversizedBody(t *testing.T) {
 	}
 }
 
+// TestClaimTasksByRuntime_ChunkedClaimReachesTailRuntime verifies the PUCK-58
+// chunking fix: a runtime at position 257+ is not permanently excluded by the
+// server's per-request truncation. A single oversized request truncates the
+// tail, but chunked requests (as the daemon now sends) still claim it.
+func TestClaimTasksByRuntime_ChunkedClaimReachesTailRuntime(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Tail claim rt")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Tail claim agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+
+	// Build 300 IDs where the valid runtime is at the very end (position 299).
+	ids := make([]string, 300)
+	for i := 0; i < 299; i++ {
+		ids[i] = "not-a-uuid"
+	}
+	ids[299] = runtimeID
+
+	// Single oversized request: server truncates to first 256, so tail task stays queued.
+	w := postBatchClaim(t, testWorkspaceID, ids, 5)
+	if w.Code != http.StatusOK {
+		t.Fatalf("single oversized claim expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp batchClaimResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tasks) != 0 {
+		t.Fatalf("single truncated claim returned %d tasks, want 0 (tail truncated)", len(resp.Tasks))
+	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status); err != nil {
+		t.Fatalf("read task status: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("task status = %s, want still queued after truncated claim", status)
+	}
+
+	// Chunked requests as the daemon now does: two chunks 256 + 44.
+	firstChunk := ids[:256]
+	secondChunk := ids[256:]
+	w1 := postBatchClaim(t, testWorkspaceID, firstChunk, 5)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first chunk expected 200, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var resp1 batchClaimResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("decode first chunk: %v", err)
+	}
+	if len(resp1.Tasks) != 0 {
+		t.Fatalf("first chunk returned %d tasks, want 0", len(resp1.Tasks))
+	}
+
+	w2 := postBatchClaim(t, testWorkspaceID, secondChunk, 5)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second chunk expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var resp2 batchClaimResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("decode second chunk: %v", err)
+	}
+	if len(resp2.Tasks) != 1 || resp2.Tasks[0].ID != taskID {
+		t.Fatalf("second chunk claimed %d tasks %+v, want tail task %s", len(resp2.Tasks), resp2.Tasks, taskID)
+	}
+}
+
 // TestFailClaimedTaskBeforeLaunchSettlesDispatchedTask pins the claim-build
 // failure behavior used by required Plugin contributions. A durable rejection
 // must become a visible terminal task instead of remaining dispatched until

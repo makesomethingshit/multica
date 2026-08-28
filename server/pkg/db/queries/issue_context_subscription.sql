@@ -1,6 +1,14 @@
 -- name: CreateIssueContextSubscription :one
+-- Atomic admission (PUCK-58 review): the per-task cap is enforced inside the
+-- statement so concurrent creates cannot race past it, and an existing peer
+-- remains updatable even at the cap. task_lock serializes concurrent
+-- admissions for the same task via row-level lock on the parent task.
+WITH task_lock AS (
+  SELECT 1 FROM agent_task_queue WHERE id = @task_id FOR UPDATE
+)
 INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
 SELECT @task_id, @peer_issue_id, 0
+FROM task_lock
 WHERE EXISTS (
     SELECT 1
     FROM agent_task_queue source_task
@@ -11,6 +19,10 @@ WHERE EXISTS (
       AND source_issue.parent_issue_id IS NOT NULL
       AND source_issue.parent_issue_id = peer_issue.parent_issue_id
 )
+AND (
+  EXISTS (SELECT 1 FROM issue_context_subscription WHERE task_id = @task_id AND peer_issue_id = @peer_issue_id)
+  OR (SELECT COUNT(*) FROM issue_context_subscription WHERE task_id = @task_id) < 32
+)
 ON CONFLICT (task_id, peer_issue_id) DO UPDATE
 SET updated_at = now()
 RETURNING *;
@@ -18,6 +30,21 @@ RETURNING *;
 -- name: GetIssueContextSubscription :one
 SELECT * FROM issue_context_subscription
 WHERE task_id = @task_id AND peer_issue_id = @peer_issue_id;
+
+-- name: CountIssueContextSubscriptions :one
+SELECT COUNT(*)::bigint FROM issue_context_subscription WHERE task_id = @task_id;
+
+-- name: ValidatePeerIssueForSubscription :one
+SELECT EXISTS (
+    SELECT 1
+    FROM agent_task_queue source_task
+    JOIN issue source_issue ON source_issue.id = source_task.issue_id
+    JOIN issue peer_issue ON peer_issue.id = @peer_issue_id
+    WHERE source_task.id = @task_id
+      AND source_issue.workspace_id = peer_issue.workspace_id
+      AND source_issue.parent_issue_id IS NOT NULL
+      AND source_issue.parent_issue_id = peer_issue.parent_issue_id
+) AS valid;
 
 -- name: ListIssueContextSubscriptions :many
 -- The JOIN carries the peer issue's current revision in the same read so the
@@ -79,6 +106,8 @@ WITH valid_peer AS (
       AND source_issue.workspace_id = peer_issue.workspace_id
       AND source_issue.parent_issue_id IS NOT NULL
       AND source_issue.parent_issue_id = peer_issue.parent_issue_id
+), task_lock AS (
+  SELECT 1 FROM agent_task_queue WHERE id = @task_id FOR UPDATE
 ), seen AS (
     INSERT INTO issue_context_subscription_task_seen (task_id, peer_task_id, seen_revision, seen_task_status)
     SELECT @task_id, @peer_task_id, @seen_revision, @seen_task_status
@@ -95,7 +124,9 @@ WITH valid_peer AS (
 ), subscription AS (
     INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
     SELECT @task_id, issue_id, @seen_revision
-    FROM valid_peer
+    FROM valid_peer, task_lock
+    WHERE EXISTS (SELECT 1 FROM issue_context_subscription WHERE task_id = @task_id AND peer_issue_id = valid_peer.issue_id)
+       OR (SELECT COUNT(*) FROM issue_context_subscription WHERE task_id = @task_id) < 32
     ON CONFLICT (task_id, peer_issue_id) DO UPDATE
     SET seen_revision = GREATEST(issue_context_subscription.seen_revision, EXCLUDED.seen_revision),
         updated_at = now()

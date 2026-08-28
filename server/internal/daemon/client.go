@@ -255,6 +255,12 @@ func (c *Client) ResolveRemoteMCPCredential(ctx context.Context, daemonToken, ta
 // comfortably above p99 claim latency so recovery stays the exception.
 const batchClaimRequestTimeout = 5 * time.Second
 
+// batchClaimMaxRuntimeIDs mirrors the server's claimBatchMaxRuntimeIDs
+// (server/internal/handler/daemon.go). The daemon chunks larger sets so a
+// machine with >256 runtimes does not have its tail permanently excluded by
+// the server's per-request truncation.
+const batchClaimMaxRuntimeIDs = 256
+
 // ClaimTasks is the machine-level (MUL-4257) batch counterpart of ClaimTask:
 // it asks the server, in a single request, to claim up to maxTasks tasks across
 // every runtime the daemon hosts. daemonID scopes the request to this machine —
@@ -266,6 +272,34 @@ const batchClaimRequestTimeout = 5 * time.Second
 // one slow claim cannot stall the whole batch; the deadline propagates to the
 // server and cancels the in-flight query there too.
 func (c *Client) ClaimTasks(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
+	if len(runtimeIDs) > batchClaimMaxRuntimeIDs {
+		var all []*Task
+		remaining := maxTasks
+		for start := 0; start < len(runtimeIDs) && remaining > 0; start += batchClaimMaxRuntimeIDs {
+			end := start + batchClaimMaxRuntimeIDs
+			if end > len(runtimeIDs) {
+				end = len(runtimeIDs)
+			}
+			chunk := runtimeIDs[start:end]
+			tasks, err := c.claimTasksSingle(ctx, daemonID, chunk, remaining)
+			if err != nil {
+				if isBatchClaimUnsupported(err) {
+					return c.claimTasksLegacy(ctx, runtimeIDs, maxTasks)
+				}
+				if len(all) == 0 {
+					return nil, err
+				}
+				return all, nil
+			}
+			all = append(all, tasks...)
+			remaining -= len(tasks)
+		}
+		return all, nil
+	}
+	return c.claimTasksSingle(ctx, daemonID, runtimeIDs, maxTasks)
+}
+
+func (c *Client) claimTasksSingle(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, batchClaimRequestTimeout)
 	defer cancel()
 	var resp struct {

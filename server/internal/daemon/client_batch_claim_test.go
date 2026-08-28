@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -79,5 +80,77 @@ func TestClient_ClaimTasks_EmptyResult(t *testing.T) {
 	}
 	if len(tasks) != 0 {
 		t.Fatalf("got %d tasks, want 0", len(tasks))
+	}
+}
+
+// TestClient_ClaimTasks_ChunksLargeRuntimeSet verifies the PUCK-58 chunking
+// fix: a set larger than batchClaimMaxRuntimeIDs is split across multiple
+// requests so a runtime at position 257+ is still claimable instead of being
+// permanently truncated by the server.
+func TestClient_ClaimTasks_ChunksLargeRuntimeSet(t *testing.T) {
+	var mu sync.Mutex
+	var gotBodies [][]string
+	var requestCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			RuntimeIDs []string `json:"runtime_ids"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		mu.Lock()
+		requestCount++
+		gotBodies = append(gotBodies, body.RuntimeIDs)
+		mu.Unlock()
+		// Only the tail chunk contains rt-tail; return a task for it.
+		for _, id := range body.RuntimeIDs {
+			if id == "rt-tail" {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"tasks":[{"id":"tail-task","runtime_id":"rt-tail"}]}`))
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"tasks":[]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	c.SetToken("tok")
+
+	// 300 IDs: first 256 are filler, tail at position 299
+	ids := make([]string, 300)
+	for i := 0; i < 299; i++ {
+		ids[i] = "rt-filler"
+	}
+	ids[299] = "rt-tail"
+
+	tasks, err := c.ClaimTasks(context.Background(), "daemon-x", ids, 5)
+	if err != nil {
+		t.Fatalf("ClaimTasks chunked: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != "tail-task" {
+		t.Fatalf("chunked claim got %d tasks %+v, want tail-task", len(tasks), tasks)
+	}
+	mu.Lock()
+	rc := requestCount
+	mu.Unlock()
+	if rc != 2 {
+		t.Fatalf("chunked claim made %d requests, want 2 (256 + 44)", rc)
+	}
+	mu.Lock()
+	foundTail := false
+	for _, body := range gotBodies {
+		for _, id := range body {
+			if id == "rt-tail" {
+				foundTail = true
+			}
+		}
+		if len(body) > batchClaimMaxRuntimeIDs {
+			t.Fatalf("chunk size %d exceeds limit %d", len(body), batchClaimMaxRuntimeIDs)
+		}
+	}
+	mu.Unlock()
+	if !foundTail {
+		t.Fatalf("tail runtime not found in any chunk")
 	}
 }

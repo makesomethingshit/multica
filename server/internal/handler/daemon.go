@@ -5228,21 +5228,26 @@ func (h *Handler) CreateIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	// Subscription cap (PUCK-58 review): reject once the task already holds the
-	// maximum, so repeated creates cannot grow the set unboundedly.
-	existing, err := h.Queries.ListIssueContextSubscriptions(r.Context(), taskID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to check peer subscriptions")
-		return
-	}
-	if len(existing) >= maxPeerContextSubscriptionsPerTask {
-		writeError(w, http.StatusBadRequest, "peer subscription limit reached")
-		return
-	}
-	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: pgtype.UUID{Bytes: peerID, Valid: true}})
+	peerUUID := pgtype.UUID{Bytes: peerID, Valid: true}
+	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "peer issue not found")
+			// Distinguish invalid peer (404) from cap (400). The statement
+			// enforces both the same-parent check and the per-task cap
+			// atomically via task_lock, so a concurrent create cannot race
+			// past the limit and an existing peer remains updatable at the cap.
+			if valid, vErr := h.Queries.ValidatePeerIssueForSubscription(r.Context(), db.ValidatePeerIssueForSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); vErr == nil && !valid {
+				writeError(w, http.StatusNotFound, "peer issue not found")
+				return
+			}
+			// Idempotent retry at cap: the peer already exists, so the
+			// limit did not block an upsert. Return the existing row as OK
+			// instead of rejecting the duplicate.
+			if existingRow, existsErr := h.Queries.GetIssueContextSubscription(r.Context(), db.GetIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); existsErr == nil {
+				writeJSON(w, http.StatusOK, issueContextSubscriptionResponse{TaskID: uuidToString(existingRow.TaskID), PeerIssueID: uuidToString(existingRow.PeerIssueID), SeenRevision: existingRow.SeenRevision})
+				return
+			}
+			writeError(w, http.StatusBadRequest, "peer subscription limit reached")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
