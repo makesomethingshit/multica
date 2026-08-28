@@ -5072,6 +5072,14 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 		}
 		defer writeTx.Rollback(r.Context())
 		txQueries := h.Queries.WithTx(writeTx)
+		// Serialize concurrent admissions for the same source task so the
+		// COUNT in Mark's subscription CTE sees the latest snapshot (PUCK-58
+		// review). Lock in a separate statement before the upsert so the next
+		// statement's snapshot is fresh.
+		if _, err := writeTx.Exec(r.Context(), "SELECT 1 FROM agent_task_queue WHERE id = $1 FOR UPDATE", sourceTaskID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
 		if _, markErr := txQueries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
 			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
 		}); markErr != nil {
@@ -5229,27 +5237,45 @@ func (h *Handler) CreateIssueContextSubscription(w http.ResponseWriter, r *http.
 		return
 	}
 	peerUUID := pgtype.UUID{Bytes: peerID, Valid: true}
-	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID})
+	ctx := r.Context()
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	defer tx.Rollback(ctx)
+	// Serialize concurrent admissions for the same task so the subsequent
+	// COUNT in Create sees the latest committed state (PUCK-58 review).
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM agent_task_queue WHERE id = $1 FOR UPDATE", taskID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	qtx := h.Queries.WithTx(tx)
+	row, err := qtx.CreateIssueContextSubscription(ctx, db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Distinguish invalid peer (404) from cap (400). The statement
-			// enforces both the same-parent check and the per-task cap
-			// atomically via task_lock, so a concurrent create cannot race
-			// past the limit and an existing peer remains updatable at the cap.
-			if valid, vErr := h.Queries.ValidatePeerIssueForSubscription(r.Context(), db.ValidatePeerIssueForSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); vErr == nil && !valid {
+			// Distinguish invalid peer (404) from cap (400) in the same
+			// snapshot that held the lock, so the admission decision is
+			// atomic and both Create and Mark share it.
+			if valid, vErr := qtx.ValidatePeerIssueForSubscription(ctx, db.ValidatePeerIssueForSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); vErr == nil && !valid {
 				writeError(w, http.StatusNotFound, "peer issue not found")
 				return
 			}
-			// Idempotent retry at cap: the peer already exists, so the
-			// limit did not block an upsert. Return the existing row as OK
-			// instead of rejecting the duplicate.
-			if existingRow, existsErr := h.Queries.GetIssueContextSubscription(r.Context(), db.GetIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); existsErr == nil {
+			if existingRow, existsErr := qtx.GetIssueContextSubscription(ctx, db.GetIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); existsErr == nil {
+				if err := tx.Commit(ctx); err != nil {
+					writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+					return
+				}
 				writeJSON(w, http.StatusOK, issueContextSubscriptionResponse{TaskID: uuidToString(existingRow.TaskID), PeerIssueID: uuidToString(existingRow.PeerIssueID), SeenRevision: existingRow.SeenRevision})
 				return
 			}
 			writeError(w, http.StatusBadRequest, "peer subscription limit reached")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
 		return
 	}

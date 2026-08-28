@@ -1,14 +1,11 @@
 -- name: CreateIssueContextSubscription :one
--- Atomic admission (PUCK-58 review): the per-task cap is enforced inside the
--- statement so concurrent creates cannot race past it, and an existing peer
--- remains updatable even at the cap. task_lock serializes concurrent
--- admissions for the same task via row-level lock on the parent task.
-WITH task_lock AS (
-  SELECT 1 FROM agent_task_queue WHERE id = @task_id FOR UPDATE
-)
+-- Admission is enforced atomically by the caller holding a row lock on the
+-- parent task (SELECT ... FOR UPDATE in a separate statement) before this
+-- insert. The WHERE clause then sees the latest committed count in the next
+-- statement's snapshot, so concurrent creates cannot race past the cap. An
+-- existing peer remains updatable even at the cap.
 INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
 SELECT @task_id, @peer_issue_id, 0
-FROM task_lock
 WHERE EXISTS (
     SELECT 1
     FROM agent_task_queue source_task
@@ -106,8 +103,6 @@ WITH valid_peer AS (
       AND source_issue.workspace_id = peer_issue.workspace_id
       AND source_issue.parent_issue_id IS NOT NULL
       AND source_issue.parent_issue_id = peer_issue.parent_issue_id
-), task_lock AS (
-  SELECT 1 FROM agent_task_queue WHERE id = @task_id FOR UPDATE
 ), seen AS (
     INSERT INTO issue_context_subscription_task_seen (task_id, peer_task_id, seen_revision, seen_task_status)
     SELECT @task_id, @peer_task_id, @seen_revision, @seen_task_status
@@ -124,7 +119,7 @@ WITH valid_peer AS (
 ), subscription AS (
     INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
     SELECT @task_id, issue_id, @seen_revision
-    FROM valid_peer, task_lock
+    FROM valid_peer
     WHERE EXISTS (SELECT 1 FROM issue_context_subscription WHERE task_id = @task_id AND peer_issue_id = valid_peer.issue_id)
        OR (SELECT COUNT(*) FROM issue_context_subscription WHERE task_id = @task_id) < 32
     ON CONFLICT (task_id, peer_issue_id) DO UPDATE

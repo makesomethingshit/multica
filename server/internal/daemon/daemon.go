@@ -488,6 +488,10 @@ type Daemon struct {
 	// the safety delay elapses, the next claim bypasses WS once and uses HTTP so
 	// a flaky reconnecting WS cannot starve queued tasks indefinitely.
 	wsClaimHTTPFallbackAfter atomic.Int64
+	// claimChunkOffset rotates the starting chunk for batch claims so a machine
+	// with >256 runtimes does not permanently starve tail runtimes when the
+	// head chunk keeps filling maxTasks (PUCK-58 review).
+	claimChunkOffset atomic.Int64
 
 	// runtimeGoneMu guards runtimeGoneInflight, reregisterNextAttempt, and
 	// reregisterLastCompletedAt. The state lets heartbeat / poller / WS-ack

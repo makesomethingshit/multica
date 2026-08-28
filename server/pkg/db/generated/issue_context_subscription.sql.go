@@ -23,12 +23,8 @@ func (q *Queries) CountIssueContextSubscriptions(ctx context.Context, taskID pgt
 }
 
 const createIssueContextSubscription = `-- name: CreateIssueContextSubscription :one
-WITH task_lock AS (
-  SELECT 1 FROM agent_task_queue WHERE id = $1 FOR UPDATE
-)
 INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
 SELECT $1, $2, 0
-FROM task_lock
 WHERE EXISTS (
     SELECT 1
     FROM agent_task_queue source_task
@@ -53,10 +49,11 @@ type CreateIssueContextSubscriptionParams struct {
 	PeerIssueID pgtype.UUID `json:"peer_issue_id"`
 }
 
-// Atomic admission (PUCK-58 review): the per-task cap is enforced inside the
-// statement so concurrent creates cannot race past it, and an existing peer
-// remains updatable even at the cap. task_lock serializes concurrent
-// admissions for the same task via row-level lock on the parent task.
+// Admission is enforced atomically by the caller holding a row lock on the
+// parent task (SELECT ... FOR UPDATE in a separate statement) before this
+// insert. The WHERE clause then sees the latest committed count in the next
+// statement's snapshot, so concurrent creates cannot race past the cap. An
+// existing peer remains updatable even at the cap.
 func (q *Queries) CreateIssueContextSubscription(ctx context.Context, arg CreateIssueContextSubscriptionParams) (IssueContextSubscription, error) {
 	row := q.db.QueryRow(ctx, createIssueContextSubscription, arg.TaskID, arg.PeerIssueID)
 	var i IssueContextSubscription
@@ -300,8 +297,6 @@ WITH valid_peer AS (
       AND source_issue.workspace_id = peer_issue.workspace_id
       AND source_issue.parent_issue_id IS NOT NULL
       AND source_issue.parent_issue_id = peer_issue.parent_issue_id
-), task_lock AS (
-  SELECT 1 FROM agent_task_queue WHERE id = $2 FOR UPDATE
 ), seen AS (
     INSERT INTO issue_context_subscription_task_seen (task_id, peer_task_id, seen_revision, seen_task_status)
     SELECT $2, $1, $3, $4
@@ -318,7 +313,7 @@ WITH valid_peer AS (
 ), subscription AS (
     INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision)
     SELECT $2, issue_id, $3
-    FROM valid_peer, task_lock
+    FROM valid_peer
     WHERE EXISTS (SELECT 1 FROM issue_context_subscription WHERE task_id = $2 AND peer_issue_id = valid_peer.issue_id)
        OR (SELECT COUNT(*) FROM issue_context_subscription WHERE task_id = $2) < 32
     ON CONFLICT (task_id, peer_issue_id) DO UPDATE

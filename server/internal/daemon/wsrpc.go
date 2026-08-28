@@ -318,9 +318,14 @@ func (c *wsRPCClient) deliver(resp protocol.RPCResponsePayload) {
 // server's per-request truncation (PUCK-58 review).
 func (d *Daemon) ClaimTasksWSFirst(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
 	if len(runtimeIDs) > batchClaimMaxRuntimeIDs {
+		numChunks := (len(runtimeIDs) + batchClaimMaxRuntimeIDs - 1) / batchClaimMaxRuntimeIDs
+		startChunk := int(d.claimChunkOffset.Load() % int64(numChunks))
+		d.claimChunkOffset.Add(1)
 		var all []*Task
 		remaining := maxTasks
-		for start := 0; start < len(runtimeIDs) && remaining > 0; start += batchClaimMaxRuntimeIDs {
+		for i := 0; i < numChunks && remaining > 0; i++ {
+			chunkIdx := (startChunk + i) % numChunks
+			start := chunkIdx * batchClaimMaxRuntimeIDs
 			end := start + batchClaimMaxRuntimeIDs
 			if end > len(runtimeIDs) {
 				end = len(runtimeIDs)

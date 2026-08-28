@@ -472,6 +472,84 @@ func TestClaimTasksByRuntime_ChunkedClaimReachesTailRuntime(t *testing.T) {
 	}
 }
 
+// TestClaimTasksByRuntime_RotatesWhenHeadSaturated verifies the rotation fix:
+// when the head chunk keeps filling maxTasks, the tail is not permanently
+// starved — the starting chunk rotates each poll so the tail is eventually
+// claimed.
+func TestClaimTasksByRuntime_RotatesWhenHeadSaturated(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	headRT := createClaimReclaimRuntime(t, ctx, "Head saturated rt")
+	tailRT := createClaimReclaimRuntime(t, ctx, "Tail saturated rt")
+	headAgent, headIssue := createClaimReclaimAgentAndIssue(t, ctx, headRT, "Head saturated agent")
+	tailAgent, tailIssue := createClaimReclaimAgentAndIssue(t, ctx, tailRT, "Tail saturated agent")
+	headTaskID := seedQueuedIssueTask(t, ctx, headAgent, headRT, headIssue)
+	tailTaskID := seedQueuedIssueTask(t, ctx, tailAgent, tailRT, tailIssue)
+
+	ids := make([]string, 300)
+	ids[0] = headRT
+	for i := 1; i < 299; i++ {
+		ids[i] = "not-a-uuid"
+	}
+	ids[299] = tailRT
+
+	// Single oversized request would truncate and never reach tail
+	wSingle := postBatchClaim(t, testWorkspaceID, ids, 1)
+	if wSingle.Code != http.StatusOK {
+		t.Fatalf("single oversized expected 200, got %d: %s", wSingle.Code, wSingle.Body.String())
+	}
+	var respSingle batchClaimResponse
+	if err := json.Unmarshal(wSingle.Body.Bytes(), &respSingle); err != nil {
+		t.Fatalf("decode single: %v", err)
+	}
+	// Single request truncates to first 256, so it sees head but not tail.
+	// headTask is claimed, tail remains queued.
+	if len(respSingle.Tasks) != 1 || respSingle.Tasks[0].ID != headTaskID {
+		t.Fatalf("single truncated claim got %+v, want head %s", respSingle.Tasks, headTaskID)
+	}
+	var tailStatus string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id = $1`, tailTaskID).Scan(&tailStatus); err != nil {
+		t.Fatalf("read tail status: %v", err)
+	}
+	if tailStatus != "queued" {
+		t.Fatalf("tail status = %s, want still queued after truncated single claim", tailStatus)
+	}
+	// Reset head task to queued for the rotation test (re-queue)
+	testPool.Exec(ctx, `UPDATE agent_task_queue SET status='queued' WHERE id=$1`, headTaskID)
+
+	// Simulate daemon rotation: poll1 starts at chunk 0 (head first) -> claims head
+	firstChunk := ids[:256]
+	secondChunk := ids[256:]
+	w1 := postBatchClaim(t, testWorkspaceID, firstChunk, 1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("poll1 chunk0 expected 200, got %d: %s", w1.Code, w1.Body.String())
+	}
+	var r1 batchClaimResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &r1); err != nil {
+		t.Fatalf("decode poll1: %v", err)
+	}
+	if len(r1.Tasks) != 1 || r1.Tasks[0].ID != headTaskID {
+		t.Fatalf("poll1 (offset 0) got %+v, want head %s", r1.Tasks, headTaskID)
+	}
+	// Re-queue head again
+	testPool.Exec(ctx, `UPDATE agent_task_queue SET status='queued' WHERE id=$1`, headTaskID)
+
+	// Poll2 with rotation (tail chunk first) -> should claim tail even though head still has a queued task
+	w2 := postBatchClaim(t, testWorkspaceID, secondChunk, 1)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("poll2 chunk1 expected 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	var r2 batchClaimResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &r2); err != nil {
+		t.Fatalf("decode poll2: %v", err)
+	}
+	if len(r2.Tasks) != 1 || r2.Tasks[0].ID != tailTaskID {
+		t.Fatalf("poll2 (rotated to tail) got %+v, want tail %s (rotation)", r2.Tasks, tailTaskID)
+	}
+}
+
 // TestFailClaimedTaskBeforeLaunchSettlesDispatchedTask pins the claim-build
 // failure behavior used by required Plugin contributions. A durable rejection
 // must become a visible terminal task instead of remaining dispatched until

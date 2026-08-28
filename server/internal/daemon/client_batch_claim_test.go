@@ -154,3 +154,101 @@ func TestClient_ClaimTasks_ChunksLargeRuntimeSet(t *testing.T) {
 		t.Fatalf("tail runtime not found in any chunk")
 	}
 }
+
+// TestClient_ClaimTasks_RotatesWhenHeadSaturated verifies the rotation fix:
+// when the head chunk keeps filling maxTasks, the tail is not permanently
+// starved — the starting chunk rotates each poll so the tail is eventually
+// claimed.
+func TestClient_ClaimTasks_RotatesWhenHeadSaturated(t *testing.T) {
+	var mu sync.Mutex
+	var gotBodies [][]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			RuntimeIDs []string `json:"runtime_ids"`
+			MaxTasks   int      `json:"max_tasks"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		mu.Lock()
+		gotBodies = append(gotBodies, body.RuntimeIDs)
+		mu.Unlock()
+		// Head chunk always has tasks that fill maxTasks; tail chunk has the
+		// desired tail task. The client should rotate so the second poll
+		// starts with the tail chunk.
+		hasHead := false
+		hasTail := false
+		for _, id := range body.RuntimeIDs {
+			if id == "rt-head" {
+				hasHead = true
+			}
+			if id == "rt-tail" {
+				hasTail = true
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if hasHead {
+			// Fill maxTasks so remaining becomes 0 and the tail chunk in the
+			// same poll is not visited — rotation is needed for the next poll.
+			w.Write([]byte(`{"tasks":[{"id":"head-task","runtime_id":"rt-head"}]}`))
+			return
+		}
+		if hasTail {
+			w.Write([]byte(`{"tasks":[{"id":"tail-task","runtime_id":"rt-tail"}]}`))
+			return
+		}
+		w.Write([]byte(`{"tasks":[]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	c.SetToken("tok")
+
+	// 300 IDs: head at position 0, tail at 299, rest filler
+	ids := make([]string, 300)
+	ids[0] = "rt-head"
+	for i := 1; i < 299; i++ {
+		ids[i] = "rt-filler"
+	}
+	ids[299] = "rt-tail"
+
+	// First poll: offset 0 -> head chunk first, fills maxTasks=1, tail not visited
+	tasks1, err := c.ClaimTasks(context.Background(), "daemon-x", ids, 1)
+	if err != nil {
+		t.Fatalf("first poll ClaimTasks: %v", err)
+	}
+	if len(tasks1) != 1 || tasks1[0].ID != "head-task" {
+		t.Fatalf("first poll got %+v, want head-task", tasks1)
+	}
+	mu.Lock()
+	if len(gotBodies) != 1 || gotBodies[0][0] != "rt-head" {
+		t.Fatalf("first poll first chunk = %v, want rt-head first", gotBodies[0])
+	}
+	mu.Unlock()
+
+	// Second poll: offset 1 -> tail chunk first, should claim tail
+	mu.Lock()
+	gotBodies = nil
+	mu.Unlock()
+	tasks2, err := c.ClaimTasks(context.Background(), "daemon-x", ids, 1)
+	if err != nil {
+		t.Fatalf("second poll ClaimTasks: %v", err)
+	}
+	if len(tasks2) != 1 || tasks2[0].ID != "tail-task" {
+		t.Fatalf("second poll got %+v, want tail-task (rotation)", tasks2)
+	}
+	mu.Lock()
+	if len(gotBodies) == 0 || gotBodies[0][0] == "rt-head" {
+		t.Fatalf("second poll first chunk = %v, want tail chunk first due to rotation", gotBodies[0])
+	}
+	foundTailFirst := false
+	for _, id := range gotBodies[0] {
+		if id == "rt-tail" {
+			foundTailFirst = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !foundTailFirst {
+		t.Fatalf("second poll first chunk did not contain rt-tail, rotation failed")
+	}
+}

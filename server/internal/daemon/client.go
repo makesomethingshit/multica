@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
@@ -116,6 +117,7 @@ type Client struct {
 	legacyWorkspaceEndpointEnabled bool
 	issueGCBatchMu                 sync.Mutex
 	legacyIssueGCBatchEnabled      bool
+	claimChunkOffset               atomic.Int64
 }
 
 // NewClient creates a new daemon API client.
@@ -273,9 +275,14 @@ const batchClaimMaxRuntimeIDs = 256
 // server and cancels the in-flight query there too.
 func (c *Client) ClaimTasks(ctx context.Context, daemonID string, runtimeIDs []string, maxTasks int) ([]*Task, error) {
 	if len(runtimeIDs) > batchClaimMaxRuntimeIDs {
+		numChunks := (len(runtimeIDs) + batchClaimMaxRuntimeIDs - 1) / batchClaimMaxRuntimeIDs
+		startChunk := int(c.claimChunkOffset.Load() % int64(numChunks))
+		c.claimChunkOffset.Add(1)
 		var all []*Task
 		remaining := maxTasks
-		for start := 0; start < len(runtimeIDs) && remaining > 0; start += batchClaimMaxRuntimeIDs {
+		for i := 0; i < numChunks && remaining > 0; i++ {
+			chunkIdx := (startChunk + i) % numChunks
+			start := chunkIdx * batchClaimMaxRuntimeIDs
 			end := start + batchClaimMaxRuntimeIDs
 			if end > len(runtimeIDs) {
 				end = len(runtimeIDs)
