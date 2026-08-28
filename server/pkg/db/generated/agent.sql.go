@@ -5135,8 +5135,8 @@ FROM agent_task_queue atq
 JOIN issue i ON i.id = atq.issue_id
 JOIN workspace w ON w.id = i.workspace_id
 JOIN agent a ON a.id = atq.agent_id
-LEFT JOIN issue_context_subscription sub
-  ON sub.task_id = $1 AND sub.peer_issue_id = i.id
+LEFT JOIN issue_context_subscription_task_seen sub
+  ON sub.task_id = $1 AND sub.peer_task_id = atq.id
 WHERE i.parent_issue_id = $2
   AND i.workspace_id = $3
   AND atq.id <> $1

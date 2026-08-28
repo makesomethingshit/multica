@@ -26,7 +26,7 @@ WHERE EXISTS (
 )
 ON CONFLICT (task_id, peer_issue_id) DO UPDATE
 SET updated_at = now()
-RETURNING task_id, peer_issue_id, seen_revision, created_at, updated_at, seen_task_status
+RETURNING task_id, peer_issue_id, seen_revision, created_at, updated_at
 `
 
 type CreateIssueContextSubscriptionParams struct {
@@ -43,14 +43,20 @@ func (q *Queries) CreateIssueContextSubscription(ctx context.Context, arg Create
 		&i.SeenRevision,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.SeenTaskStatus,
 	)
 	return i, err
 }
 
 const deleteIssueContextSubscription = `-- name: DeleteIssueContextSubscription :execrows
-DELETE FROM issue_context_subscription
-WHERE task_id = $1 AND peer_issue_id = $2
+WITH deleted_seen AS (
+    DELETE FROM issue_context_subscription_task_seen seen
+    USING agent_task_queue peer_task
+    WHERE seen.task_id = $1
+      AND seen.peer_task_id = peer_task.id
+      AND peer_task.issue_id = $2
+)
+DELETE FROM issue_context_subscription subscription
+WHERE subscription.task_id = $1 AND subscription.peer_issue_id = $2
 `
 
 type DeleteIssueContextSubscriptionParams struct {
@@ -67,7 +73,7 @@ func (q *Queries) DeleteIssueContextSubscription(ctx context.Context, arg Delete
 }
 
 const getIssueContextSubscription = `-- name: GetIssueContextSubscription :one
-SELECT task_id, peer_issue_id, seen_revision, created_at, updated_at, seen_task_status FROM issue_context_subscription
+SELECT task_id, peer_issue_id, seen_revision, created_at, updated_at FROM issue_context_subscription
 WHERE task_id = $1 AND peer_issue_id = $2
 `
 
@@ -85,7 +91,6 @@ func (q *Queries) GetIssueContextSubscription(ctx context.Context, arg GetIssueC
 		&i.SeenRevision,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.SeenTaskStatus,
 	)
 	return i, err
 }
@@ -110,7 +115,7 @@ func (q *Queries) GetTaskPeerSnapshot(ctx context.Context, taskID pgtype.UUID) (
 }
 
 const listIssueContextSubscriptions = `-- name: ListIssueContextSubscriptions :many
-SELECT s.task_id, s.peer_issue_id, s.seen_revision, s.created_at, s.updated_at, s.seen_task_status
+SELECT s.task_id, s.peer_issue_id, s.seen_revision, s.created_at, s.updated_at
 FROM issue_context_subscription s
 JOIN issue i ON i.id = s.peer_issue_id
 WHERE s.task_id = $1
@@ -132,7 +137,6 @@ func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgty
 			&i.SeenRevision,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.SeenTaskStatus,
 		); err != nil {
 			return nil, err
 		}
@@ -145,48 +149,49 @@ func (q *Queries) ListIssueContextSubscriptions(ctx context.Context, taskID pgty
 }
 
 const markIssueContextSubscriptionSeen = `-- name: MarkIssueContextSubscriptionSeen :one
-INSERT INTO issue_context_subscription (task_id, peer_issue_id, seen_revision, seen_task_status)
+INSERT INTO issue_context_subscription_task_seen (task_id, peer_task_id, seen_revision, seen_task_status)
 SELECT $1, $2, $3, $4
-FROM issue i
-JOIN agent_task_queue source_task ON source_task.id = $1
+FROM agent_task_queue source_task
 JOIN issue source_issue ON source_issue.id = source_task.issue_id
-WHERE i.id = $2
-  AND source_issue.workspace_id = i.workspace_id
+JOIN agent_task_queue peer_task ON peer_task.id = $2
+JOIN issue peer_issue ON peer_issue.id = peer_task.issue_id
+WHERE source_issue.workspace_id = peer_issue.workspace_id
   AND source_issue.parent_issue_id IS NOT NULL
-  AND source_issue.parent_issue_id = i.parent_issue_id
-ON CONFLICT (task_id, peer_issue_id) DO UPDATE
-SET seen_revision = GREATEST(issue_context_subscription.seen_revision, EXCLUDED.seen_revision),
+  AND source_issue.parent_issue_id = peer_issue.parent_issue_id
+  AND source_task.id = $1
+ON CONFLICT (task_id, peer_task_id) DO UPDATE
+SET seen_revision = GREATEST(issue_context_subscription_task_seen.seen_revision, EXCLUDED.seen_revision),
     seen_task_status = CASE
-        WHEN EXCLUDED.seen_revision >= issue_context_subscription.seen_revision
+        WHEN EXCLUDED.seen_revision >= issue_context_subscription_task_seen.seen_revision
         THEN EXCLUDED.seen_task_status
-        ELSE issue_context_subscription.seen_task_status
+        ELSE issue_context_subscription_task_seen.seen_task_status
     END,
     updated_at = now()
-RETURNING task_id, peer_issue_id, seen_revision, created_at, updated_at, seen_task_status
+RETURNING task_id, peer_task_id, seen_revision, seen_task_status, created_at, updated_at
 `
 
 type MarkIssueContextSubscriptionSeenParams struct {
 	TaskID         pgtype.UUID `json:"task_id"`
-	PeerIssueID    pgtype.UUID `json:"peer_issue_id"`
+	PeerTaskID     pgtype.UUID `json:"peer_task_id"`
 	SeenRevision   int64       `json:"seen_revision"`
 	SeenTaskStatus string      `json:"seen_task_status"`
 }
 
-func (q *Queries) MarkIssueContextSubscriptionSeen(ctx context.Context, arg MarkIssueContextSubscriptionSeenParams) (IssueContextSubscription, error) {
+func (q *Queries) MarkIssueContextSubscriptionSeen(ctx context.Context, arg MarkIssueContextSubscriptionSeenParams) (IssueContextSubscriptionTaskSeen, error) {
 	row := q.db.QueryRow(ctx, markIssueContextSubscriptionSeen,
 		arg.TaskID,
-		arg.PeerIssueID,
+		arg.PeerTaskID,
 		arg.SeenRevision,
 		arg.SeenTaskStatus,
 	)
-	var i IssueContextSubscription
+	var i IssueContextSubscriptionTaskSeen
 	err := row.Scan(
 		&i.TaskID,
-		&i.PeerIssueID,
+		&i.PeerTaskID,
 		&i.SeenRevision,
+		&i.SeenTaskStatus,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.SeenTaskStatus,
 	)
 	return i, err
 }

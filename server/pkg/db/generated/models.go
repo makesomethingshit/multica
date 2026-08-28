@@ -779,12 +779,20 @@ type Issue struct {
 }
 
 type IssueContextSubscription struct {
+	TaskID       pgtype.UUID        `json:"task_id"`
+	PeerIssueID  pgtype.UUID        `json:"peer_issue_id"`
+	SeenRevision int64              `json:"seen_revision"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+type IssueContextSubscriptionTaskSeen struct {
 	TaskID         pgtype.UUID        `json:"task_id"`
-	PeerIssueID    pgtype.UUID        `json:"peer_issue_id"`
+	PeerTaskID     pgtype.UUID        `json:"peer_task_id"`
 	SeenRevision   int64              `json:"seen_revision"`
+	SeenTaskStatus string             `json:"seen_task_status"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
-	SeenTaskStatus string             `json:"seen_task_status"`
 }
 
 type IssueDependency struct {

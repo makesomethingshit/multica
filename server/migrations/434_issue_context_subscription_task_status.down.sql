@@ -1,2 +1,1 @@
-ALTER TABLE issue_context_subscription
-    DROP COLUMN seen_task_status;
+DROP TABLE issue_context_subscription_task_seen;

@@ -5015,7 +5015,7 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	// itself never advances this cursor.
 	if markPeerSeen {
 		if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
-			TaskID: sourceTaskID, PeerIssueID: task.IssueID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
+			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
 		}); markErr != nil {
 			if errors.Is(markErr, pgx.ErrNoRows) {
 				writeError(w, http.StatusNotFound, "peer context not found")
@@ -5081,7 +5081,9 @@ func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.R
 	resp := make([]issueContextSubscriptionResponse, 0, len(rows))
 	for _, row := range rows {
 		revision := int64(0)
-		if issue, err := h.Queries.GetIssue(r.Context(), row.PeerIssueID); err == nil { revision = issue.Revision }
+		if issue, err := h.Queries.GetIssue(r.Context(), row.PeerIssueID); err == nil {
+			revision = issue.Revision
+		}
 		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: revision})
 	}
 	writeJSON(w, http.StatusOK, resp)
