@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS issue_context_subscription_task_seen_peer_idx;

@@ -220,10 +220,8 @@ var issueAssignCmd = &cobra.Command{
 var issueStatusCmd = &cobra.Command{
 	Use:   "status <id> <status>",
 	Short: "Change issue status",
-	Long: "Change an issue's status. The argument is a status KEY, not its display name.\n" +
-		"Built-in keys: backlog, todo, in_progress, in_review, done, blocked, cancelled.\n" +
-		"A workspace may define custom statuses on top of these; their keys are shown in\n" +
-		"Workspace Settings > Issue Statuses, and an unknown value errors with the full list.",
+	Long: "Change an issue's status. Valid statuses: " +
+		"backlog, todo, in_progress, in_review, done, blocked, cancelled.",
 	Args: exactArgs(2),
 	RunE: runIssueStatus,
 }
@@ -330,6 +328,13 @@ var issueRunMessagesCmd = &cobra.Command{
 	Short: "List messages for an execution",
 	Args:  exactArgs(1),
 	RunE:  runIssueRunMessages,
+}
+
+var issueRunRebasesCmd = &cobra.Command{
+	Use:   "run-rebases <task-id>",
+	Short: "List an execution's peer context rebase audit log in occurrence order",
+	Args:  exactArgs(1),
+	RunE:  runIssueRunRebases,
 }
 
 var issueUsageCmd = &cobra.Command{
@@ -459,6 +464,7 @@ func init() {
 	issueCmd.AddCommand(issueSubscriberCmd)
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
+	issueCmd.AddCommand(issueRunRebasesCmd)
 	issueCmd.AddCommand(issueUsageCmd)
 	issueCmd.AddCommand(issueRerunCmd)
 	issueCmd.AddCommand(issueCancelTaskCmd)
@@ -483,7 +489,7 @@ func init() {
 	issueListCmd.Flags().String("assignee-id", "", "Filter by assignee UUID — member, agent, or squad (mutually exclusive with --assignee)")
 	issueListCmd.Flags().String("project", "", "Filter by project ID")
 	issueListCmd.Flags().StringSlice("metadata", nil, "Filter by metadata key=value (repeatable; combined with AND). Value is JSON-parsed: 'true'/'false' → bool, numbers → number, otherwise string. Wrap as '\"42\"' to force a string when the value would otherwise sniff as a number.")
-	issueListCmd.Flags().Int("limit", 50, "Maximum number of issues to return in one page (the server caps a page at 100; use --offset to page through more)")
+	issueListCmd.Flags().Int("limit", 50, "Maximum number of issues to return")
 	issueListCmd.Flags().Int("offset", 0, "Number of issues to skip (for pagination)")
 	issueListCmd.Flags().String("sort", "", "Sort column: position (default, manual board order), title, created_at, start_date, due_date, priority")
 	issueListCmd.Flags().String("direction", "", "Sort direction (asc or desc); requires --sort to be a non-position column (position is always ascending)")
@@ -579,6 +585,8 @@ func init() {
 	issueRunMessagesCmd.Flags().String("output", "json", "Output format: table or json")
 	issueRunMessagesCmd.Flags().Int("since", 0, "Only return messages after this sequence number")
 	issueRunMessagesCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
+	issueRunRebasesCmd.Flags().String("output", "json", "Output format: table or json")
+	issueRunRebasesCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
 
 	// issue comment add
 	issueCommentAddCmd.Flags().String("content", "", "Comment content (decodes \\n, \\r, \\t, \\\\; pipe via --content-stdin for multi-line bodies or to preserve literal backslashes)")
@@ -2282,6 +2290,55 @@ func runIssueRunMessages(cmd *cobra.Command, args []string) error {
 			strVal(m, "type"),
 			strVal(m, "tool"),
 			content,
+		})
+	}
+	cli.PrintTable(os.Stdout, headers, rows)
+	return nil
+}
+
+func runIssueRunRebases(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+
+	issueID := ""
+	if issueInput, _ := cmd.Flags().GetString("issue"); issueInput != "" {
+		issueRef, err := resolveIssueRef(ctx, client, issueInput)
+		if err != nil {
+			return fmt.Errorf("resolve issue: %w", err)
+		}
+		issueID = issueRef.ID
+	}
+	taskRef, err := resolveTaskRunID(ctx, client, issueID, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve task run: %w", err)
+	}
+
+	path := "/api/tasks/" + url.PathEscape(taskRef.ID) + "/peer-context/rebases"
+
+	var rebases []map[string]any
+	if err := client.GetJSON(ctx, path, &rebases); err != nil {
+		return fmt.Errorf("list peer context rebases: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, rebases)
+	}
+
+	headers := []string{"SEQ", "PEER TASK", "REVISION", "STATUS", "RECORDED AT"}
+	rows := make([][]string, 0, len(rebases))
+	for _, r := range rebases {
+		rows = append(rows, []string{
+			fmt.Sprintf("%v", r["seq"]),
+			strVal(r, "peer_task_id"),
+			fmt.Sprintf("%v -> %v", r["from_revision"], r["to_revision"]),
+			fmt.Sprintf("%q -> %q", r["from_status"], r["to_status"]),
+			strVal(r, "created_at"),
 		})
 	}
 	cli.PrintTable(os.Stdout, headers, rows)

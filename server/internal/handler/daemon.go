@@ -1567,6 +1567,23 @@ func (h *Handler) repairStaleCommentPlanIfNeeded(ctx context.Context, task *db.A
 // daemon never asks for more than its free execution-slot count anyway.
 const claimBatchMaxTasksCap = 32
 
+// claimBatchMaxRuntimeIDs bounds how many runtime_ids one batch claim request
+// may carry, so an authenticated caller cannot make the handler allocate an
+// unbounded id map or hand an unbounded array to the runtime lookup query. A
+// machine beyond the cap has its extra ids truncated, never rejected: the
+// claim loop re-runs every poll, and a 400 would give an oversized machine no
+// fallback (the daemon only falls back to the legacy per-runtime claim on
+// 404). Truncation matches the endpoint's existing "unknown id skipped"
+// tolerance — the first claimBatchMaxRuntimeIDs hosts keep claiming.
+const claimBatchMaxRuntimeIDs = 256
+
+// claimBatchMaxBodyBytes bounds the decoded size of one batch claim request.
+// The legitimate payload is daemon_id plus at most claimBatchMaxRuntimeIDs
+// UUID strings plus max_tasks — a few KiB — so 64 KiB is generous headroom.
+// Without the cap any authenticated daemon/PAT/JWT caller could make the JSON
+// decoder allocate the full request body before validation.
+const claimBatchMaxBodyBytes = 64 << 10
+
 // ClaimTasksByRuntime is the machine-level (MUL-4257) batch claim endpoint. A
 // daemon posts every runtime_id it hosts plus its free execution-slot count and
 // receives up to max_tasks already-claimed tasks in ONE round trip — each
@@ -1588,9 +1605,15 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		RuntimeIDs []string `json:"runtime_ids"`
 		MaxTasks   int      `json:"max_tasks"`
 	}
+	// Body-size cap (PUCK-58 review): bound the decode before reading, so an
+	// oversized request fails fast instead of allocating the whole body.
+	r.Body = http.MaxBytesReader(w, r.Body, claimBatchMaxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	if len(req.RuntimeIDs) > claimBatchMaxRuntimeIDs {
+		req.RuntimeIDs = req.RuntimeIDs[:claimBatchMaxRuntimeIDs]
 	}
 
 	// Machine-level ownership (MUL-4257 review): the batch claim is scoped to a
@@ -3045,6 +3068,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					IssueRevision:   sibling.IssueRevision,
 					Revision:        sibling.IssueRevision,
 					SeenRevision:    sibling.SeenRevision,
+					Stale:           sibling.Stale,
 					AgentName:       sibling.AgentName,
 					Status:          sibling.Status,
 					CreatedAt:       timestampToString(sibling.CreatedAt),
@@ -4946,37 +4970,142 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 	}
 
 	var (
-		messages []db.TaskMessage
-		queryErr error
+		messages       []db.TaskMessage
+		queryErr       error
+		sourceTaskID   pgtype.UUID
+		markPeerSeen   bool
+		seenRevision   int64
+		seenTaskStatus string
+		priorPeerSeen  db.IssueContextSubscriptionTaskSeen
+		rebaseNeeded   bool
 	)
+	if r.Header.Get("X-Actor-Source") == "task_token" {
+		if sourceID, parseErr := uuid.Parse(r.Header.Get("X-Task-ID")); parseErr == nil {
+			sourceTaskID = pgtype.UUID{Bytes: sourceID, Valid: true}
+			markPeerSeen = sourceTaskID != taskUUID && task.IssueID.Valid
+		}
+	}
+	var queryTx pgx.Tx
+	if markPeerSeen {
+		queryTx, queryErr = h.TxStarter.Begin(r.Context())
+		if queryErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+		defer queryTx.Rollback(r.Context())
+		_, queryErr = queryTx.Exec(r.Context(), "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+		if queryErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+	}
+	queries := h.Queries
+	if queryTx != nil {
+		queries = h.Queries.WithTx(queryTx)
+		// Claim-time staleness (ListActiveSiblingIssueTasks) is computed from
+		// the per-task cursor alone; mirror it exactly so the lookup records a
+		// rebase precisely when the claim snapshot showed `[stale]` — including
+		// a new parallel peer task on an issue whose revision was already read
+		// through a sibling task (status cursor absent → stale at claim).
+		if priorPeerSeen, queryErr = queries.GetIssueContextSubscriptionTaskSeen(r.Context(), db.GetIssueContextSubscriptionTaskSeenParams{
+			TaskID: sourceTaskID, PeerTaskID: taskUUID,
+		}); queryErr != nil && !errors.Is(queryErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+	}
 	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
 		sinceSeq, parseErr := strconv.Atoi(sinceStr)
 		if parseErr != nil {
 			writeError(w, http.StatusBadRequest, "invalid since parameter")
 			return
 		}
-		messages, queryErr = h.Queries.ListTaskMessagesSince(r.Context(), db.ListTaskMessagesSinceParams{
+		messages, queryErr = queries.ListTaskMessagesSince(r.Context(), db.ListTaskMessagesSinceParams{
 			TaskID: taskUUID,
 			Seq:    int32(sinceSeq),
 		})
 	} else {
-		messages, queryErr = h.Queries.ListTaskMessages(r.Context(), taskUUID)
+		messages, queryErr = queries.ListTaskMessages(r.Context(), taskUUID)
 	}
 	if queryErr != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list task messages")
 		return
 	}
+	if markPeerSeen {
+		snapshot, snapshotErr := queries.GetTaskPeerSnapshot(r.Context(), taskUUID)
+		if snapshotErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+		seenRevision = snapshot.IssueRevision
+		seenTaskStatus = snapshot.TaskStatus
+		// The authenticated lookup is the rebase boundary: compare the snapshot
+		// captured in this transaction with this source task's per-peer cursor,
+		// using the claim query's exact stale condition — an unseen peer keeps
+		// zero-value cursors, so a first lookup of a peer whose revision or
+		// status is already non-empty is stale just like the claim snapshot.
+		rebaseNeeded = seenRevision > priorPeerSeen.SeenRevision ||
+			seenTaskStatus != priorPeerSeen.SeenTaskStatus
+		if err := queryTx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to snapshot peer context")
+			return
+		}
+	}
 
 	issueID := uuidToString(task.IssueID)
 	// A running agent may explicitly inspect a sibling run from the claim
 	// prompt. Record that read only after the messages lookup succeeded; claim
-	// itself never advances this cursor.
-	if r.Header.Get("X-Actor-Source") == "task_token" {
-		if sourceID, err := uuid.Parse(r.Header.Get("X-Task-ID")); err == nil && sourceID != taskUUID && task.IssueID.Valid {
-			if _, markErr := h.Queries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{TaskID: sourceID, PeerIssueID: task.IssueID}); markErr != nil {
-				if errors.Is(markErr, pgx.ErrNoRows) { writeError(w, http.StatusNotFound, "peer context not found"); return }
-				slog.Warn("mark peer context seen failed", "task_id", sourceID, "peer_issue_id", task.IssueID, "error", markErr)
+	// itself never advances this cursor. When the cursor was stale, append the
+	// rebase event to the task's dedicated audit log (never to task_message —
+	// the daemon owns that seq space and the transcript is daemon output) so
+	// the rebase attempt is auditable without requiring a second write command
+	// from the agent.
+	if markPeerSeen {
+		// The cursor advance and the audit record must land together: if the
+		// audit insert failed while the cursor survived, every retry would see
+		// the stale event as already consumed and the audit trail would lose
+		// the rebase permanently.
+		writeTx, writeErr := h.TxStarter.Begin(r.Context())
+		if writeErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
+		defer writeTx.Rollback(r.Context())
+		txQueries := h.Queries.WithTx(writeTx)
+		// Serialize concurrent admissions for the same source task so the
+		// COUNT in Mark's subscription CTE sees the latest snapshot (PUCK-58
+		// review). Lock in a separate statement before the upsert so the next
+		// statement's snapshot is fresh.
+		if _, err := writeTx.Exec(r.Context(), "SELECT 1 FROM agent_task_queue WHERE id = $1 FOR UPDATE", sourceTaskID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
+		}
+		if _, markErr := txQueries.MarkIssueContextSubscriptionSeen(r.Context(), db.MarkIssueContextSubscriptionSeenParams{
+			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
+		}); markErr != nil {
+			if errors.Is(markErr, pgx.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "peer context not found")
+				return
 			}
+			writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
+			return
+		}
+		if rebaseNeeded {
+			if _, auditErr := txQueries.CreatePeerContextRebaseLog(r.Context(), db.CreatePeerContextRebaseLogParams{
+				TaskID:       sourceTaskID,
+				PeerTaskID:   taskUUID,
+				FromRevision: priorPeerSeen.SeenRevision,
+				ToRevision:   seenRevision,
+				FromStatus:   priorPeerSeen.SeenTaskStatus,
+				ToStatus:     seenTaskStatus,
+			}); auditErr != nil {
+				writeError(w, http.StatusInternalServerError, "failed to record peer context rebase")
+				return
+			}
+		}
+		if err := writeTx.Commit(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to record peer context")
+			return
 		}
 	}
 
@@ -5021,6 +5150,15 @@ func (h *Handler) issueContextSubscriptionTask(w http.ResponseWriter, r *http.Re
 	return task, taskID, true
 }
 
+// maxPeerContextSubscriptionsPerTask bounds the explicit peer subscriptions a
+// single task may hold (PUCK-58 review). Without a cap an authenticated caller
+// could grow one task's subscription set unboundedly, inflating the list
+// response and every claim-time snapshot read against it. Enforcement is
+// application-layer (the repo forbids DB-side constraints for relationships),
+// so concurrent creations can race past the cap by a small margin — this is a
+// resource guard, not an authorization boundary.
+const maxPeerContextSubscriptionsPerTask = 32
+
 // ListIssueContextSubscriptions returns the task's explicit peer subscriptions.
 func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.Request) {
 	_, taskID, ok := h.issueContextSubscriptionTask(w, r)
@@ -5034,9 +5172,50 @@ func (h *Handler) ListIssueContextSubscriptions(w http.ResponseWriter, r *http.R
 	}
 	resp := make([]issueContextSubscriptionResponse, 0, len(rows))
 	for _, row := range rows {
-		revision := int64(0)
-		if issue, err := h.Queries.GetIssue(r.Context(), row.PeerIssueID); err == nil { revision = issue.Revision }
-		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: revision})
+		resp = append(resp, issueContextSubscriptionResponse{TaskID: uuidToString(row.TaskID), PeerIssueID: uuidToString(row.PeerIssueID), SeenRevision: row.SeenRevision, Revision: row.Revision})
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type peerContextRebaseResponse struct {
+	Seq          int64     `json:"seq"`
+	TaskID       string    `json:"task_id"`
+	PeerTaskID   string    `json:"peer_task_id"`
+	FromRevision int64     `json:"from_revision"`
+	ToRevision   int64     `json:"to_revision"`
+	FromStatus   string    `json:"from_status"`
+	ToStatus     string    `json:"to_status"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// ListPeerContextRebaseLog returns the task's rebase audit trail in true
+// occurrence order. Rebase events live in their own log rather than in
+// task_message: the daemon owns that table's seq space with a local counter,
+// so server-side inserts would either collide with daemon output or sort out
+// of chronological position, and the transcript renderers only know daemon
+// message types.
+func (h *Handler) ListPeerContextRebaseLog(w http.ResponseWriter, r *http.Request) {
+	_, taskID, ok := h.issueContextSubscriptionTask(w, r)
+	if !ok {
+		return
+	}
+	rows, err := h.Queries.ListPeerContextRebaseLog(r.Context(), taskID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list peer context rebases")
+		return
+	}
+	resp := make([]peerContextRebaseResponse, 0, len(rows))
+	for _, row := range rows {
+		resp = append(resp, peerContextRebaseResponse{
+			Seq:          row.Seq,
+			TaskID:       uuidToString(row.TaskID),
+			PeerTaskID:   uuidToString(row.PeerTaskID),
+			FromRevision: row.FromRevision,
+			ToRevision:   row.ToRevision,
+			FromStatus:   row.FromStatus,
+			ToStatus:     row.ToStatus,
+			CreatedAt:    row.CreatedAt.Time,
+		})
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -5057,12 +5236,46 @@ func (h *Handler) CreateIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	row, err := h.Queries.CreateIssueContextSubscription(r.Context(), db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	peerUUID := pgtype.UUID{Bytes: peerID, Valid: true}
+	ctx := r.Context()
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	defer tx.Rollback(ctx)
+	// Serialize concurrent admissions for the same task so the subsequent
+	// COUNT in Create sees the latest committed state (PUCK-58 review).
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM agent_task_queue WHERE id = $1 FOR UPDATE", taskID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	qtx := h.Queries.WithTx(tx)
+	row, err := qtx.CreateIssueContextSubscription(ctx, db.CreateIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "peer issue not found")
+			// Distinguish invalid peer (404) from cap (400) in the same
+			// snapshot that held the lock, so the admission decision is
+			// atomic and both Create and Mark share it.
+			if valid, vErr := qtx.ValidatePeerIssueForSubscription(ctx, db.ValidatePeerIssueForSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); vErr == nil && !valid {
+				writeError(w, http.StatusNotFound, "peer issue not found")
+				return
+			}
+			if existingRow, existsErr := qtx.GetIssueContextSubscription(ctx, db.GetIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerUUID}); existsErr == nil {
+				if err := tx.Commit(ctx); err != nil {
+					writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+					return
+				}
+				writeJSON(w, http.StatusOK, issueContextSubscriptionResponse{TaskID: uuidToString(existingRow.TaskID), PeerIssueID: uuidToString(existingRow.PeerIssueID), SeenRevision: existingRow.SeenRevision})
+				return
+			}
+			writeError(w, http.StatusBadRequest, "peer subscription limit reached")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to subscribe to peer issue")
 		return
 	}
@@ -5080,7 +5293,7 @@ func (h *Handler) DeleteIssueContextSubscription(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusBadRequest, "invalid peer_issue_id")
 		return
 	}
-	deleted, err := h.Queries.DeleteIssueContextSubscription(r.Context(), db.DeleteIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: peerID})
+	deleted, err := h.Queries.DeleteIssueContextSubscription(r.Context(), db.DeleteIssueContextSubscriptionParams{TaskID: taskID, PeerIssueID: pgtype.UUID{Bytes: peerID, Valid: true}})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to delete peer subscription")
 		return

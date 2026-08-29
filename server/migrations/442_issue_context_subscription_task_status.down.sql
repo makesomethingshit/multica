@@ -1,0 +1,1 @@
+DROP TABLE issue_context_subscription_task_seen;
