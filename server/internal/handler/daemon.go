@@ -5084,7 +5084,13 @@ func (h *Handler) ListTaskMessagesByUser(w http.ResponseWriter, r *http.Request)
 			TaskID: sourceTaskID, PeerTaskID: taskUUID, SeenRevision: seenRevision, SeenTaskStatus: seenTaskStatus,
 		}); markErr != nil {
 			if errors.Is(markErr, pgx.ErrNoRows) {
-				writeError(w, http.StatusNotFound, "peer context not found")
+				// No explicit subscription exists for this peer - not an error for message listing
+				_ = writeTx.Rollback(r.Context())
+				resp := make([]protocol.TaskMessagePayload, len(messages))
+				for i, m := range messages {
+					resp[i] = taskMessageToPayload(m, taskID, issueID)
+				}
+				writeJSON(w, http.StatusOK, resp)
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "failed to mark peer context seen")
