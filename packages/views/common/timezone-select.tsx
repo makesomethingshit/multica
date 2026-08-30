@@ -8,9 +8,25 @@ import {
   SelectValue,
 } from "@multica/ui/components/ui/select";
 
+// IANA 2022b: Europe/Kiev is a backward-compat alias for Europe/Kyiv.
+function canConstructTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeTimezone(tz: string): string {
+  if (tz === "Europe/Kiev" && canConstructTimezone("Europe/Kyiv")) return "Europe/Kyiv";
+  return tz;
+}
+
 // Curated fallback list used when the runtime lacks `Intl.supportedValuesOf`.
 // Exported so every timezone picker draws from one source instead of
 // drifting copies.
+
 export const COMMON_TIMEZONES = [
   "UTC",
   "America/Los_Angeles",
@@ -22,6 +38,7 @@ export const COMMON_TIMEZONES = [
   "Europe/Berlin",
   "Europe/Paris",
   "Europe/Moscow",
+  "Europe/Kyiv",
   "Africa/Cairo",
   "Asia/Dubai",
   "Asia/Kolkata",
@@ -37,7 +54,7 @@ let cachedBrowserTZ: string | null = null;
 export function browserTimezone(): string {
   if (cachedBrowserTZ !== null) return cachedBrowserTZ;
   try {
-    cachedBrowserTZ = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    cachedBrowserTZ = normalizeTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
   } catch {
     cachedBrowserTZ = "UTC";
   }
@@ -63,17 +80,15 @@ function supportedTimezones(): string[] {
     const supported = (Intl as IntlWithSupportedValues).supportedValuesOf?.(
       "timeZone",
     );
-    return supported && supported.length > 0 ? supported : COMMON_TIMEZONES;
+    return (supported && supported.length > 0 ? supported : COMMON_TIMEZONES).map(normalizeTimezone);
   } catch {
-    return COMMON_TIMEZONES;
+    return COMMON_TIMEZONES.map(normalizeTimezone);
   }
 }
 
 export function timezoneOptions(current: string): string[] {
   const browser = browserTimezone();
-  return Array.from(
-    new Set([current, browser, ...COMMON_TIMEZONES, ...supportedTimezones()]),
-  ).filter(Boolean);
+  return Array.from(new Set([current, browser, ...COMMON_TIMEZONES, ...supportedTimezones()].map((tz) => (tz ? normalizeTimezone(tz) : tz)).filter(Boolean)));
 }
 
 export function TimezoneSelect({
