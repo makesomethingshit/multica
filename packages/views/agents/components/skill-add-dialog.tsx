@@ -79,11 +79,7 @@ export function SkillAddDialog({
     if (selectedIds.size === 0) return;
     setSaving(true);
     try {
-      const newIds = [
-        ...agent.skills.map((s) => s.id),
-        ...selectedIds,
-      ];
-      await api.setAgentSkills(agent.id, { skill_ids: newIds });
+      await api.addAgentSkills(agent.id, { skill_ids: [...selectedIds] });
       qc.invalidateQueries({ queryKey: workspaceKeys.agents(wsId) });
       handleOpenChange(false);
     } catch (e) {
