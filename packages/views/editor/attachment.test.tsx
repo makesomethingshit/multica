@@ -101,7 +101,8 @@ function attachmentIdFromTestDownloadURL(url: string): string | undefined {
     ? (() => {
         try {
           return new URL(url).pathname;
-        } catch {
+        } catch (_err) {
+          void _err;
           return "";
         }
       })()
@@ -199,7 +200,9 @@ afterEach(async () => {
   try {
     const { __resetInlineMediaBlobCacheForTests } = await import("./hooks/use-inline-media-url");
     __resetInlineMediaBlobCacheForTests();
-  } catch {}
+  } catch (_err) {
+    void _err;
+  }
   restoreObjectURL("createObjectURL", originalCreateObjectURL);
   restoreObjectURL("revokeObjectURL", originalRevokeObjectURL);
   vi.restoreAllMocks();
@@ -985,12 +988,12 @@ describe("Attachment — blob URL GC (MUL-7741)", () => {
     const blob = new Blob(["png-bytes"], { type: "image/png" });
     getAttachmentBlobMock.mockResolvedValue(blob);
 
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const { unmount } = renderWithQuery(
       <Attachment attachment={{ kind: "url", url: markdownUrl, filename: "shot.png", forceKind: "image" }} />,
     );
     await waitFor(() => expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL));
     expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     unmount();
     expect(revokeObjectURLMock).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000 - 1000);
@@ -1008,14 +1011,15 @@ describe("Attachment — blob URL GC (MUL-7741)", () => {
     getAttachmentMock.mockResolvedValue(makeRecord({ id, download_url: `/api/attachments/${id}/download` }));
     const blob = new Blob(["x"], { type: "image/png" });
     getAttachmentBlobMock.mockResolvedValue(blob);
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const first = renderWithQuery(<Attachment attachment={{ kind: "url", url: markdownUrl, filename: "shot.png", forceKind: "image" }} />);
     await waitFor(() => expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     first.unmount();
     await vi.advanceTimersByTimeAsync(60 * 1000);
     const second = renderWithQuery(<Attachment attachment={{ kind: "url", url: markdownUrl, filename: "shot.png", forceKind: "image" }} />);
-    await waitFor(() => expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL));
-    // Pending GC was cancelled — advancing to original expiry must NOT revoke
+    // Synchronous cache hit — second mount reuses blob URL without waitFor
+    expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL);
+    // Pending GC was cancelled on re-enter — advancing to original expiry must NOT revoke
     await vi.advanceTimersByTimeAsync(4 * 60 * 1000);
     expect(revokeObjectURLMock).not.toHaveBeenCalled();
     second.unmount();
@@ -1031,10 +1035,10 @@ describe("Attachment — blob URL GC (MUL-7741)", () => {
     resolverState.attachments = [makeRecord({ id, url: "https://minio:9000/r.png", markdown_url: markdownUrl, download_url: "" })];
     getAttachmentMock.mockResolvedValue(makeRecord({ id, download_url: `/api/attachments/${id}/download` }));
     getAttachmentBlobMock.mockResolvedValue(new Blob(["r"], { type: "image/png" }));
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const first = renderWithQuery(<Attachment attachment={{ kind: "url", url: markdownUrl, filename: "r.png", forceKind: "image" }} />);
     await waitFor(() => expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL));
     expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     first.unmount();
     await vi.advanceTimersByTimeAsync(60 * 1000);
     createObjectURLMock.mockClear();
@@ -1042,12 +1046,41 @@ describe("Attachment — blob URL GC (MUL-7741)", () => {
     // Synchronous cache hit — src is blob URL on first render, no new createObjectURL
     expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL);
     expect(createObjectURLMock).not.toHaveBeenCalled();
-    await waitFor(() => expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL));
     second.unmount();
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    expect(revokeObjectURLMock).toHaveBeenCalledWith(OBJECT_URL);
     vi.useRealTimers();
   });
 
-  it("does not show previous image when gallery id changes and new blob fetch fails (A→B)", async () => {
+  it("both concurrent consumers of same id get blob URL (no fallback stick)", async () => {
+    getBaseUrlMock.mockReturnValue("https://multica-api.copilothub.ai");
+    const id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const markdownUrl = `https://multica-api.copilothub.ai/api/attachments/${id}/download`;
+    resolverState.attachments = [makeRecord({ id, url: "https://minio:9000/c.png", markdown_url: markdownUrl, download_url: "" })];
+    getAttachmentMock.mockResolvedValue(makeRecord({ id, download_url: `/api/attachments/${id}/download` }));
+    getAttachmentBlobMock.mockResolvedValue(new Blob(["c"], { type: "image/png" }));
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+    const { unmount } = render(
+      <QueryClientProvider client={qc}>
+        <Attachment attachment={{ kind: "url", url: markdownUrl, filename: "c.png", forceKind: "image" }} />
+        <Attachment attachment={{ kind: "url", url: markdownUrl, filename: "c.png", forceKind: "image" }} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => {
+      const imgs = document.querySelectorAll("img");
+      expect(imgs).toHaveLength(2);
+      expect(imgs[0]?.getAttribute("src")).toBe(OBJECT_URL);
+      expect(imgs[1]?.getAttribute("src")).toBe(OBJECT_URL);
+    });
+    expect(createObjectURLMock).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers();
+    unmount();
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    expect(revokeObjectURLMock).toHaveBeenCalledWith(OBJECT_URL);
+    vi.useRealTimers();
+  });
+
+  it("does not show previous image when gallery id changes and new blob fetch fails (A→B) via rerender", async () => {
     getBaseUrlMock.mockReturnValue("https://multica-api.copilothub.ai");
     const idA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const idB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -1062,13 +1095,16 @@ describe("Attachment — blob URL GC (MUL-7741)", () => {
       if (id === idA) return Promise.resolve(new Blob(["a"], { type: "image/png" }));
       return Promise.reject(new Error("fetch failed"));
     });
-    const { unmount } = renderWithQuery(<Attachment attachment={{ kind: "url", url: urlA, filename: "a.png", forceKind: "image" }} />);
+    const { rerender, unmount } = renderWithQuery(<Attachment attachment={{ kind: "url", url: urlA, filename: "a.png", forceKind: "image" }} />);
     await waitFor(() => expect(document.querySelector("img")?.getAttribute("src")).toBe(OBJECT_URL));
-    unmount();
-    // New mount for B — must not reuse A's blob URL
-    const { unmount: unmountB } = renderWithQuery(<Attachment attachment={{ kind: "url", url: urlB, filename: "b.png", forceKind: "image" }} />);
+    // Same instance id change — panel reuse, not unmount+mount
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}>
+        <Attachment attachment={{ kind: "url", url: urlB, filename: "b.png", forceKind: "image" }} />
+      </QueryClientProvider>,
+    );
     await waitFor(() => expect(document.querySelector("img")?.getAttribute("src")).toBe(urlB));
     expect(document.querySelector("img")?.getAttribute("src")).not.toBe(OBJECT_URL);
-    unmountB();
+    unmount();
   });
 });

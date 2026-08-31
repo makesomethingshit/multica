@@ -86,7 +86,8 @@ export function useResignedInlineMediaURL(
     }
     try {
       return new URL(pickedUrl).origin !== window.location.origin;
-    } catch {
+    } catch (_err) {
+      void _err;
       return false;
     }
   })();
@@ -165,7 +166,9 @@ function useObjectURL(id: string | undefined, blob: Blob | undefined): string {
           if (cached) {
             try {
               URL.revokeObjectURL(cached);
-            } catch {}
+            } catch (_err) {
+              void _err;
+            }
             blobUrlCache.delete(id);
           }
           blobUrlGCTimers.delete(id);
@@ -182,7 +185,10 @@ function useObjectURL(id: string | undefined, blob: Blob | undefined): string {
 
   useEffect(() => {
     if (!blob || !id || typeof URL.createObjectURL !== "function") return;
-    if (blobUrlCache.has(id)) return;
+    if (blobUrlCache.has(id)) {
+      bump((v) => v + 1);
+      return;
+    }
     const next = URL.createObjectURL(blob);
     blobUrlCache.set(id, next);
     bump((v) => v + 1);
