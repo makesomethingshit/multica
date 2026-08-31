@@ -124,17 +124,25 @@ export function useResignedInlineMediaURL(
     staleTime: Infinity,
     gcTime: INLINE_BLOB_GC_MS,
   });
-  const blobUrl = useObjectURL(resignAttachmentId, blob);
+  const isAuthenticated = !!fresh;
+  const blobUrl = useObjectURL(resignAttachmentId, blob, isAuthenticated);
 
   if (!needsResign) return pickedUrl;
   if (signedUrl) return signedUrl;
-  // Only return the cached blob URL when it belongs to the current id;
-  // otherwise a reused panel (gallery navigation) would show the previous
-  // image on fetch failure.
-  if (blobUrl && resignAttachmentId && blobUrlCache.get(resignAttachmentId) === blobUrl) {
+  // Only return the cached blob URL when it belongs to the current id and
+  // the current QueryClient has authenticated metadata for it. This keeps
+  // the 5-min re-entry cache for the same session but prevents a logged-out
+  // or account-switched QueryClient (fresh pending/rejected) from reusing a
+  // previous account's private blob: URL without coupling to logout code.
+  if (
+    blobUrl &&
+    resignAttachmentId &&
+    isAuthenticated &&
+    blobUrlCache.get(resignAttachmentId) === blobUrl
+  ) {
     return blobUrl;
   }
-  if (blobUrl && !resignAttachmentId) return blobUrl;
+  if (blobUrl && !resignAttachmentId && isAuthenticated) return blobUrl;
   return pickedUrl;
 }
 
@@ -143,13 +151,20 @@ export function useResignedInlineMediaURL(
 // the fallback pickedUrl for one frame (see #7741). Refcount + delayed GC
 // ensures bytes are released 5 min after last unmount (matching
 // INLINE_BLOB_GC_MS) without leaking until renderer exit.
-function useObjectURL(id: string | undefined, blob: Blob | undefined): string {
+function useObjectURL(
+  id: string | undefined,
+  blob: Blob | undefined,
+  isAuthenticated: boolean,
+): string {
   const [, bump] = useState(0);
 
   // Refcount: cancel pending GC on re-enter, schedule revoke+delete after
-  // INLINE_BLOB_GC_MS when last consumer unmounts.
+  // INLINE_BLOB_GC_MS when last consumer unmounts. Only participate when the
+  // current QueryClient has authenticated metadata — otherwise a logged-out
+  // client would cancel the previous account's GC and extend the lifetime of
+  // private bytes.
   useEffect(() => {
-    if (!id) return;
+    if (!id || !isAuthenticated) return;
     const pending = blobUrlGCTimers.get(id);
     if (pending) {
       clearTimeout(pending);
@@ -181,10 +196,10 @@ function useObjectURL(id: string | undefined, blob: Blob | undefined): string {
         blobUrlRefCount.set(id, next);
       }
     };
-  }, [id]);
+  }, [id, isAuthenticated]);
 
   useEffect(() => {
-    if (!blob || !id || typeof URL.createObjectURL !== "function") return;
+    if (!blob || !id || !isAuthenticated || typeof URL.createObjectURL !== "function") return;
     if (blobUrlCache.has(id)) {
       bump((v) => v + 1);
       return;
@@ -192,9 +207,9 @@ function useObjectURL(id: string | undefined, blob: Blob | undefined): string {
     const next = URL.createObjectURL(blob);
     blobUrlCache.set(id, next);
     bump((v) => v + 1);
-  }, [blob, id]);
+  }, [blob, id, isAuthenticated]);
 
-  if (id && blobUrlCache.has(id)) return blobUrlCache.get(id)!;
+  if (isAuthenticated && id && blobUrlCache.has(id)) return blobUrlCache.get(id)!;
   return "";
 }
 
