@@ -3245,12 +3245,6 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
 	claimMs = time.Since(claimStart).Milliseconds()
 	if err != nil {
-		var accessErr *service.RuntimeAccessDeniedError
-		if errors.As(err, &accessErr) {
-			outcome = "error_runtime_access_denied"
-			writeError(w, http.StatusForbidden, accessErr.Message+" (private runtime does not permit task agent)")
-			return
-		}
 		outcome = "error_claim"
 		writeError(w, http.StatusInternalServerError, "failed to claim task: "+err.Error())
 		return

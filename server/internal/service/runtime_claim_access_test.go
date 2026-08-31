@@ -272,9 +272,8 @@ func TestClaimTaskFailsQueuedPrivateRuntimeOwnerMismatch(t *testing.T) {
 	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
 
 	claimed, err := svc.ClaimTaskForRuntime(ctx, fixture.runtimeID)
-	var accessErr *RuntimeAccessDeniedError
-	if !errors.As(err, &accessErr) {
-		t.Fatalf("claim error = %v, want RuntimeAccessDeniedError", err)
+	if err != nil {
+		t.Fatalf("claim task: %v", err)
 	}
 	if claimed != nil {
 		t.Fatalf("claimed rejected task %s", util.UUIDToString(claimed.ID))

@@ -3350,25 +3350,20 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 	return s.claimTask(ctx, agentID, pgtype.UUID{})
 }
 
-type RuntimeAccessDeniedError struct{ Message string }
-
-func (e *RuntimeAccessDeniedError) Error() string { return e.Message }
-
 // failQueuedTasksRejectedByRuntimeAccess settles deterministic private-runtime
 // owner mismatches before the candidate query can hide them from the claim
 // loop. The SQL fence remains unchanged; only rows that can never be claimed
-// are moved to a terminal state with the same actionable message as the daemon
-// response path.
-func (s *TaskService) failQueuedTasksRejectedByRuntimeAccess(ctx context.Context, runtimeIDs []pgtype.UUID) (string, error) {
+// are moved to a terminal state with an actionable task-level diagnostic.
+func (s *TaskService) failQueuedTasksRejectedByRuntimeAccess(ctx context.Context, runtimeIDs []pgtype.UUID) error {
 	if len(runtimeIDs) == 0 {
-		return "", nil
+		return nil
 	}
 	tasks, err := s.Queries.FailQueuedTasksRejectedByRuntimeAccess(ctx, runtimeIDs)
 	if err != nil {
-		return "", fmt.Errorf("fail queued runtime access rejections: %w", err)
+		return fmt.Errorf("fail queued runtime access rejections: %w", err)
 	}
 	if len(tasks) == 0 {
-		return "", nil
+		return nil
 	}
 	s.HandleFailedTasks(ctx, tasks)
 	for _, task := range tasks {
@@ -3376,7 +3371,7 @@ func (s *TaskService) failQueuedTasksRejectedByRuntimeAccess(ctx context.Context
 			s.createAgentComment(ctx, task.IssueID, task.AgentID, task.Error.String, "system", task.TriggerCommentID, task.ID)
 		}
 	}
-	return tasks[0].Error.String, nil
+	return nil
 }
 
 // claimTask is the runtime-scoped claim primitive used by daemon poll paths.
@@ -3517,13 +3512,6 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 // every enqueue (notifyTaskAvailable), so a queued task becomes
 // claimable on the next call rather than waiting for the TTL.
 func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	message, err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, []pgtype.UUID{runtimeID})
-	if err != nil {
-		return nil, err
-	}
-	if message != "" {
-		return nil, &RuntimeAccessDeniedError{Message: message}
-	}
 	start := time.Now()
 	var (
 		outcome          = "no_task"
@@ -3600,12 +3588,20 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		return nil, nil
 	}
 
-	// Sample the invalidation version BEFORE the SELECT. If a
-	// concurrent enqueue Bumps between this read and the post-SELECT
-	// MarkEmpty, the next IsEmpty will see the empty key tagged with
-	// a stale version and reject it — closing the race that would
-	// otherwise stall the just-queued task until the empty key's TTL
-	// expired.
+	// Settle deterministic owner mismatches only after the empty-cache
+	// fast path. Enqueue invalidates EmptyClaim synchronously, so a newly
+	// queued rejected task still reaches this repair path without adding
+	// a Postgres round-trip to steady-state idle daemon polls.
+	if err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, []pgtype.UUID{runtimeID}); err != nil {
+		outcome = "error_runtime_access_repair"
+		return nil, err
+	}
+
+	// Sample the invalidation version AFTER repair. HandleFailedTasks
+	// invalidates EmptyClaim for settled rows, so this version represents
+	// the queue state that the candidate SELECT below is about to inspect.
+	// If a concurrent enqueue bumps the version before post-SELECT MarkEmpty,
+	// the next IsEmpty rejects that stale marker instead of hiding new work.
 	preSelectVersion := s.EmptyClaim.CurrentVersion(ctx, runtimeKey)
 
 	t0 := time.Now()
@@ -3758,9 +3754,6 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	if len(runtimeIDs) == 0 || maxTasks <= 0 {
 		return nil, nil
 	}
-	if _, err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, runtimeIDs); err != nil {
-		return nil, err
-	}
 
 	// De-dup runtime IDs defensively so MarkEmpty/version bookkeeping stays
 	// unambiguous even if a daemon ever sends a duplicate.
@@ -3860,22 +3853,37 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		return claimed[:maxTasks], nil
 	}
 
-	// 3. Empty-cache short-circuit + version sampling for the remaining runtimes.
+	// 3. Empty-cache short-circuit for the remaining runtimes. Do not run
+	// mismatch repair for cached-idle runtimes: enqueue invalidates the cache,
+	// so work that actually needs repair cannot be hidden by this fast path.
 	nonEmpty := make([]pgtype.UUID, 0, len(uniqueIDs))
-	versions := make(map[string]int64, len(uniqueIDs))
 	for _, rid := range uniqueIDs {
 		key := util.UUIDToString(rid)
 		if s.EmptyClaim.IsEmpty(ctx, key) {
 			continue
 		}
-		versions[key] = s.EmptyClaim.CurrentVersion(ctx, key)
 		nonEmpty = append(nonEmpty, rid)
 	}
 	if len(nonEmpty) == 0 {
 		return claimed, nil
 	}
 
-	// 4. One candidate SELECT across the non-empty set.
+	// 4. Settle deterministic private-runtime owner mismatches only for
+	// runtimes that survived the empty-cache filter. Treat them as bad queue
+	// rows, not as authorization failures of the daemon claim request.
+	if err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, nonEmpty); err != nil {
+		return nil, err
+	}
+
+	// Sample versions after repair because HandleFailedTasks invalidates the
+	// affected runtime's empty-claim generation.
+	versions := make(map[string]int64, len(nonEmpty))
+	for _, rid := range nonEmpty {
+		key := util.UUIDToString(rid)
+		versions[key] = s.EmptyClaim.CurrentVersion(ctx, key)
+	}
+
+	// 5. One candidate SELECT across the non-empty set.
 	candidates, err := s.Queries.ListQueuedClaimCandidatesByRuntimes(ctx, nonEmpty)
 	if err != nil {
 		// Steps 2/6 commit reclaimed/claimed tasks in their own transactions,
