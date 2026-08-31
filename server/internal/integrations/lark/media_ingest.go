@@ -56,8 +56,8 @@ func NewFeishuMediaResolver(api APIClient, creds CredentialsResolver, storage me
 // ACK path.
 // For group quoted/replied file propagation, a text @-mention that quotes a
 // file has no media on its own payload; its parent does. The parent key is
-// not known without a fetch, so HasMedia reports true for a group message
-// with a ParentID to ensure ResolveMedia is invoked and can fetch the parent.
+// not known without a fetch, so HasMedia reports true only for that narrowed
+// text-reply shape and lets ResolveMedia fetch the parent.
 func (r *feishuMediaResolver) HasMedia(msg channel.InboundMessage) bool {
 	lm, err := larkMsgFromRaw(msg)
 	if err != nil {
@@ -66,7 +66,7 @@ func (r *feishuMediaResolver) HasMedia(msg channel.InboundMessage) bool {
 	if len(mediaResourcesFromMessage(lm)) > 0 {
 		return true
 	}
-	if lm.ParentID != "" && lm.ChatType == ChatTypeGroup {
+	if lm.ParentID != "" && lm.ChatType == ChatTypeGroup && lm.MessageType == "text" {
 		return true
 	}
 	return false
@@ -93,12 +93,13 @@ func (r *feishuMediaResolver) ResolveMedia(ctx context.Context, inst engine.Reso
 		r.logMediaWarn("lark media ingest skipped: credentials unavailable", lm, err)
 		return msg
 	}
-	// Group quoted/replied file propagation: the triggering message is a text
-	// @-mention quoting a file/ZIP parent. Its own payload has no media, but
-	// the parent does. Fetch the parent and append its file resources so the
-	// existing pipeline downloads and attaches them under the triggering turn.
-	if parentResources := r.parentMediaResources(ctx, creds, lm); len(parentResources) > 0 {
-		resources = append(resources, parentResources...)
+	// Group quoted/replied file propagation is only a fallback for a text
+	// trigger with no media of its own. A file/image reply may also carry a
+	// ParentID; do not silently attach both the trigger and its parent.
+	if len(resources) == 0 {
+		if parentResources := r.parentMediaResources(ctx, creds, lm); len(parentResources) > 0 {
+			resources = append(resources, parentResources...)
+		}
 	}
 	if len(resources) == 0 {
 		return msg
@@ -320,7 +321,10 @@ func mediaResourcesFromMessage(lm InboundMessage) []larkMediaResource {
 }
 
 func (r *feishuMediaResolver) parentMediaResources(ctx context.Context, creds InstallationCredentials, lm InboundMessage) []larkMediaResource {
-	if lm.ParentID == "" || lm.ChatType != ChatTypeGroup || r.api == nil {
+	if lm.ParentID == "" || lm.ChatType != ChatTypeGroup || lm.MessageType != "text" || r.api == nil {
+		return nil
+	}
+	if len(mediaResourcesFromMessage(lm)) > 0 {
 		return nil
 	}
 	items, err := r.api.GetMessage(ctx, creds, lm.ParentID)
