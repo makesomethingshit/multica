@@ -19,12 +19,24 @@ import type {
   Workload,
 } from "./types";
 
+type RuntimeLiveness = Pick<AgentRuntime, "status" | "last_seen_at">;
+
+function runtimeLivenessFromAgent(agent: Agent): RuntimeLiveness | null {
+  if (agent.runtime_status !== "online" && agent.runtime_status !== "offline") {
+    return null;
+  }
+  return {
+    status: agent.runtime_status,
+    last_seen_at: agent.runtime_last_seen_at ?? null,
+  };
+}
+
 // AgentAvailability mirrors RuntimeHealth's reachability buckets but folds
 // `long_offline` into `offline` — both mean "unreachable" from the agent
 // availability standpoint; the duration detail belongs to the runtime card,
 // not the agent dot.
 export function deriveAgentAvailability(
-  runtime: AgentRuntime | null,
+  runtime: RuntimeLiveness | null,
   now: number,
 ): AgentAvailability {
   if (!runtime) return "offline";
@@ -84,7 +96,7 @@ export function deriveWorkloadDetail(tasks: readonly AgentTask[]): WorkloadDetai
 
 interface DerivePresenceInput {
   agent: Agent;
-  runtime: AgentRuntime | null;
+  runtime: RuntimeLiveness | null;
   // Tasks for THIS agent only. Callers (buildPresenceMap, hooks) pre-filter
   // by agent_id — we don't re-check here.
   tasks: readonly AgentTask[];
@@ -108,7 +120,10 @@ export function deriveAgentPresenceDetail(input: DerivePresenceInput): AgentPres
     };
   }
 
-  const availability = deriveAgentAvailability(input.runtime, input.now);
+  const availability = deriveAgentAvailability(
+    input.runtime ?? runtimeLivenessFromAgent(input.agent),
+    input.now,
+  );
   const detail = deriveWorkloadDetail(input.tasks);
 
   return {

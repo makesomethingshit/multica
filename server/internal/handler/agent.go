@@ -58,9 +58,16 @@ type AgentResponse struct {
 	// branch on this rather than on RuntimeID being falsy, and must not confuse
 	// it with a bound-but-offline runtime (a different user story: reconnect the
 	// machine vs. pick a new one).
-	RuntimeBound bool   `json:"runtime_bound"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
+	RuntimeBound bool `json:"runtime_bound"`
+	// RuntimeStatus and RuntimeLastSeenAt are the privacy-safe liveness
+	// projection for a runtime that may be hidden from the caller's runtime
+	// list. They deliberately carry no device, owner, configuration, or
+	// credential fields; clients use them only when the full runtime row is
+	// unavailable.
+	RuntimeStatus     string  `json:"runtime_status,omitempty"`
+	RuntimeLastSeenAt *string `json:"runtime_last_seen_at,omitempty"`
+	Name              string  `json:"name"`
+	Description       string  `json:"description"`
 	// Instructions is what this agent's owner wrote. For a system agent it
 	// holds only the workspace's own notes — the product half lives in
 	// SystemInstructions and is never stored on the row.
@@ -976,6 +983,42 @@ func computeTaskKind(t db.AgentTaskQueue) string {
 	return "direct"
 }
 
+// loadAgentRuntimeLiveness returns only the status fields needed to derive
+// agent presence. Runtime rows are loaded internally even when the caller is
+// not allowed to list or inspect the private runtime; only the two redacted
+// fields are copied onto an agent response.
+func (h *Handler) loadAgentRuntimeLiveness(ctx context.Context, agents []db.Agent, workspaceID string) (map[string]db.AgentRuntime, error) {
+	runtimeIDs := make([]pgtype.UUID, 0, len(agents))
+	for _, agent := range agents {
+		if agent.RuntimeID.Valid {
+			runtimeIDs = append(runtimeIDs, agent.RuntimeID)
+		}
+	}
+	result := make(map[string]db.AgentRuntime, len(runtimeIDs))
+	if len(runtimeIDs) == 0 {
+		return result, nil
+	}
+
+	runtimes, err := h.Queries.GetAgentRuntimes(ctx, runtimeIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, runtime := range runtimes {
+		// Agent/runtime workspace consistency is normally enforced at bind time;
+		// keep the projection fail-closed if a legacy row violates it.
+		if uuidToString(runtime.WorkspaceID) != workspaceID {
+			continue
+		}
+		result[uuidToString(runtime.ID)] = runtime
+	}
+	return result, nil
+}
+
+func applyAgentRuntimeLiveness(resp *AgentResponse, runtime db.AgentRuntime) {
+	resp.RuntimeStatus = runtime.Status
+	resp.RuntimeLastSeenAt = timestampToPtr(runtime.LastSeenAt)
+}
+
 func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 	workspaceID := h.resolveWorkspaceID(r)
 	member, ok := h.workspaceMember(w, r, workspaceID)
@@ -993,6 +1036,11 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list agents")
+		return
+	}
+	runtimeLivenessByID, err := h.loadAgentRuntimeLiveness(r.Context(), agents, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load agent runtime liveness")
 		return
 	}
 
@@ -1046,6 +1094,9 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		resp := h.agentToResponse(a)
+		if runtime, ok := runtimeLivenessByID[resp.RuntimeID]; ok {
+			applyAgentRuntimeLiveness(&resp, runtime)
+		}
 		applyInvocationTargetsToResponse(&resp, targets)
 		if skills, ok := skillMap[resp.ID]; ok {
 			resp.Skills = skills
@@ -1095,6 +1146,14 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := h.agentToResponse(agent)
+	runtimeLiveness, err := h.loadAgentRuntimeLiveness(r.Context(), []db.Agent{agent}, workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load agent runtime liveness")
+		return
+	}
+	if runtime, ok := runtimeLiveness[resp.RuntimeID]; ok {
+		applyAgentRuntimeLiveness(&resp, runtime)
+	}
 	if !h.enrichAgentResponseWithTargetsHTTP(w, r, &resp, agent.ID) {
 		return
 	}

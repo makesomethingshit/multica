@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/middleware"
@@ -187,6 +188,94 @@ func TestListAgents_FiltersPrivateForPlainMember(t *testing.T) {
 	}
 	if listContainsAgent(t, w.Body.Bytes(), agentID) {
 		t.Fatalf("ListAgents as plain member leaked private agent %s", agentID)
+	}
+}
+
+// TestListAgents_SharedAgentCarriesPrivateRuntimeLiveness verifies the
+// privacy-safe bridge used by presence derivation: a member may see a shared
+// agent's runtime liveness even when that private runtime is absent from their
+// runtime list, but no runtime detail fields are added to the agent response.
+func TestListAgents_SharedAgentCarriesPrivateRuntimeLiveness(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	runtimeID, runtimeOwnerID, memberID := runtimeVisibilityFixture(t)
+	var agentID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			runtime_id, visibility, permission_mode, max_concurrent_tasks, owner_id,
+			instructions, custom_env, custom_args
+		)
+		VALUES ($1, 'shared-private-runtime-agent', '', 'cloud', '{}'::jsonb,
+		        $2, 'workspace', 'public_to', 1, $3, '', '{}'::jsonb, '[]'::jsonb)
+		RETURNING id
+	`, testWorkspaceID, runtimeID, runtimeOwnerID).Scan(&agentID); err != nil {
+		t.Fatalf("create shared agent: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID)
+	})
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
+		VALUES ($1, 'workspace', $2)
+	`, agentID, testWorkspaceID); err != nil {
+		t.Fatalf("share agent with workspace: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	testHandler.ListAgents(w, newRequestAs(memberID, "GET", "/api/agents", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("ListAgents as shared member: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var responses []AgentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &responses); err != nil {
+		t.Fatalf("decode ListAgents response: %v", err)
+	}
+	var shared *AgentResponse
+	for i := range responses {
+		if responses[i].ID == agentID {
+			shared = &responses[i]
+			break
+		}
+	}
+	if shared == nil {
+		t.Fatalf("shared agent %s missing from member list", agentID)
+	}
+	if shared.RuntimeStatus != "online" {
+		t.Fatalf("runtime_status = %q, want online", shared.RuntimeStatus)
+	}
+	if shared.RuntimeLastSeenAt == nil {
+		t.Fatal("runtime_last_seen_at is nil for live private runtime")
+	}
+	var wire []map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
+		t.Fatalf("decode raw ListAgents response: %v", err)
+	}
+	for _, item := range wire {
+		if string(item["id"]) != strconv.Quote(agentID) {
+			continue
+		}
+		for _, field := range []string{"device_info", "metadata", "daemon_id"} {
+			if _, ok := item[field]; ok {
+				t.Errorf("agent response leaked runtime field %q", field)
+			}
+		}
+	}
+
+	detailW := httptest.NewRecorder()
+	testHandler.GetAgent(detailW, withURLParam(newRequestAs(memberID, "GET", "/api/agents/"+agentID, nil), "id", agentID))
+	if detailW.Code != http.StatusOK {
+		t.Fatalf("GetAgent as shared member: expected 200, got %d: %s", detailW.Code, detailW.Body.String())
+	}
+	var detail AgentResponse
+	if err := json.Unmarshal(detailW.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode GetAgent response: %v", err)
+	}
+	if detail.RuntimeStatus != "online" || detail.RuntimeLastSeenAt == nil {
+		t.Fatalf("GetAgent liveness = (%q, %v), want online with timestamp", detail.RuntimeStatus, detail.RuntimeLastSeenAt)
 	}
 }
 
