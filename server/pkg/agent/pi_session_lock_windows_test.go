@@ -43,3 +43,42 @@ func TestPiSessionFileLockDoesNotBlockTranscriptIO(t *testing.T) {
 		t.Fatalf("write transcript while session is running: %v", err)
 	}
 }
+
+func TestPiSessionFileLockSerializesWriters(t *testing.T) {
+	t.Parallel()
+
+	sessionPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(sessionPath, nil, 0o644); err != nil {
+		t.Fatalf("create session file: %v", err)
+	}
+
+	first, locked, err := tryLockPiSessionFile(sessionPath)
+	if err != nil {
+		t.Fatalf("acquire first lock: %v", err)
+	}
+	if !locked {
+		t.Fatal("first lock was unexpectedly busy")
+	}
+
+	second, locked, err := tryLockPiSessionFile(sessionPath)
+	if err != nil {
+		releasePiSessionFileLock(first)
+		t.Fatalf("attempt competing lock: %v", err)
+	}
+	if locked {
+		releasePiSessionFileLock(second)
+		releasePiSessionFileLock(first)
+		t.Fatal("competing lock unexpectedly succeeded")
+	}
+
+	releasePiSessionFileLock(first)
+
+	third, locked, err := tryLockPiSessionFile(sessionPath)
+	if err != nil {
+		t.Fatalf("reacquire lock after release: %v", err)
+	}
+	if !locked {
+		t.Fatal("lock remained busy after release")
+	}
+	releasePiSessionFileLock(third)
+}
