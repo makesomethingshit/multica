@@ -2163,6 +2163,29 @@ WHERE atq.runtime_id = $1
   )
 ORDER BY atq.priority DESC, atq.created_at ASC;
 
+-- name: FailQueuedTasksRejectedByRuntimeAccess :many
+-- A private runtime with a concrete owner must never execute an agent owned by
+-- another member. Keep that authorization fence in the
+-- claim queries, but settle rows that crossed it after enqueue instead of
+-- leaving them queued until expiry.
+UPDATE agent_task_queue atq
+SET status = 'failed',
+    completed_at = now(),
+    error = 'This private runtime cannot run the assigned agent because the agent and runtime have different owners.',
+    failure_reason = 'invalid_task_identity',
+    prepare_lease_expires_at = NULL
+FROM agent a, agent_runtime r
+WHERE atq.runtime_id = ANY(@runtime_ids::uuid[])
+  AND atq.status = 'queued'
+  AND a.id = atq.agent_id
+  AND a.runtime_id = atq.runtime_id
+  AND r.id = atq.runtime_id
+  AND r.visibility = 'private'
+  AND r.owner_id IS NOT NULL
+  AND a.owner_id IS NOT NULL
+  AND a.owner_id IS DISTINCT FROM r.owner_id
+RETURNING atq.*;
+
 -- name: CancelSupersededDeferredRetriesForRuntimes :many
 -- Cancels deferred auto-retry rows that a newer active task has already
 -- superseded, so one rerun click still means exactly one more run.

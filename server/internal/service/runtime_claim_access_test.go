@@ -266,6 +266,73 @@ func TestClaimTaskRejectsMismatchedAgentRuntime(t *testing.T) {
 	}
 }
 
+func TestClaimTaskFailsQueuedPrivateRuntimeOwnerMismatch(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRuntimeClaimAccessFixture(t, "private", false, true, "queued")
+	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
+
+	claimed, err := svc.ClaimTaskForRuntime(ctx, fixture.runtimeID)
+	var accessErr *RuntimeAccessDeniedError
+	if !errors.As(err, &accessErr) {
+		t.Fatalf("claim error = %v, want RuntimeAccessDeniedError", err)
+	}
+	if claimed != nil {
+		t.Fatalf("claimed rejected task %s", util.UUIDToString(claimed.ID))
+	}
+
+	var status, errorMessage, failureReason string
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT status, error, failure_reason
+		FROM agent_task_queue
+		WHERE id = $1
+	`, fixture.taskID).Scan(&status, &errorMessage, &failureReason); err != nil {
+		t.Fatalf("read task state: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("task status = %q, want failed", status)
+	}
+	if errorMessage != "This private runtime cannot run the assigned agent because the agent and runtime have different owners." {
+		t.Fatalf("task error = %q, want owner-mismatch diagnostic", errorMessage)
+	}
+	if failureReason != "invalid_task_identity" {
+		t.Fatalf("failure_reason = %q, want invalid_task_identity", failureReason)
+	}
+}
+
+func TestClaimTaskForRuntimeKeepsOwnerlessPrivateAgentClaimable(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRuntimeClaimAccessFixture(t, "private", true, true, "queued")
+	if _, err := fixture.pool.Exec(ctx, `UPDATE agent SET owner_id = NULL WHERE id = $1`, fixture.agentID); err != nil {
+		t.Fatalf("clear agent owner: %v", err)
+	}
+	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
+
+	claimed, err := svc.ClaimTaskForRuntime(ctx, fixture.runtimeID)
+	if err != nil {
+		t.Fatalf("claim task: %v", err)
+	}
+	if claimed == nil || util.UUIDToString(claimed.ID) != fixture.taskID {
+		t.Fatalf("claimed task = %+v, want %s", claimed, fixture.taskID)
+	}
+}
+
+func TestClaimTasksForRuntimesKeepsOwnerlessPrivateAgentClaimable(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRuntimeClaimAccessFixture(t, "private", true, true, "queued")
+	if _, err := fixture.pool.Exec(ctx, `UPDATE agent SET owner_id = NULL WHERE id = $1`, fixture.agentID); err != nil {
+		t.Fatalf("clear agent owner: %v", err)
+	}
+	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
+
+	claimed, err := svc.ClaimTasksForRuntimes(ctx, []pgtype.UUID{fixture.runtimeID}, 1)
+	if err != nil {
+		t.Fatalf("claim tasks: %v", err)
+	}
+	if len(claimed) != 1 || util.UUIDToString(claimed[0].ID) != fixture.taskID {
+		t.Fatalf("claimed tasks = %+v, want task %s", claimed, fixture.taskID)
+	}
+}
+
 func TestClaimTaskUsesCurrentAgentRuntimeWhenRuntimeIDIsOmitted(t *testing.T) {
 	ctx := context.Background()
 	fixture := newRuntimeClaimAccessFixture(t, "public", true, true, "queued")

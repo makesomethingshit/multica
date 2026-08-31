@@ -3350,6 +3350,35 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 	return s.claimTask(ctx, agentID, pgtype.UUID{})
 }
 
+type RuntimeAccessDeniedError struct{ Message string }
+
+func (e *RuntimeAccessDeniedError) Error() string { return e.Message }
+
+// failQueuedTasksRejectedByRuntimeAccess settles deterministic private-runtime
+// owner mismatches before the candidate query can hide them from the claim
+// loop. The SQL fence remains unchanged; only rows that can never be claimed
+// are moved to a terminal state with the same actionable message as the daemon
+// response path.
+func (s *TaskService) failQueuedTasksRejectedByRuntimeAccess(ctx context.Context, runtimeIDs []pgtype.UUID) (string, error) {
+	if len(runtimeIDs) == 0 {
+		return "", nil
+	}
+	tasks, err := s.Queries.FailQueuedTasksRejectedByRuntimeAccess(ctx, runtimeIDs)
+	if err != nil {
+		return "", fmt.Errorf("fail queued runtime access rejections: %w", err)
+	}
+	if len(tasks) == 0 {
+		return "", nil
+	}
+	s.HandleFailedTasks(ctx, tasks)
+	for _, task := range tasks {
+		if task.IssueID.Valid && task.Error.Valid {
+			s.createAgentComment(ctx, task.IssueID, task.AgentID, task.Error.String, "system", task.TriggerCommentID, task.ID)
+		}
+	}
+	return tasks[0].Error.String, nil
+}
+
 // claimTask is the runtime-scoped claim primitive used by daemon poll paths.
 // The exported ClaimTask wrapper omits runtimeID and therefore resolves the
 // agent's currently bound runtime. Scoping the SQL claim itself prevents an
@@ -3488,6 +3517,13 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 // every enqueue (notifyTaskAvailable), so a queued task becomes
 // claimable on the next call rather than waiting for the TTL.
 func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	message, err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, []pgtype.UUID{runtimeID})
+	if err != nil {
+		return nil, err
+	}
+	if message != "" {
+		return nil, &RuntimeAccessDeniedError{Message: message}
+	}
 	start := time.Now()
 	var (
 		outcome          = "no_task"
@@ -3721,6 +3757,9 @@ func (s *TaskService) RequeueTaskAfterClaimFailure(ctx context.Context, task db.
 func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pgtype.UUID, maxTasks int) ([]db.AgentTaskQueue, error) {
 	if len(runtimeIDs) == 0 || maxTasks <= 0 {
 		return nil, nil
+	}
+	if _, err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, runtimeIDs); err != nil {
+		return nil, err
 	}
 
 	// De-dup runtime IDs defensively so MarkEmpty/version bookkeeping stays
