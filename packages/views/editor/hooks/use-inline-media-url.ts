@@ -27,6 +27,12 @@ const RESIGN_STALE_MS = 20 * 60 * 1000;
 // renderer memory forever.
 const INLINE_BLOB_GC_MS = 5 * 60 * 1000;
 
+// Module-level cache for blob: URLs keyed by attachment id. Without this,
+// useObjectURL creates a new object URL on every mount (state "" -> effect
+// creates URL), so a cached blob still flashes the fallback pickedUrl for one
+// frame on re-entry — the flicker reported in #7741 for image-heavy issues.
+const blobUrlCache = new Map<string, string>();
+
 // useResignedInlineMediaURL upgrades an auth-gated media URL to a freshly
 // signed one for clients that cannot load `/api/attachments/<id>/download`
 // natively.
@@ -108,30 +114,28 @@ export function useResignedInlineMediaURL(
     staleTime: Infinity,
     gcTime: INLINE_BLOB_GC_MS,
   });
-  const blobUrl = useObjectURL(blob);
+  const blobUrl = useObjectURL(resignAttachmentId, blob);
 
   if (!needsResign) return pickedUrl;
   if (signedUrl) return signedUrl;
   return blobUrl || pickedUrl;
 }
 
-// useObjectURL turns a Blob into a `blob:` URL for the lifetime of the calling
-// component, revoking it on unmount / replacement so the bytes are released
-// once nothing renders them. Returns "" while there is no blob (and during
-// SSR, where createObjectURL does not exist).
-function useObjectURL(blob: Blob | undefined): string {
-  const [url, setUrl] = useState("");
+// useObjectURL turns a Blob into a `blob:` URL. The module cache keeps the
+// URL stable across remounts so a re-entry with a cached blob does not flash
+// the fallback pickedUrl for one frame (see #7741).
+function useObjectURL(id: string | undefined, blob: Blob | undefined): string {
+  const [url, setUrl] = useState(() => (id ? blobUrlCache.get(id) ?? "" : ""));
   useEffect(() => {
-    if (!blob || typeof URL.createObjectURL !== "function") {
-      setUrl("");
+    if (!blob || !id || typeof URL.createObjectURL !== "function") return;
+    if (blobUrlCache.has(id)) {
+      setUrl(blobUrlCache.get(id)!);
       return;
     }
     const next = URL.createObjectURL(blob);
+    blobUrlCache.set(id, next);
     setUrl(next);
-    return () => {
-      URL.revokeObjectURL(next);
-    };
-  }, [blob]);
+  }, [blob, id]);
   return url;
 }
 
