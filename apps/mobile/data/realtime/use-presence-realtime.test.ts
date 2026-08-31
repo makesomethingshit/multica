@@ -54,24 +54,24 @@ describe("usePresenceRealtime", () => {
     subscriptionSetups[0](ws, "workspace-1");
     handlers.get("daemon:register")?.({});
 
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["runtimes", "workspace-1"],
-    });
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["agents", "workspace-1"],
-    });
+    const invalidatedKeys = () =>
+      invalidateQueries.mock.calls.map(([query]) => query.queryKey);
+    expect(invalidatedKeys()).toEqual(
+      expect.arrayContaining([
+        ["runtimes", "workspace-1"],
+        ["agents", "workspace-1"],
+      ]),
+    );
 
     invalidateQueries.mockClear();
     reconnect?.();
 
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["runtimes", "workspace-1"],
-    });
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["agents", "workspace-1"],
-    });
-    expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["agent-task-snapshot", "workspace-1"],
-    });
+    expect(invalidatedKeys()).toEqual(
+      expect.arrayContaining([
+        ["runtimes", "workspace-1"],
+        ["agents", "workspace-1"],
+        ["agent-task-snapshot", "workspace-1"],
+      ]),
+    );
   });
 });

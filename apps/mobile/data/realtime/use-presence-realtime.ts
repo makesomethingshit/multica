@@ -16,8 +16,7 @@
  *   - task:progress / task:message — fire many times per active task. The
  *     presence cache only needs lifecycle transitions, not per-step updates.
  *
- * Reconnect: re-invalidate runtimes + agents + snapshot so the redacted
- * liveness projections recover after missed daemon transitions.
+ * Reconnect: re-invalidate runtimes + agents + snapshot after missed events.
  */
 import { useQueryClient } from "@tanstack/react-query";
 import { useWSSubscriptions } from "@/lib/use-ws-subscriptions";
@@ -39,9 +38,7 @@ export function usePresenceRealtime() {
         queryClient.invalidateQueries({ queryKey: snapshotKey });
 
       return [
-        // Daemon lifecycle — register events cover online, re-register, and
-        // stale-sweep transitions. Refresh both runtime rows and redacted
-        // agent liveness; heartbeats are deliberately omitted.
+        // Daemon lifecycle; heartbeats deliberately omitted.
         ws.on("daemon:register", () => {
           invalidateRuntimes();
           invalidateAgents();
@@ -62,8 +59,7 @@ export function usePresenceRealtime() {
         ws.on("task:failed", invalidateSnapshot),
         ws.on("task:cancelled", invalidateSnapshot),
 
-        // We may have missed sweeper-driven runtime offline transitions
-        // while disconnected — refetch all three presence inputs.
+        // Recover all presence inputs after missed sweeper transitions.
         ws.onReconnect(() => {
           invalidateRuntimes();
           invalidateAgents();

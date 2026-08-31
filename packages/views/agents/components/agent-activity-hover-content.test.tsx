@@ -68,34 +68,6 @@ import {
   WorkspaceAgentActivityHoverContent,
 } from "./agent-activity-hover-content";
 
-function makeAgent(overrides: Partial<Agent> = {}): Agent {
-  return {
-    id: "agent-1",
-    workspace_id: "ws-1",
-    runtime_id: "private-runtime",
-    name: "Niko",
-    description: "",
-    instructions: "",
-    avatar_url: null,
-    runtime_mode: "local",
-    runtime_config: {},
-    custom_args: [],
-    visibility: "workspace",
-    permission_mode: "public_to",
-    invocation_targets: [],
-    status: "idle",
-    max_concurrent_tasks: 1,
-    model: "",
-    owner_id: null,
-    skills: [],
-    created_at: "2026-06-08T08:00:00Z",
-    updated_at: "2026-06-08T08:00:00Z",
-    archived_at: null,
-    archived_by: null,
-    ...overrides,
-  };
-}
-
 function makeIssue(id: string, identifier: string, title: string): Issue {
   return {
     id,
@@ -175,10 +147,12 @@ describe("AgentActivityHoverContent", () => {
 
   it("uses an online agent projection when its runtime row is hidden", () => {
     activityQueryData.agents = [
-      makeAgent({
+      {
+        id: "agent-1",
+        runtime_id: "private-runtime",
         runtime_status: "online",
         runtime_last_seen_at: "2026-06-08T07:59:50Z",
-      }),
+      } as Agent,
     ];
 
     const { container } = renderWithI18n(
