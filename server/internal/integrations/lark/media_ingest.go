@@ -54,12 +54,22 @@ func NewFeishuMediaResolver(api APIClient, creds CredentialsResolver, storage me
 // (standalone image/video/file/audio or post-embedded img/media spans). Pure
 // in-memory decode of the already-received payload — it runs on the connector
 // ACK path.
+// For group quoted/replied file propagation, a text @-mention that quotes a
+// file has no media on its own payload; its parent does. The parent key is
+// not known without a fetch, so HasMedia reports true for a group message
+// with a ParentID to ensure ResolveMedia is invoked and can fetch the parent.
 func (r *feishuMediaResolver) HasMedia(msg channel.InboundMessage) bool {
 	lm, err := larkMsgFromRaw(msg)
 	if err != nil {
 		return false
 	}
-	return len(mediaResourcesFromMessage(lm)) > 0
+	if len(mediaResourcesFromMessage(lm)) > 0 {
+		return true
+	}
+	if lm.ParentID != "" && lm.ChatType == ChatTypeGroup {
+		return true
+	}
+	return false
 }
 
 func (r *feishuMediaResolver) ResolveMedia(ctx context.Context, inst engine.ResolvedInstallation, _ engine.ResolvedIdentity, _ pgtype.UUID, chatMessageID pgtype.UUID, msg channel.InboundMessage) channel.InboundMessage {
@@ -69,9 +79,6 @@ func (r *feishuMediaResolver) ResolveMedia(ctx context.Context, inst engine.Reso
 		return msg
 	}
 	resources := mediaResourcesFromMessage(lm)
-	if len(resources) == 0 {
-		return msg
-	}
 	if r.api == nil || r.creds == nil || r.storage == nil || r.ledger == nil {
 		r.logMediaWarn("lark media ingest skipped: missing dependency", lm, nil)
 		return msg
@@ -84,6 +91,16 @@ func (r *feishuMediaResolver) ResolveMedia(ctx context.Context, inst engine.Reso
 	creds, err := installationCredentialsFor(larkInst, r.creds)
 	if err != nil {
 		r.logMediaWarn("lark media ingest skipped: credentials unavailable", lm, err)
+		return msg
+	}
+	// Group quoted/replied file propagation: the triggering message is a text
+	// @-mention quoting a file/ZIP parent. Its own payload has no media, but
+	// the parent does. Fetch the parent and append its file resources so the
+	// existing pipeline downloads and attaches them under the triggering turn.
+	if parentResources := r.parentMediaResources(ctx, creds, lm); len(parentResources) > 0 {
+		resources = append(resources, parentResources...)
+	}
+	if len(resources) == 0 {
 		return msg
 	}
 	for resIndex, res := range resources {
@@ -300,6 +317,44 @@ func mediaResourcesFromMessage(lm InboundMessage) []larkMediaResource {
 	default:
 		return nil
 	}
+}
+
+func (r *feishuMediaResolver) parentMediaResources(ctx context.Context, creds InstallationCredentials, lm InboundMessage) []larkMediaResource {
+	if lm.ParentID == "" || lm.ChatType != ChatTypeGroup || r.api == nil {
+		return nil
+	}
+	items, err := r.api.GetMessage(ctx, creds, lm.ParentID)
+	if err != nil || len(items) == 0 {
+		if err != nil {
+			r.logMediaWarn("lark media parent fetch failed", lm, err)
+		}
+		return nil
+	}
+	parent := items[0]
+	if parent.Deleted {
+		return nil
+	}
+	// Wrap the LarkMessage into an InboundMessage shape for the shared helper.
+	parentLM := InboundMessage{
+		MessageID:   parent.MessageID,
+		MessageType: parent.MessageType,
+		Content:     parent.Content,
+		ChatType:    ChatTypeGroup,
+	}
+	resources := mediaResourcesFromMessage(parentLM)
+	if len(resources) == 0 {
+		return nil
+	}
+	// Scope to group quoted/replied file propagation (ZIP/file). A parent
+	// image/video/post should remain on its own media path; only file-like
+	// parents are propagated as attachments on the quoting turn.
+	filtered := make([]larkMediaResource, 0, len(resources))
+	for _, res := range resources {
+		if res.kind == channel.MsgTypeFile {
+			filtered = append(filtered, res)
+		}
+	}
+	return filtered
 }
 
 func mediaResourcesFromPost(lm InboundMessage) []larkMediaResource {
