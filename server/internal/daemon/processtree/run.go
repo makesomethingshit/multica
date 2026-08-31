@@ -1,5 +1,7 @@
 // Package processtree runs bounded helper commands whose descendants must not
-// survive cancellation. It uses a Unix process group or a Windows Job Object.
+// survive cancellation. Windows uses a Job Object. Unix uses a process group;
+// Linux additionally snapshots procfs descendants at cancellation so a child
+// that calls setsid cannot escape merely by leaving that group.
 package processtree
 
 import (
@@ -14,7 +16,7 @@ import (
 const gracefulStopTimeout = time.Second
 
 // CombinedOutput runs an unstarted command and returns its combined output.
-// Cancellation terminates the entire process tree, waits for it to disappear,
+// Cancellation terminates the owned process tree, waits for it to disappear,
 // and returns the context cause rather than a platform-specific exit status.
 func CombinedOutput(ctx context.Context, cmd *exec.Cmd, waitDelay time.Duration) ([]byte, error) {
 	var output bytes.Buffer
@@ -36,7 +38,9 @@ func Output(ctx context.Context, cmd *exec.Cmd, waitDelay time.Duration) ([]byte
 	return stdout.Bytes(), err
 }
 
-// Run executes an unstarted command while owning its complete process tree.
+// Run executes an unstarted command while owning its platform-supported
+// process tree: a Job Object on Windows, a process group on Unix, and that
+// group plus descendants observed through procfs at cancellation on Linux.
 func Run(ctx context.Context, cmd *exec.Cmd, waitDelay time.Duration) error {
 	return run(ctx, cmd, waitDelay)
 }
