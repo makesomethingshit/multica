@@ -13,6 +13,7 @@ import (
 )
 
 type linuxProcessStat struct {
+	state     byte
 	ppid      int
 	startTime uint64
 }
@@ -31,7 +32,7 @@ func readLinuxProcessStat(pid int) (linuxProcessStat, error) {
 	fields := strings.Fields(string(data[closeParen+1:]))
 	// fields[0] is state (field 3), fields[1] is ppid (field 4), and
 	// fields[19] is starttime (field 22).
-	if len(fields) <= 19 {
+	if len(fields) <= 19 || len(fields[0]) != 1 {
 		return linuxProcessStat{}, fmt.Errorf("short /proc/%d/stat", pid)
 	}
 	ppid, err := strconv.Atoi(fields[1])
@@ -42,7 +43,7 @@ func readLinuxProcessStat(pid int) (linuxProcessStat, error) {
 	if err != nil {
 		return linuxProcessStat{}, fmt.Errorf("parse /proc/%d/stat starttime: %w", pid, err)
 	}
-	return linuxProcessStat{ppid: ppid, startTime: startTime}, nil
+	return linuxProcessStat{state: fields[0][0], ppid: ppid, startTime: startTime}, nil
 }
 
 func discoverOwnedDescendants(rootPID int) ([]ownedDescendant, error) {
@@ -101,7 +102,7 @@ func signalOwnedDescendant(ref ownedDescendant, sig syscall.Signal) error {
 		// unrelated process after the original descendant exited.
 		return nil
 	}
-	if stat.startTime != ref.identity {
+	if stat.startTime != ref.identity || stat.state == 'Z' {
 		return nil
 	}
 	if err := syscall.Kill(ref.pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
@@ -112,5 +113,5 @@ func signalOwnedDescendant(ref ownedDescendant, sig syscall.Signal) error {
 
 func ownedDescendantAlive(ref ownedDescendant) bool {
 	stat, err := readLinuxProcessStat(ref.pid)
-	return err == nil && stat.startTime == ref.identity
+	return err == nil && stat.startTime == ref.identity && stat.state != 'Z'
 }
