@@ -1267,8 +1267,8 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
 	}
 	var task db.AgentTaskQueue
-	isChannelIssue := issue.OriginType.Valid && issue.OriginType.String == "lark_chat" && issue.OriginID.Valid
-	if isChannelIssue && s.TxStarter != nil {
+	isInitialChannelIssueTask := issue.OriginType.Valid && issue.OriginType.String == "lark_chat" && issue.OriginID.Valid && !triggerCommentID.Valid && !rerunOfTaskID.Valid
+	if isInitialChannelIssueTask && s.TxStarter != nil {
 		tx, err := s.TxStarter.Begin(ctx)
 		if err != nil {
 			return db.AgentTaskQueue{}, fmt.Errorf("begin tx for channel issue task: %w", err)
@@ -1350,7 +1350,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 			slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
 			return db.AgentTaskQueue{}, fmt.Errorf("create task: %w", err)
 		}
-		if isChannelIssue {
+		if isInitialChannelIssueTask {
 			if _, err := s.Queries.CreateChannelTaskDeliveryFromSession(ctx, db.CreateChannelTaskDeliveryFromSessionParams{
 				TaskID: task.ID, ChatSessionID: issue.OriginID,
 			}); err != nil {
