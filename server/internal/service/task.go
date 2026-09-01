@@ -3564,9 +3564,12 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		return nil, nil
 	}
 
-	// Sample the invalidation version before the candidate SELECT. If a
-	// concurrent enqueue bumps the version before post-SELECT MarkEmpty, the
-	// next IsEmpty rejects that stale marker instead of hiding new work.
+	// Sample the invalidation version BEFORE the SELECT. If a
+	// concurrent enqueue Bumps between this read and the post-SELECT
+	// MarkEmpty, the next IsEmpty will see the empty key tagged with
+	// a stale version and reject it — closing the race that would
+	// otherwise stall the just-queued task until the empty key's TTL
+	// expired.
 	preSelectVersion := s.EmptyClaim.CurrentVersion(ctx, runtimeKey)
 
 	t0 := time.Now()
@@ -3818,30 +3821,22 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		return claimed[:maxTasks], nil
 	}
 
-	// 3. Empty-cache short-circuit for the remaining runtimes. Enqueue
-	// invalidates the cache, so queued work cannot be hidden by this fast path.
+	// 3. Empty-cache short-circuit + version sampling for the remaining runtimes.
 	nonEmpty := make([]pgtype.UUID, 0, len(uniqueIDs))
+	versions := make(map[string]int64, len(uniqueIDs))
 	for _, rid := range uniqueIDs {
 		key := util.UUIDToString(rid)
 		if s.EmptyClaim.IsEmpty(ctx, key) {
 			continue
 		}
+		versions[key] = s.EmptyClaim.CurrentVersion(ctx, key)
 		nonEmpty = append(nonEmpty, rid)
 	}
 	if len(nonEmpty) == 0 {
 		return claimed, nil
 	}
 
-	// 4. Sample versions before the candidate SELECT. Runtimes with candidates
-	// remain non-empty; a concurrent enqueue bumps the version and prevents a
-	// stale MarkEmpty from hiding new work.
-	versions := make(map[string]int64, len(nonEmpty))
-	for _, rid := range nonEmpty {
-		key := util.UUIDToString(rid)
-		versions[key] = s.EmptyClaim.CurrentVersion(ctx, key)
-	}
-
-	// 5. One candidate SELECT across the non-empty set.
+	// 4. One candidate SELECT across the non-empty set.
 	candidates, err := s.Queries.ListQueuedClaimCandidatesByRuntimes(ctx, nonEmpty)
 	if err != nil {
 		// Steps 2/6 commit reclaimed/claimed tasks in their own transactions,
