@@ -1,0 +1,252 @@
+package service
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/dbid"
+)
+
+func TestChannelIssueDelivery_AtomicSnapshot_Success(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, _ := seedAttributionFixture(t, pool)
+	workspaceUUID := util.MustParseUUID(workspaceID)
+	userUUID := util.MustParseUUID(userID)
+	agentUUID := util.MustParseUUID(agentID)
+
+	// Create a feishu channel installation for this agent/workspace.
+	var chatSessionID pgtype.UUID
+	{
+		// Use a unique app_id per test.
+		appID := "test-app-" + workspaceID[:8]
+		var instID string
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id, status)
+			VALUES ($1, $2, 'feishu', jsonb_build_object('app_id', $3::text), $4, 'active')
+			RETURNING id`, workspaceID, agentID, appID, userID).Scan(&instID); err != nil {
+			t.Fatalf("create channel installation: %v", err)
+		}
+		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM channel_installation WHERE id = $1`, instID) })
+
+		var sessionID string
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO chat_session (id, workspace_id, agent_id, creator_id, title)
+			VALUES ($1, $2, $3, $4, '')
+			RETURNING id`, dbid.NewV7(), workspaceID, agentID, userID).Scan(&sessionID); err != nil {
+			t.Fatalf("create chat session: %v", err)
+		}
+		chatSessionID = util.MustParseUUID(sessionID)
+		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM chat_session WHERE id = $1`, sessionID) })
+
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config, route_revision)
+			VALUES ($1, $2, 'feishu', 'oc_test_chat', 'group', '{}'::jsonb, 1)`, sessionID, instID); err != nil {
+			t.Fatalf("create channel binding: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO channel_chat_context_generation (chat_session_id, revision) VALUES ($1, 1)`, sessionID); err != nil {
+			t.Fatalf("create context generation: %v", err)
+		}
+	}
+
+	bus := events.New()
+	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
+	issueService := NewIssueService(q, pool, bus, nil, taskService)
+
+	// Immediate channel issue (no media, no deferred).
+	result, err := issueService.Create(ctx, IssueCreateParams{
+		WorkspaceID:  workspaceUUID,
+		Title:        "Channel issue immediate",
+		Status:       "todo",
+		Priority:     "medium",
+		AssigneeType: pgtype.Text{String: "agent", Valid: true},
+		AssigneeID:   agentUUID,
+		CreatorType:  "member",
+		CreatorID:    userUUID,
+		OriginType:   pgtype.Text{String: "lark_chat", Valid: true},
+		OriginID:     chatSessionID,
+	}, IssueCreateOpts{})
+	if err != nil {
+		t.Fatalf("Create immediate channel issue: %v", err)
+	}
+	if !result.AssignedTaskID.Valid {
+		t.Fatalf("immediate channel issue should have assigned task")
+	}
+	// Delivery must be atomically visible before any poll can claim the task.
+	if _, err := q.GetChannelTaskDelivery(ctx, result.AssignedTaskID); err != nil {
+		t.Fatalf("delivery missing for immediate channel issue task: %v", err)
+	}
+	// Quick sanity: task is claimable via poll path only after delivery exists.
+	var deliveryCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, result.AssignedTaskID).Scan(&deliveryCount); err != nil {
+		t.Fatalf("count delivery: %v", err)
+	}
+	if deliveryCount != 1 {
+		t.Fatalf("delivery count = %d, want 1", deliveryCount)
+	}
+}
+
+func TestChannelIssueDelivery_AtomicSnapshot_DeferredSuccess(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, _ := seedAttributionFixture(t, pool)
+	workspaceUUID := util.MustParseUUID(workspaceID)
+	userUUID := util.MustParseUUID(userID)
+	agentUUID := util.MustParseUUID(agentID)
+
+	var chatSessionID pgtype.UUID
+	{
+		appID := "test-app-" + workspaceID[:8]
+		var instID string
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id, status)
+			VALUES ($1, $2, 'feishu', jsonb_build_object('app_id', $3::text), $4, 'active')
+			RETURNING id`, workspaceID, agentID, appID, userID).Scan(&instID); err != nil {
+			t.Fatalf("create channel installation: %v", err)
+		}
+		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM channel_installation WHERE id = $1`, instID) })
+		var sessionID string
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO chat_session (id, workspace_id, agent_id, creator_id, title)
+			VALUES ($1, $2, $3, $4, '')
+			RETURNING id`, dbid.NewV7(), workspaceID, agentID, userID).Scan(&sessionID); err != nil {
+			t.Fatalf("create chat session: %v", err)
+		}
+		chatSessionID = util.MustParseUUID(sessionID)
+		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM chat_session WHERE id = $1`, sessionID) })
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config, route_revision)
+			VALUES ($1, $2, 'feishu', 'oc_test_chat', 'group', '{}'::jsonb, 1)`, sessionID, instID); err != nil {
+			t.Fatalf("create channel binding: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO channel_chat_context_generation (chat_session_id, revision) VALUES ($1, 1)`, sessionID); err != nil {
+			t.Fatalf("create context generation: %v", err)
+		}
+	}
+
+	bus := events.New()
+	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
+	issueService := NewIssueService(q, pool, bus, nil, taskService)
+
+	deferredResult, err := issueService.Create(ctx, IssueCreateParams{
+		WorkspaceID:  workspaceUUID,
+		Title:        "Channel issue deferred",
+		Status:       "todo",
+		Priority:     "medium",
+		AssigneeType: pgtype.Text{String: "agent", Valid: true},
+		AssigneeID:   agentUUID,
+		CreatorType:  "member",
+		CreatorID:    userUUID,
+		OriginType:   pgtype.Text{String: "lark_chat", Valid: true},
+		OriginID:     chatSessionID,
+	}, IssueCreateOpts{AssignedAgentRunFireAt: time.Now().Add(time.Minute)})
+	if err != nil {
+		t.Fatalf("Create deferred channel issue: %v", err)
+	}
+	if !deferredResult.AssignedTaskID.Valid {
+		t.Fatalf("deferred channel issue should have assigned task")
+	}
+	if _, err := q.GetChannelTaskDelivery(ctx, deferredResult.AssignedTaskID); err != nil {
+		t.Fatalf("delivery missing for deferred channel issue task: %v", err)
+	}
+}
+
+func TestChannelIssueDelivery_SnapshotFailureRollsBack(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, _ := seedAttributionFixture(t, pool)
+	workspaceUUID := util.MustParseUUID(workspaceID)
+	userUUID := util.MustParseUUID(userID)
+	agentUUID := util.MustParseUUID(agentID)
+
+	bus := events.New()
+	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
+	issueService := NewIssueService(q, pool, bus, nil, taskService)
+
+	// Use a random OriginID that has no channel_chat_session_binding, so
+	// CreateChannelTaskDeliveryFromSession will find 0 rows and fail.
+	bogusSessionID := dbid.NewV7()
+	// Count issues before attempt.
+	var beforeCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM issue WHERE workspace_id = $1`, workspaceID).Scan(&beforeCount); err != nil {
+		t.Fatalf("count before: %v", err)
+	}
+
+	_, err := issueService.Create(ctx, IssueCreateParams{
+		WorkspaceID:  workspaceUUID,
+		Title:        "Channel issue bogus session",
+		Status:       "todo",
+		Priority:     "medium",
+		AssigneeType: pgtype.Text{String: "agent", Valid: true},
+		AssigneeID:   agentUUID,
+		CreatorType:  "member",
+		CreatorID:    userUUID,
+		OriginType:   pgtype.Text{String: "lark_chat", Valid: true},
+		OriginID:     bogusSessionID,
+	}, IssueCreateOpts{AssignedAgentRunFireAt: time.Now().Add(time.Minute)})
+	if err == nil {
+		t.Fatalf("expected snapshot failure to abort issue creation, got nil")
+	}
+
+	var afterCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM issue WHERE workspace_id = $1`, workspaceID).Scan(&afterCount); err != nil {
+		t.Fatalf("count after: %v", err)
+	}
+	if afterCount != beforeCount {
+		t.Fatalf("issue count after failed snapshot = %d, want %d (rollback)", afterCount, beforeCount)
+	}
+	// No task should be visible for the bogus session.
+	var taskCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id IN (SELECT id FROM issue WHERE title = 'Channel issue bogus session')`).Scan(&taskCount); err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	if taskCount != 0 {
+		t.Fatalf("tasks for failed channel issue = %d, want 0", taskCount)
+	}
+}
+
+func TestChannelIssueDelivery_NonChannelIssueDoesNotRequireDelivery(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, _ := seedAttributionFixture(t, pool)
+	workspaceUUID := util.MustParseUUID(workspaceID)
+	userUUID := util.MustParseUUID(userID)
+	agentUUID := util.MustParseUUID(agentID)
+
+	bus := events.New()
+	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
+	issueService := NewIssueService(q, pool, bus, nil, taskService)
+
+	// Web issue (no OriginType) should succeed without delivery.
+	result, err := issueService.Create(ctx, IssueCreateParams{
+		WorkspaceID:  workspaceUUID,
+		Title:        "Web issue no origin",
+		Status:       "todo",
+		Priority:     "medium",
+		AssigneeType: pgtype.Text{String: "agent", Valid: true},
+		AssigneeID:   agentUUID,
+		CreatorType:  "member",
+		CreatorID:    userUUID,
+	}, IssueCreateOpts{})
+	if err != nil {
+		t.Fatalf("Create web issue: %v", err)
+	}
+	if !result.AssignedTaskID.Valid {
+		t.Fatalf("web issue should have assigned task")
+	}
+	// Web issue must NOT have a channel delivery row.
+	if _, err := q.GetChannelTaskDelivery(ctx, result.AssignedTaskID); err == nil {
+		t.Fatalf("web issue should not have delivery, but found one")
+	}
+}
