@@ -465,17 +465,6 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		if err != nil {
 			return IssueCreateResult{}, fmt.Errorf("create deferred channel issue task: %w", err)
 		}
-		if assignedTask.ID.Valid && p.OriginID.Valid && p.OriginType.Valid {
-			if _, err := qtx.CreateChannelTaskDeliveryFromSession(ctx, db.CreateChannelTaskDeliveryFromSessionParams{
-				TaskID: assignedTask.ID, ChatSessionID: p.OriginID,
-			}); err != nil {
-				slog.Warn("issue service: snapshot channel delivery for deferred issue task failed",
-					"issue_id", util.UUIDToString(issue.ID),
-					"task_id", util.UUIDToString(assignedTask.ID),
-					"error", err,
-				)
-			}
-		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
