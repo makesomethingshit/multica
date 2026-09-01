@@ -624,8 +624,7 @@ jobs:
         # host proves this, so it cannot live in the ubuntu backend job. The
         # OpenClaw regression (PUCK-112) is also a Windows launcher: an
         # npm-installed openclaw.cmd shim serialises the whole `openclaw
-        # agent --message` command through cmd.exe, so a 6193-byte task prompt
-        # already exceeds the 8191-character limit. When `openclaw agent
+        # agent --message` command through cmd.exe, the reported 6193-byte production prompt already failed at this cmd.exe boundary; a separate quote-heavy fixture proves the serialized command-line limit. When `openclaw agent
         # --help` advertises --message-file the prompt must leave argv for a
         # real cmd.exe -> openclaw.cmd -> native child. Scoped to the
         # windows-tagged tests by allow-list; the backend job still runs the
