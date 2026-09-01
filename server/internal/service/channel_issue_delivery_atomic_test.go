@@ -297,4 +297,11 @@ func TestChannelIssueDelivery_ImmediateSnapshotFailureDoesNotCreateTask(t *testi
 	if taskCount != 0 {
 		t.Fatalf("tasks for immediate bogus channel issue = %d, want 0", taskCount)
 	}
+	var deliveryCountForIssue int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, result.Issue.ID).Scan(&deliveryCountForIssue); err != nil {
+		t.Fatalf("count deliveries for issue: %v", err)
+	}
+	if deliveryCountForIssue != 0 {
+		t.Fatalf("deliveries for immediate bogus channel issue = %d, want 0", deliveryCountForIssue)
+	}
 }
