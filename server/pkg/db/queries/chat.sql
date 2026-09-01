@@ -972,6 +972,19 @@ WHERE claimed_input.id = latest_visible.claimed_input_id
 -- Channel batches are excluded because their immutable provider ordering may
 -- contain multiple user rows. Direct chat currently owns exactly one row; if
 -- direct batching is added, assign stable per-row offsets here.
+--
+-- MUL-6886: the deferred-cancel path settles after the follow-up was already
+-- claimed (dispatched) and a normal production claim quickly moves it to
+-- running/waiting_local_directory before the sweeper settles (60s grace +
+-- 30s tick). The original queued-only predicate missed those heads, leaving
+-- user B before assistant A. The fix widens the target to the proven
+-- non-terminal heads that are still not externally finalized: queued,
+-- dispatched, waiting_local_directory and running (all proven by
+-- TestMUL6886_ActiveStates_Table — dispatched via the original repro and
+-- waiting/running via the same fixture updated in-place). completed/failed/
+-- cancelled/deferred (including retry children via chat_input_task_id != id) are
+-- deliberately never moved to avoid rewriting terminal history or channel
+-- batches.
 UPDATE chat_message AS queued_input
 SET created_at = sqlc.arg('assistant_created_at')::timestamptz + interval '1 microsecond'
 WHERE queued_input.chat_session_id = $1
@@ -987,7 +1000,7 @@ WHERE queued_input.chat_session_id = $1
     FROM agent_task_queue AS queued_task
     WHERE queued_task.id = queued_input.task_id
       AND queued_task.chat_session_id = queued_input.chat_session_id
-      AND queued_task.status = 'queued'
+      AND queued_task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
       AND queued_task.chat_input_task_id = queued_task.id
       AND queued_task.regenerate_quick_actions_for IS NULL
       AND queued_task.id = (
