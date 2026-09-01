@@ -50,6 +50,12 @@ export function agentListOptions(wsId: string) {
     queryKey: workspaceKeys.agents(wsId),
     queryFn: () =>
       api.listAgents({ workspace_id: wsId, include_archived: true }),
+    refetchInterval: (query) =>
+      query.state.data?.some(
+        (agent) => agent.runtime_availability === "unstable",
+      )
+        ? 30_000
+        : false,
   });
 }
 

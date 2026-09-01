@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Workspace } from "../types";
-import { workspaceBySlugOptions } from "./queries";
+import type { Agent, Workspace } from "../types";
+import { agentListOptions, workspaceBySlugOptions } from "./queries";
 
 function makeWorkspace(slug: string): Workspace {
   return {
@@ -29,5 +29,24 @@ describe("workspaceBySlugOptions", () => {
 
   it("returns null after an authoritative list omits the slug", () => {
     expect(workspaceBySlugOptions("missing").select?.(workspaces)).toBeNull();
+  });
+});
+
+describe("agentListOptions", () => {
+  it("polls while availability is unstable, then stops after offline refresh", () => {
+    const options = agentListOptions("ws-1");
+    const interval = options.refetchInterval;
+    expect(typeof interval).toBe("function");
+    if (typeof interval !== "function") return;
+
+    const queryState = (data: Agent[]) =>
+      interval({ state: { status: "success", data } } as never);
+
+    expect(
+      queryState([{ runtime_availability: "unstable" } as Agent]),
+    ).toBe(30_000);
+    expect(queryState([{ runtime_availability: "offline" } as Agent])).toBe(false);
+    expect(queryState([{ runtime_availability: "online" } as Agent])).toBe(false);
+    expect(queryState([])).toBe(false);
   });
 });
