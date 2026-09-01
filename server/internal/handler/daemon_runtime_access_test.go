@@ -13,7 +13,7 @@ import (
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
-func TestClaimTaskByRuntime_OwnerlessAgentOnPrivateRuntimeRemainsClaimable(t *testing.T) {
+func TestClaimTaskByRuntime_OwnerlessAgentOnPrivateRuntimeFailsExplicitly(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -27,18 +27,24 @@ func TestClaimTaskByRuntime_OwnerlessAgentOnPrivateRuntimeRemainsClaimable(t *te
 		testWorkspaceID, "ownerless-agent-claim")
 	req = withURLParam(req, "runtimeId", runtimeID)
 	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
-	if !strings.Contains(w.Body.String(), taskID) {
-		t.Fatalf("ClaimTaskByRuntime body = %q, want claimed task %s", w.Body.String(), taskID)
+	if strings.TrimSpace(w.Body.String()) != `{"task":null}` {
+		t.Fatalf("ClaimTaskByRuntime body = %q, want empty successful poll", w.Body.String())
 	}
 
-	var status string
+	var status, errorMessage, failureReason string
 	dbfx.QueryRow(t, `
-		SELECT status
+		SELECT status, error, failure_reason
 		FROM agent_task_queue
 		WHERE id = $1
-	`, taskID).Scan(&status)
-	if status != "dispatched" {
-		t.Fatalf("task status = %q, want dispatched", status)
+	`, taskID).Scan(&status, &errorMessage, &failureReason)
+	if status != "failed" {
+		t.Fatalf("task status = %q, want failed", status)
+	}
+	if !strings.Contains(errorMessage, "agent has no owner") {
+		t.Fatalf("task error = %q, want actionable missing-owner error", errorMessage)
+	}
+	if failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
+		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonInvalidTaskIdentity)
 	}
 }
 

@@ -2084,8 +2084,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		)
 	}
 	if runtime.Visibility == "private" && runtime.OwnerID.Valid &&
-		agent.OwnerID.Valid && agent.OwnerID != runtime.OwnerID {
+		(!agent.OwnerID.Valid || agent.OwnerID != runtime.OwnerID) {
 		userMessage := "This private runtime cannot run the assigned agent because the agent and runtime have different owners."
+		if !agent.OwnerID.Valid {
+			userMessage = "This private runtime cannot run the assigned agent because the agent has no owner."
+		}
 		slog.Warn("daemon claim: private runtime no longer permits task agent; refusing dispatch",
 			"task_id", uuidToString(task.ID),
 			"agent_id", uuidToString(task.AgentID),
