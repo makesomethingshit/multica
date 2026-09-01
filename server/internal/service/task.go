@@ -1300,6 +1300,17 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
 		return db.AgentTaskQueue{}, fmt.Errorf("create task: %w", err)
 	}
+	if task.ID.Valid && issue.OriginID.Valid && issue.OriginType.Valid {
+		if _, err := s.Queries.CreateChannelTaskDeliveryFromSession(ctx, db.CreateChannelTaskDeliveryFromSessionParams{
+			TaskID: task.ID, ChatSessionID: issue.OriginID,
+		}); err != nil {
+			slog.Warn("task enqueue: snapshot channel delivery for issue task failed",
+				"issue_id", util.UUIDToString(issue.ID),
+				"task_id", util.UUIDToString(task.ID),
+				"error", err,
+			)
+		}
+	}
 
 	slog.Info("task enqueued",
 		"task_id", util.UUIDToString(task.ID),
@@ -2265,19 +2276,6 @@ func (s *TaskService) PromoteDeferredChannelIssueTask(ctx context.Context, taskI
 	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
 	s.NotifyTaskEnqueued(ctx, task)
 	return nil
-}
-
-// SnapshotChannelTaskDelivery persists a frozen channel route snapshot for an
-// issue task created via /issue. Chat tasks already snapshot via
-// EnqueueChannelChatTask; issue tasks must snapshot via the same
-// channel_task_delivery table so the existing outbound GetChannelTaskDelivery
-// fence and thread routing apply. Best-effort: a missing binding fails closed
-// and is logged without failing issue creation.
-func (s *TaskService) SnapshotChannelTaskDelivery(ctx context.Context, taskID, sessionID pgtype.UUID) error {
-	_, err := s.Queries.CreateChannelTaskDeliveryFromSession(ctx, db.CreateChannelTaskDeliveryFromSessionParams{
-		TaskID: taskID, ChatSessionID: sessionID,
-	})
-	return err
 }
 
 // DirectChatSendResult carries the rows a transactional direct-chat send

@@ -867,7 +867,7 @@ func TestPatcherClearsTypingOnTaskCancelled(t *testing.T) {
 	}
 }
 
-	// Deleting a chat session cancels its queued turns and deletes the Lark binding
+// Deleting a chat session cancels its queued turns and deletes the Lark binding
 // in one transaction, then broadcasts the cancels after that transaction
 // commits. By the time the Patcher sees them the binding row is gone, so every
 // step that reads it — the Patcher's own lookup and the credential resolution
@@ -965,8 +965,8 @@ func TestPatcherIssueCompleted_SendsToOriginatingGroup(t *testing.T) {
 	if !strings.Contains(got.Text, "MUL-42") || !strings.Contains(got.Text, "Fix login") {
 		t.Errorf("completion text must contain identifier and title; got %q", got.Text)
 	}
-	if !strings.Contains(got.Text, "✅ Completed") {
-		t.Errorf("completion text must carry checkmark; got %q", got.Text)
+	if !strings.Contains(got.Text, "✅ Task completed for") {
+		t.Errorf("completion text must carry task-completed phrasing; got %q", got.Text)
 	}
 	if got.ReplyTarget.IsSet() {
 		t.Errorf("group non-thread completion must be chat-level; got %+v", got.ReplyTarget)

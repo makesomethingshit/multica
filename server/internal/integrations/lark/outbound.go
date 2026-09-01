@@ -471,9 +471,14 @@ func (p *Patcher) handleIssueCompleted(ctx context.Context, taskID pgtype.UUID, 
 		prefix = ws.IssuePrefix
 	}
 	identifier := issueIdentifier(prefix, issue.Number)
-	text := issueCompletedText(identifier, issue.Title)
+	// TaskService.CompleteTask explicitly does NOT change issue status
+	// (task.go:4230), so this notification is for the agent run/task
+	// completing, not the issue reaching done/in_review. An in_progress
+	// issue after this message is expected — the task is done, the issue
+	// may still be worked on.
+	text := taskCompletedText(identifier, issue.Title)
 	target := threadReplyTarget(binding)
-	return sendWithThreadFallback(p.cfg.Logger, "send issue completed", target, func(t ReplyTarget) error {
+	return sendWithThreadFallback(p.cfg.Logger, "send task completed", target, func(t ReplyTarget) error {
 		_, err := p.client.SendTextMessage(ctx, SendTextParams{
 			InstallationID: creds,
 			ChatID:         outboundChatID(binding),
@@ -491,12 +496,12 @@ func issueIdentifier(prefix string, number int32) string {
 	return prefix + "-" + strconv.Itoa(int(number))
 }
 
-func issueCompletedText(identifier, title string) string {
+func taskCompletedText(identifier, title string) string {
 	title = strings.TrimSpace(title)
 	if title == "" {
-		return "✅ Completed " + identifier
+		return "✅ Task completed for " + identifier
 	}
-	return "✅ Completed " + identifier + " — " + title
+	return "✅ Task completed for " + identifier + " — " + title
 }
 
 // sendChatReply turns ChatDonePayload.Content into a Lark message.
