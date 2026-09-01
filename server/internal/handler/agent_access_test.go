@@ -174,6 +174,13 @@ func TestGetAgent_PrivateAgentForbidsPlainMember(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("GetAgent as workspace owner: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
+	var ownerResponse map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &ownerResponse); err != nil {
+		t.Fatalf("decode GetAgent owner response: %v", err)
+	}
+	if _, ok := ownerResponse["runtime_availability"]; ok {
+		t.Fatal("runtime_availability should be omitted when the viewer owns the runtime")
+	}
 
 	// Agent owner (plain member who happens to own the agent): allowed.
 	w = httptest.NewRecorder()

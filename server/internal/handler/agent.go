@@ -985,8 +985,9 @@ func computeTaskKind(t db.AgentTaskQueue) string {
 // loadAgentRuntimeAvailability returns only a coarse liveness bucket for
 // agent presence. Runtime rows are loaded internally even when the caller is
 // not allowed to list or inspect the private runtime; no runtime fields are
-// copied onto an agent response.
-func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.Agent, workspaceID string, now time.Time) (map[string]string, error) {
+// copied onto an agent response. The existing runtime-list visibility contract
+// is mirrored so the bucket is only copied when the full row is hidden.
+func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.Agent, workspaceID, viewerID, viewerRole string, now time.Time) (map[string]string, error) {
 	runtimeIDs := make([]pgtype.UUID, 0, len(agents))
 	for _, agent := range agents {
 		if agent.RuntimeID.Valid {
@@ -1006,6 +1007,14 @@ func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.
 		// Agent/runtime workspace consistency is normally enforced at bind time;
 		// keep the projection fail-closed if a legacy row violates it.
 		if uuidToString(runtime.WorkspaceID) != workspaceID {
+			continue
+		}
+		// ListAgentRuntimes exposes every row to workspace owner/admin and only
+		// owner/public rows to regular members. Keep the coarse bridge for the
+		// rows that the viewer's runtime list cannot carry.
+		if roleAllowed(viewerRole, "owner", "admin") ||
+			runtime.Visibility == "public" ||
+			(runtime.OwnerID.Valid && uuidToString(runtime.OwnerID) == viewerID) {
 			continue
 		}
 		result[uuidToString(runtime.ID)] = deriveAgentRuntimeAvailability(runtime, now)
@@ -1048,7 +1057,7 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list agents")
 		return
 	}
-	runtimeAvailabilityByID, err := h.loadAgentRuntimeAvailability(r.Context(), agents, workspaceID, time.Now())
+	runtimeAvailabilityByID, err := h.loadAgentRuntimeAvailability(r.Context(), agents, workspaceID, userID, member.Role, time.Now())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load agent runtime availability")
 		return
@@ -1150,13 +1159,18 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 	// render an explicit "no access" placeholder instead of a 404 — see
 	// agent-detail-page.tsx.
 	workspaceID := uuidToString(agent.WorkspaceID)
-	actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	userID := requestUserID(r)
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
 	if !h.canAccessPrivateAgent(r.Context(), agent, actorType, actorID, workspaceID) {
 		writeError(w, http.StatusForbidden, "you do not have access to this agent")
 		return
 	}
 	resp := h.agentToResponse(agent)
-	runtimeAvailability, err := h.loadAgentRuntimeAvailability(r.Context(), []db.Agent{agent}, workspaceID, time.Now())
+	viewerRole := ""
+	if member, ok := ctxMember(r.Context()); ok {
+		viewerRole = member.Role
+	}
+	runtimeAvailability, err := h.loadAgentRuntimeAvailability(r.Context(), []db.Agent{agent}, workspaceID, userID, viewerRole, time.Now())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load agent runtime availability")
 		return
@@ -1178,7 +1192,6 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 
 	// mcp_config redaction (custom_env was removed from this response shape
 	// in MUL-2600; secrets are now fetched via GET /api/agents/{id}/env).
-	userID := requestUserID(r)
 	ws, err := h.Queries.GetWorkspace(r.Context(), agent.WorkspaceID)
 	if err != nil {
 		slog.Warn("GetWorkspace failed for redact check", "workspace_id", uuidToString(agent.WorkspaceID), "error", err)
