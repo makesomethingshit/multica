@@ -250,3 +250,51 @@ func TestChannelIssueDelivery_NonChannelIssueDoesNotRequireDelivery(t *testing.T
 		t.Fatalf("web issue should not have delivery, but found one")
 	}
 }
+
+func TestChannelIssueDelivery_ImmediateSnapshotFailureDoesNotCreateTask(t *testing.T) {
+	pool := newResolveOriginatorPool(t)
+	ctx := context.Background()
+	q := db.New(pool)
+	workspaceID, userID, agentID, _ := seedAttributionFixture(t, pool)
+	workspaceUUID := util.MustParseUUID(workspaceID)
+	userUUID := util.MustParseUUID(userID)
+	agentUUID := util.MustParseUUID(agentID)
+
+	bus := events.New()
+	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
+	issueService := NewIssueService(q, pool, bus, nil, taskService)
+
+	bogusSessionID := dbid.NewV7()
+	result, err := issueService.Create(ctx, IssueCreateParams{
+		WorkspaceID:  workspaceUUID,
+		Title:        "Channel issue immediate bogus",
+		Status:       "todo",
+		Priority:     "medium",
+		AssigneeType: pgtype.Text{String: "agent", Valid: true},
+		AssigneeID:   agentUUID,
+		CreatorType:  "member",
+		CreatorID:    userUUID,
+		OriginType:   pgtype.Text{String: "lark_chat", Valid: true},
+		OriginID:     bogusSessionID,
+	}, IssueCreateOpts{})
+	if err != nil {
+		t.Fatalf("Create immediate bogus channel issue should not fail the issue itself, got %v", err)
+	}
+	if result.AssignedTaskID.Valid {
+		t.Fatalf("immediate bogus channel issue should have no assigned task due to snapshot failure, got %v", result.AssignedTaskID)
+	}
+	var issueCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM issue WHERE id = $1`, result.Issue.ID).Scan(&issueCount); err != nil {
+		t.Fatalf("count issue: %v", err)
+	}
+	if issueCount != 1 {
+		t.Fatalf("issue should exist despite task snapshot failure, count = %d", issueCount)
+	}
+	var taskCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`, result.Issue.ID).Scan(&taskCount); err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	if taskCount != 0 {
+		t.Fatalf("tasks for immediate bogus channel issue = %d, want 0", taskCount)
+	}
+}
