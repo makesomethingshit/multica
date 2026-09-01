@@ -17,6 +17,7 @@ const (
 	openclawShimHelperEnv      = "MULTICA_OPENCLAW_SHIM_HELPER"
 	openclawShimHelperArgvFile = "MULTICA_OPENCLAW_SHIM_ARGV_FILE"
 	openclawShimHelperMsgFile  = "MULTICA_OPENCLAW_SHIM_MSG_FILE"
+	openclawShimHelperMode     = "MULTICA_OPENCLAW_SHIM_HELPER_MODE" // "supported" (default/unset) | "unsupported"
 )
 
 // TestOpenclawWindowsShimHelperProcess is not a test. Re-executed by the
@@ -46,6 +47,11 @@ func TestOpenclawWindowsShimHelperProcess(t *testing.T) {
 		os.Exit(0)
 	}
 	if len(forwarded) >= 2 && forwarded[0] == "agent" && forwarded[1] == "--help" {
+		if os.Getenv(openclawShimHelperMode) == "unsupported" {
+			fmt.Println("Usage: openclaw agent")
+			fmt.Println("  --message <text>")
+			os.Exit(0)
+		}
 		fmt.Println("Usage: openclaw agent")
 		fmt.Println("  --message <text>")
 		fmt.Println("  --message-file <path>")
@@ -138,11 +144,12 @@ func TestOpenclawExecuteLongPromptViaMessageFileOnWindowsShim(t *testing.T) {
 
 	openclawMessageFileSupportCache = sync.Map{}
 
-	// 6KB+ UTF-8 that exceeds the 8000-byte threshold even after combining
-	// with any system prompt. Multi-byte ensures the file is UTF-8 without BOM.
+	// 6KB+ UTF-8 that exceeds the 6000-byte shim threshold
+	// (openclawShimThreshold) even after combining with any system prompt.
+	// Multi-byte ensures the file is UTF-8 without BOM.
 	prompt := strings.Repeat("한글🌟a", 900) + "\n— gateway dispatch test —\n" + strings.Repeat("Ω≈ç√∫˜µ≤≥÷", 200)
-	if len(prompt) <= openclawMessageFileThreshold {
-		t.Fatalf("prompt must exceed threshold %d, got %d", openclawMessageFileThreshold, len(prompt))
+	if len(prompt) <= openclawShimThreshold {
+		t.Fatalf("prompt must exceed shim threshold %d, got %d", openclawShimThreshold, len(prompt))
 	}
 
 	backend, err := New("openclaw", Config{ExecutablePath: cmdPath, Logger: slog.Default(), Env: helperEnv})
@@ -227,6 +234,169 @@ func TestOpenclawExecuteLongPromptViaMessageFileOnWindowsShim(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(mfPath)); err == nil {
 		t.Errorf("message temp dir %q still exists after session; cleanup missing", filepath.Dir(mfPath))
+	}
+}
+
+func TestIsOpenclawShimPath(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{`C:\tools\openclaw.cmd`, true},
+		{`C:\tools\openclaw.CMD`, true},
+		{`C:\tools\openclaw.bat`, true},
+		{`C:\tools\openclaw.BAT`, true},
+		{`openclaw.cmd`, true},
+		{`openclaw.bat`, true},
+		{" openclaw.cmd ", true},
+		{`/usr/local/bin/openclaw`, false},
+		{`C:\tools\openclaw.exe`, false},
+		{`openclaw`, false},
+		{`openclaw.sh`, false},
+	} {
+		if got := isOpenclawShimPath(tc.path); got != tc.want {
+			t.Errorf("isOpenclawShimPath(%q)=%v want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestOpenclawThresholds(t *testing.T) {
+	if openclawShimThreshold != 6000 {
+		t.Errorf("openclawShimThreshold=%d want 6000 (must fire before 6193 repro)", openclawShimThreshold)
+	}
+	if openclawNativeThreshold != 30000 {
+		t.Errorf("openclawNativeThreshold=%d want 30000", openclawNativeThreshold)
+	}
+	if openclawMessageFileThreshold != openclawShimThreshold {
+		t.Errorf("openclawMessageFileThreshold alias %d != shim %d", openclawMessageFileThreshold, openclawShimThreshold)
+	}
+	if openclawShimThreshold >= 6193 {
+		t.Errorf("shim threshold %d must be < 6193 to block before repro", openclawShimThreshold)
+	}
+}
+
+func TestOpenclawExecuteLongPromptRejectedWithoutMessageFileOnWindowsShimAtReproBoundary(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	dir := t.TempDir()
+	argvPath := filepath.Join(dir, "argv.txt")
+	msgContentPath := filepath.Join(dir, "msg.txt")
+	cmdPath := filepath.Join(dir, "openclaw.cmd")
+	body := fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestOpenclawWindowsShimHelperProcess -- %%*\r\n", self)
+	if err := os.WriteFile(cmdPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+	t.Setenv(openclawShimHelperEnv, "1")
+	t.Setenv(openclawShimHelperMode, "unsupported")
+	t.Setenv(openclawShimHelperArgvFile, argvPath)
+	t.Setenv(openclawShimHelperMsgFile, msgContentPath)
+	helperEnv := map[string]string{
+		openclawShimHelperEnv:      "1",
+		openclawShimHelperMode:     "unsupported",
+		openclawShimHelperArgvFile: argvPath,
+		openclawShimHelperMsgFile:  msgContentPath,
+	}
+	openclawMessageFileSupportCache = sync.Map{}
+	reproPrompt := strings.Repeat("x", 6200)
+	if len(reproPrompt) <= openclawShimThreshold {
+		t.Fatalf("repro prompt must exceed shim threshold %d", openclawShimThreshold)
+	}
+	backend, err := New("openclaw", Config{ExecutablePath: cmdPath, Logger: slog.Default(), Env: helperEnv})
+	if err != nil {
+		t.Fatalf("New(openclaw): %v", err)
+	}
+	_, execErr := backend.Execute(t.Context(), reproPrompt, ExecOptions{Timeout: 10 * time.Second})
+	if execErr == nil {
+		t.Fatal("expected Execute to reject 6200-byte prompt on unsupported .cmd shim, got nil")
+	}
+	msg := execErr.Error()
+	if strings.Contains(strings.ToLower(msg), "command line too long") {
+		t.Errorf("must not surface raw OS message: %q", msg)
+	}
+	for _, want := range []string{"command-line limit", "--message-file", "openclaw update"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q: %q", want, msg)
+		}
+	}
+	// 5999 on the same unsupported shim must NOT be rejected (just below 6000)
+	openclawMessageFileSupportCache = sync.Map{}
+	short := strings.Repeat("x", 5999)
+	if err := os.Remove(argvPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("cleanup argv: %v", err)
+	}
+	session, err := backend.Execute(t.Context(), short, ExecOptions{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("short 5999-byte prompt should not be rejected on unsupported shim: %v", err)
+	}
+	go func() { for range session.Messages {} }()
+	<-session.Result
+}
+
+func TestOpenclawExecuteLongPromptViaMessageFileOnWindowsShimAtReproBoundary(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	dir := t.TempDir()
+	argvPath := filepath.Join(dir, "argv.txt")
+	msgContentPath := filepath.Join(dir, "msg.txt")
+	cmdPath := filepath.Join(dir, "openclaw.cmd")
+	body := fmt.Sprintf("@echo off\r\n\"%s\" -test.run=TestOpenclawWindowsShimHelperProcess -- %%*\r\n", self)
+	if err := os.WriteFile(cmdPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+	t.Setenv(openclawShimHelperEnv, "1")
+	t.Setenv(openclawShimHelperMode, "supported")
+	t.Setenv(openclawShimHelperArgvFile, argvPath)
+	t.Setenv(openclawShimHelperMsgFile, msgContentPath)
+	helperEnv := map[string]string{
+		openclawShimHelperEnv:      "1",
+		openclawShimHelperMode:     "supported",
+		openclawShimHelperArgvFile: argvPath,
+		openclawShimHelperMsgFile:  msgContentPath,
+	}
+	openclawMessageFileSupportCache = sync.Map{}
+	prompt := strings.Repeat("한글🌟", 800) + strings.Repeat("x", 900)
+	if len(prompt) <= openclawShimThreshold {
+		t.Fatalf("prompt must exceed shim threshold %d, got %d", openclawShimThreshold, len(prompt))
+	}
+	if len(prompt) < 6200 {
+		prompt += strings.Repeat("a", 6200-len(prompt))
+	}
+	backend, err := New("openclaw", Config{ExecutablePath: cmdPath, Logger: slog.Default(), Env: helperEnv})
+	if err != nil {
+		t.Fatalf("New(openclaw): %v", err)
+	}
+	session, err := backend.Execute(t.Context(), prompt, ExecOptions{Timeout: 60 * time.Second})
+	if err != nil {
+		t.Fatalf("Execute at repro boundary: %v", err)
+	}
+	go func() { for range session.Messages {} }()
+	result := <-session.Result
+	if result.Status != "completed" {
+		t.Fatalf("status=%q want completed; error=%q", result.Status, result.Error)
+	}
+	argvRaw, err := os.ReadFile(argvPath)
+	if err != nil {
+		t.Fatalf("helper never recorded argv: %v", err)
+	}
+	gotArgv := string(argvRaw)
+	if !strings.Contains(gotArgv, "--message-file") {
+		t.Errorf("expected --message-file at 6200 boundary; argv=%q", gotArgv)
+	}
+	for _, needle := range []string{"한글", "🌟"} {
+		if strings.Contains(gotArgv, needle) {
+			t.Errorf("prompt fragment %q leaked into argv at boundary", needle)
+		}
+	}
+	data, err := os.ReadFile(msgContentPath)
+	if err != nil {
+		t.Fatalf("helper never recorded msg: %v", err)
+	}
+	if string(data) != prompt {
+		t.Errorf("UTF-8 not preserved byte-for-byte at boundary: got %d want %d", len(data), len(prompt))
 	}
 }
 

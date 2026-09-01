@@ -50,12 +50,40 @@ var openclawBlockedArgs = map[string]blockedArgMode{
 	"--system-prompt": blockedWithValue, // openclaw agent does not accept --system-prompt; instructions are injected into --message
 }
 
-// openclawMessageFileThreshold is the byte length above which a prompt is
-// considered "long" for Windows argv purposes. 8191 is the cmd.exe limit
-// for .cmd shims; 32767 is the CreateProcess limit. A conservative 8000
-// leaves headroom for the remaining argv while still catching any prompt
-// that would overflow a shim before the OS reports "command line too long".
-const openclawMessageFileThreshold = 8000
+// openclawShimThreshold is the byte length above which a prompt is considered
+// "long" for Windows .cmd/.bat shims. 8191 is the cmd.exe limit for .cmd
+// shims; 32767 is the CreateProcess limit. The original 8000 left headroom for
+// the remaining argv but missed the observed failure at ~6193 prompt bytes
+// (issue #6032): the total command line includes the shim prefix, fixed args,
+// and quoting overhead, so a 6.2KB prompt already overflows before the shim
+// limit. 6000 fires strictly before that reproduction while still leaving room
+// for args overhead on the .cmd boundary.
+const openclawShimThreshold = 6000
+
+// openclawNativeThreshold is the limit used for non-shim executables (POSIX
+// shells or native .exe on Windows) where the cmd.exe 8191 ceiling does not
+// apply. 30000 keeps headroom for CreateProcess 32767 while preserving the
+// existing inline --message fallback for ~6KB prompts that would otherwise be
+// spuriously rejected on Linux/macOS and native Windows binaries.
+const openclawNativeThreshold = 30000
+
+// openclawMessageFileThreshold is the legacy name for the shim threshold.
+// Kept for backwards compatibility with tests and callers that import it;
+// new code should use openclawShimThreshold / openclawNativeThreshold
+// directly and gate on isOpenclawShimPath(execPath).
+const openclawMessageFileThreshold = openclawShimThreshold
+
+// isOpenclawShimPath reports whether bin is a Windows batch shim (.cmd/.bat)
+// rather than a directly executable binary. Mirrors the check in
+// server/internal/daemon/execenv (isOpenclawShimPath) so the long-prompt gate
+// can distinguish the cmd.exe 8191 boundary from the CreateProcess 32767
+// boundary without importing execenv (avoiding a cycle). Extension match is
+// case-insensitive and deliberately not gated on GOOS so the gate is testable
+// on Linux/macOS.
+func isOpenclawShimPath(bin string) bool {
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(bin)))
+	return ext == ".cmd" || ext == ".bat"
+}
 
 // openclawMessageFileSupportCache caches per-executable+version probe results
 // for `openclaw agent --help` containing --message-file. Key is
@@ -205,8 +233,22 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	if opts.SystemPrompt != "" {
 		finalPrompt = opts.SystemPrompt + "\n\n" + prompt
 	}
+	// Threshold gates on the WINDOWS shim boundary. 6000 is conservative vs
+	// the 6193 reproduction (covers quoting + fixed args overhead) and fires
+	// only for .cmd/.bat shims where cmd.exe 8191 applies. Native binaries
+	// and POSIX shells use CreateProcess 32767, so they keep inline --message
+	// up to 30000 and are not spuriously rejected. Gate on finalPrompt (which
+	// includes SystemPrompt) so the combined payload is what is bounded.
 	supportsFile := isOpenclawMessageFileSupported(ctx, b.cfg.commandAt(execPath))
-	isLong := len(finalPrompt) > openclawMessageFileThreshold
+	threshold := openclawNativeThreshold
+	if isOpenclawShimPath(execPath) {
+		threshold = openclawShimThreshold
+	}
+	isLong := len(finalPrompt) > threshold
+	// Wire isLong into the transport choice: long shim prompts must go via
+	// --message-file when supported (keeps argv short), short prompts stay
+	// inline. The shim-only rejection produces an actionable upgrade hint
+	// before cmd.exe can report "command line too long".
 	if isLong && !supportsFile {
 		cancel()
 		return nil, fmt.Errorf("prompt is %d bytes and exceeds the Windows command-line limit for %q; "+
@@ -214,9 +256,10 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 			"Upgrade to openclaw >= 2026.7.1-2 (`openclaw update`) to send long prompts via --message-file, "+
 			"or shorten the task prompt", len(finalPrompt), execPath)
 	}
+	useMessageFile := supportsFile && isLong
 	var messageFilePath string
 	var args []string
-	if supportsFile {
+	if useMessageFile {
 		var err error
 		messageFilePath, err = writeOpenclawMessageFile(finalPrompt)
 		if err != nil {
