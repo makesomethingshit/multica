@@ -974,13 +974,14 @@ WHERE claimed_input.id = latest_visible.claimed_input_id
 -- direct batching is added, assign stable per-row offsets here.
 --
 -- MUL-6886: the deferred-cancel path settles after the follow-up was already
--- claimed (dispatched). The original queued-only predicate missed that head,
--- leaving user B before assistant A. The fix widens the target to the proven
--- non-terminal head that is still not externally finalized: queued (always) and
--- dispatched (claimed but not yet running, proven by
--- TestMUL6886_DeferredCancelClaimedFollowUp_Repro). Running and
--- waiting_local_directory are intentionally excluded here — they would require
--- their own proven regression before being added — and completed/failed/
+-- claimed (dispatched) and a normal production claim quickly moves it to
+-- running/waiting_local_directory before the sweeper settles (60s grace +
+-- 30s tick). The original queued-only predicate missed those heads, leaving
+-- user B before assistant A. The fix widens the target to the proven
+-- non-terminal heads that are still not externally finalized: queued,
+-- dispatched, waiting_local_directory and running (all proven by
+-- TestMUL6886_ActiveStates_Table — dispatched via the original repro and
+-- waiting/running via the same fixture updated in-place). completed/failed/
 -- cancelled/deferred (including retry children via chat_input_task_id != id) are
 -- deliberately never moved to avoid rewriting terminal history or channel
 -- batches.
@@ -999,7 +1000,7 @@ WHERE queued_input.chat_session_id = $1
     FROM agent_task_queue AS queued_task
     WHERE queued_task.id = queued_input.task_id
       AND queued_task.chat_session_id = queued_input.chat_session_id
-      AND queued_task.status IN ('queued', 'dispatched')
+      AND queued_task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
       AND queued_task.chat_input_task_id = queued_task.id
       AND queued_task.regenerate_quick_actions_for IS NULL
       AND queued_task.id = (
