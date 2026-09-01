@@ -247,9 +247,6 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	}()
 
 	go func() {
-		if messageFilePath != "" {
-			defer cleanupOpenclawMessageFile(messageFilePath)
-		}
 		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
@@ -333,6 +330,12 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 			usage = map[string]TokenUsage{model: u}
 		}
 
+		// The buffered resCh would deliver the result before defers run,
+		// so a receiver waking on Result arrival would observe the temp
+		// message file still present. Remove it before sending.
+		if messageFilePath != "" {
+			cleanupOpenclawMessageFile(messageFilePath)
+		}
 		resCh <- Result{
 			Status:     scanResult.status,
 			Output:     scanResult.output,
