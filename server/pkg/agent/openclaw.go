@@ -44,6 +44,7 @@ var openclawBlockedArgs = map[string]blockedArgMode{
 	"--json":         blockedStandalone, // JSON output for daemon communication
 	"--session-id":   blockedWithValue,  // managed by daemon for session resumption
 	"--message":      blockedWithValue,  // prompt is set by daemon
+	"-m":             blockedWithValue,  // alias for --message
 	"--message-file": blockedWithValue,  // prompt file is set by daemon when --message-file is supported
 	"--model":        blockedWithValue,  // openclaw agent does not accept --model; model is bound at registration via `openclaw agents add/update --model`
 	"--system-prompt": blockedWithValue, // openclaw agent does not accept --system-prompt; instructions are injected into --message
@@ -56,40 +57,79 @@ var openclawBlockedArgs = map[string]blockedArgMode{
 // that would overflow a shim before the OS reports "command line too long".
 const openclawMessageFileThreshold = 8000
 
-// openclawMessageFileSupportCache caches per-executable probe results for
-// `openclaw agent --help` containing --message-file. Key is runtimeCmd.Path.
-// Only positive (true) results are cached — a false from an older build must
-// not outlive an in-place upgrade on the same path (otherwise a long prompt
-// stays rejected until the daemon restarts).
+// openclawMessageFileSupportCache caches per-executable+version probe results
+// for `openclaw agent --help` containing --message-file. Key is
+// openclawMessageFileCacheKey(runtimeCmd, version). Only positive (true) results
+// are cached — a false from an older build must not outlive an in-place
+// upgrade on the same path (otherwise a long prompt stays rejected until the
+// daemon restarts), and a cached true must not survive a downgrade or a
+// PATH/symlink swap to a different binary.
 var openclawMessageFileSupportCache sync.Map // map[string]bool
 
-// isOpenclawMessageFileSupported reports whether the cached probe for runtimeCmd
-// indicates --message-file is available. Uncached executables are probed via
-// `openclaw agent --help`; probe errors are treated as unknown (false) and
-// not cached so a later retry can succeed after an upgrade. Only true is
-// cached, so an in-place `openclaw update` on the same path is observed on
-// the next call.
+func openclawMessageFileCacheKey(runtimeCmd Command, version string) string {
+	return runtimeCmd.cacheKey() + "\x00" + version
+}
+
+func probeOpenclawVersionString(ctx context.Context, runtimeCmd Command) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
+	defer cancel()
+	cmd := runtimeCmd.exec(ctx, "--version")
+	hideAgentWindow(cmd)
+	cmd.WaitDelay = 2 * time.Second
+	data, err := combinedOutputOwned(cmd, runtimeCmd.logger)
+	out := string(data)
+	ver, ok := parseOpenclawVersion(out)
+	if err != nil {
+		if ok && errors.Is(err, exec.ErrWaitDelay) {
+			if runtimeCmd.logger != nil {
+				runtimeCmd.logger.Warn("agent: CLI answered version but left pipes open; using answer", "command", runtimeCmd.String(), "probe", "openclaw --version")
+			}
+			return ver, nil
+		}
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("could not parse openclaw version from output: %q", strings.TrimSpace(out))
+	}
+	return ver, nil
+}
+
+// isOpenclawMessageFileSupported reports whether the probe for runtimeCmd
+// indicates --message-file is available. The cache is keyed by
+// executable identity (runtimeCmd.cacheKey) plus the detected version, so a
+// downgrade, symlink swap, or PATH change invalidates a stale true.
+// Probe errors are treated as unknown (false) and not cached so a later
+// retry can succeed after an upgrade. Only true+version is cached, so an
+// in-place `openclaw update` on the same path is observed on the next call.
 func isOpenclawMessageFileSupported(ctx context.Context, runtimeCmd Command) bool {
-	if v, ok := openclawMessageFileSupportCache.Load(runtimeCmd.Path); ok {
+	version, err := probeOpenclawVersionString(ctx, runtimeCmd)
+	if err != nil {
+		supported, pErr := probeOpenclawMessageFileSupport(ctx, runtimeCmd)
+		if pErr != nil {
+			return false
+		}
+		return supported
+	}
+	key := openclawMessageFileCacheKey(runtimeCmd, version)
+	if v, ok := openclawMessageFileSupportCache.Load(key); ok {
 		return v.(bool)
 	}
 	supported, err := probeOpenclawMessageFileSupport(ctx, runtimeCmd)
 	if err != nil {
-		if supported {
-			openclawMessageFileSupportCache.Store(runtimeCmd.Path, true)
-			return true
-		}
 		return false
 	}
 	if supported {
-		openclawMessageFileSupportCache.Store(runtimeCmd.Path, true)
+		openclawMessageFileSupportCache.Store(key, true)
 	}
 	return supported
 }
 
 // probeOpenclawMessageFileSupport runs `openclaw agent --help` and reports
-// whether its output advertises --message-file. Uses combinedOutputOwned so
-// a lingering descendant holding pipes past WaitDelay does not hide the answer.
+// whether its output advertises --message-file. Only a successful probe
+// (or an ErrWaitDelay salvage where the answer already arrived) counts as
+// supported — a non-zero exit that happens to mention the flag in an error
+// message must not become a false-positive. Uses combinedOutputOwned so a
+// lingering descendant holding pipes past WaitDelay does not hide the answer.
 func probeOpenclawMessageFileSupport(ctx context.Context, runtimeCmd Command) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
 	defer cancel()
@@ -106,7 +146,7 @@ func probeOpenclawMessageFileSupport(ctx context.Context, runtimeCmd Command) (b
 			}
 			return true, nil
 		}
-		return has, err
+		return false, err
 	}
 	return has, nil
 }

@@ -1594,7 +1594,7 @@ func TestBuildOpenclawArgsWithMessageFileOmitsMessageAndContainsFileFlag(t *test
 func TestBuildOpenclawArgsWithMessageFileRespectsGatewayAndFiltersBlocked(t *testing.T) {
 	args := buildOpenclawArgsWithMessageFile("ses-file-gw", "/tmp/m.txt", ExecOptions{
 		OpenclawMode: "gateway",
-		CustomArgs:   []string{"--local", "--message", "hijacked", "--message-file", "/tmp/evil.txt", "--agent", "from-custom"},
+		CustomArgs:   []string{"--local", "--message", "hijacked", "-m", "also-hijacked", "--message-file", "/tmp/evil.txt", "--agent", "from-custom"},
 	}, slog.Default())
 	if indexOf(args, "--local") != -1 {
 		t.Errorf("gateway file mode must not emit --local: %v", args)
@@ -1604,6 +1604,9 @@ func TestBuildOpenclawArgsWithMessageFileRespectsGatewayAndFiltersBlocked(t *tes
 	}
 	if count := countOccurrences(args, "--message"); count != 0 {
 		t.Errorf("expected no --message in file mode, got %d: %v", count, args)
+	}
+	if count := countOccurrences(args, "-m"); count != 0 {
+		t.Errorf("expected no -m alias in file mode, got %d: %v", count, args)
 	}
 	if idx := indexOf(args, "--agent"); idx == -1 || args[idx+1] != "from-custom" {
 		t.Errorf("custom --agent should survive filtering: %v", args)
@@ -1718,6 +1721,22 @@ func TestProbeOpenclawMessageFileSupport(t *testing.T) {
 			t.Error("expected probe error on help failure")
 		}
 	})
+	t.Run("non-zero help mentioning --message-file must not be treated as supported", func(t *testing.T) {
+		fakePath := filepath.Join(t.TempDir(), "openclaw")
+		script := "#!/bin/sh\n" +
+			"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5'; exit 0; fi\n" +
+			"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo 'error: unknown flag --message-file' >&2; exit 1; fi\n" +
+			"exit 99\n"
+		writeTestExecutable(t, fakePath, []byte(script))
+		cmd := NewCommand(fakePath, nil)
+		supported, err := probeOpenclawMessageFileSupport(context.Background(), cmd)
+		if err == nil {
+			t.Fatal("expected probe error on non-zero help exit")
+		}
+		if supported {
+			t.Error("non-zero help must not be reported as supported")
+		}
+	})
 }
 
 func TestOpenclawExecuteLongPromptRejectsWithoutMessageFileSupport(t *testing.T) {
@@ -1808,17 +1827,34 @@ func TestOpenclawExecuteLongPromptViaMessageFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute with --message-file: %v", err)
 	}
-	var text string
-	go func() { for m := range session.Messages { if m.Type == MessageText { text += m.Content } } }()
+	var (
+		mu   sync.Mutex
+		text string
+		done = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		for m := range session.Messages {
+			if m.Type == MessageText {
+				mu.Lock()
+				text += m.Content
+				mu.Unlock()
+			}
+		}
+	}()
 	result := <-session.Result
+	<-done
+	mu.Lock()
+	gotText := text
+	mu.Unlock()
 	if result.Status != "completed" {
 		t.Fatalf("result: %+v", result)
 	}
 	if result.Output != longPrompt {
 		t.Errorf("output mismatch: got %d bytes, want %d", len(result.Output), len(longPrompt))
 	}
-	if text != longPrompt {
-		t.Errorf("streamed text mismatch: got %d bytes", len(text))
+	if gotText != longPrompt {
+		t.Errorf("streamed text mismatch: got %d bytes", len(gotText))
 	}
 	argvRaw, _ := os.ReadFile(argvPath)
 	argv := string(argvRaw)
@@ -1888,8 +1924,14 @@ func TestOpenclawMessageFileSupportCacheDoesNotPinFalse(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected rejection on first run (unsupported)")
 	}
+	for _, ver := range []string{"2026.5.5", "2026.7.1"} {
+		k := openclawMessageFileCacheKey(NewCommand(fakePath, nil), ver)
+		if _, ok := openclawMessageFileSupportCache.Load(k); ok {
+			t.Fatalf("false probe must not be cached; got entry for key %q", k)
+		}
+	}
 	if _, ok := openclawMessageFileSupportCache.Load(fakePath); ok {
-		t.Fatalf("false probe must not be cached; got entry for %q", fakePath)
+		t.Fatalf("legacy unversioned cache key must not be used; got entry for %q", fakePath)
 	}
 	// In-place upgrade: same path now advertises --message-file.
 	supported := "#!/bin/sh\n" +
@@ -1897,7 +1939,7 @@ func TestOpenclawMessageFileSupportCacheDoesNotPinFalse(t *testing.T) {
 		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo '--message-file <path>'; exit 0; fi\n" +
 		"printf '%s\\n' \"$@\" > \"" + argvPath + "\"\n" +
 		"MF=\"\"; NEXT=0; for a in \"$@\"; do if [ \"$NEXT\" = 1 ]; then MF=\"$a\"; break; fi; if [ \"$a\" = \"--message-file\" ]; then NEXT=1; fi; done\n" +
-		"if [ -n \"$MF\" ] && [ -f \"$MF\" ]; then cat \"$MF\" > \"" + filepath.Join(filepath.Dir(argvPath), "msg2.txt") + "\"\n" +
+		"if [ -n \"$MF\" ] && [ -f \"$MF\" ]; then cat \"$MF\" > \"" + filepath.Join(filepath.Dir(argvPath), "msg2.txt") + "\"; fi\n" +
 		"printf '{\"payloads\":[{\"text\":\"ok\"}],\"meta\":{}}'\n" +
 		"exit 0\n"
 	writeTestExecutable(t, fakePath, []byte(supported))
@@ -1911,8 +1953,43 @@ func TestOpenclawMessageFileSupportCacheDoesNotPinFalse(t *testing.T) {
 	if !strings.Contains(string(argvRaw), "--message-file") {
 		t.Fatalf("expected --message-file after upgrade; argv=%q", string(argvRaw))
 	}
-	if v, ok := openclawMessageFileSupportCache.Load(fakePath); !ok || !v.(bool) {
-		t.Fatalf("expected cached true after successful probe")
+	key := openclawMessageFileCacheKey(NewCommand(fakePath, nil), "2026.7.1")
+	if v, ok := openclawMessageFileSupportCache.Load(key); !ok || !v.(bool) {
+		t.Fatalf("expected cached true after successful probe for key %q", key)
+	}
+}
+
+func TestOpenclawMessageFileCacheVersionIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	writeTestExecutable(t, fakePath, []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\nif [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo '--message-file <path>'; exit 0; fi\nexit 0\n"))
+	openclawMessageFileSupportCache = sync.Map{}
+	if !isOpenclawMessageFileSupported(context.Background(), NewCommand(fakePath, nil)) {
+		t.Fatal("expected supported on 2026.7.1")
+	}
+	keyGood := openclawMessageFileCacheKey(NewCommand(fakePath, nil), "2026.7.1")
+	if v, ok := openclawMessageFileSupportCache.Load(keyGood); !ok || !v.(bool) {
+		t.Fatalf("expected cached true for versioned key %q", keyGood)
+	}
+	// Change only the executable identity (prefix) while keeping the same path — must miss.
+	prefixed := NewCommand(fakePath, []string{"--prefix", "value"})
+	keyPrefixed := openclawMessageFileCacheKey(prefixed, "2026.7.1")
+	if _, ok := openclawMessageFileSupportCache.Load(keyPrefixed); ok {
+		t.Fatalf("identity change must not reuse key %q", keyPrefixed)
+	}
+	// Change only the version while keeping the same binary — must miss so a downgrade is noticed.
+	keyDowngrade := openclawMessageFileCacheKey(NewCommand(fakePath, nil), "2026.5.5")
+	if _, ok := openclawMessageFileSupportCache.Load(keyDowngrade); ok {
+		t.Fatalf("version change must not reuse key %q", keyDowngrade)
+	}
+	// Different PATH name with same version must also miss (PATH swap).
+	otherPath := filepath.Join(t.TempDir(), "openclaw-other")
+	writeTestExecutable(t, otherPath, []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\nif [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo '--message-file <path>'; exit 0; fi\nexit 0\n"))
+	keyOtherPath := openclawMessageFileCacheKey(NewCommand(otherPath, nil), "2026.7.1")
+	if _, ok := openclawMessageFileSupportCache.Load(keyOtherPath); ok {
+		t.Fatalf("different executable path must not reuse key %q", keyOtherPath)
 	}
 }
 
@@ -1928,7 +2005,7 @@ func TestOpenclawExecuteSystemPromptCombinedIntoMessageFile(t *testing.T) {
 		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo '--message-file <path>'; exit 0; fi\n" +
 		"printf '%s\n' \"$@\" > \"" + argvPath + "\"\n" +
 		"MF=\"\"; NEXT=0; for a in \"$@\"; do if [ \"$NEXT\" = 1 ]; then MF=\"$a\"; break; fi; if [ \"$a\" = \"--message-file\" ]; then NEXT=1; fi; done\n" +
-		"if [ -n \"$MF\" ] && [ -f \"$MF\" ]; then cat \"$MF\" > \"" + filepath.Join(dir, "msg.txt") + "\"\n" +
+		"if [ -n \"$MF\" ] && [ -f \"$MF\" ]; then cat \"$MF\" > \"" + filepath.Join(dir, "msg.txt") + "\"; fi\n" +
 		"printf '{\"payloads\":[{\"text\":\"ok\"}],\"meta\":{}}'\n" +
 		"exit 0\n"
 	writeTestExecutable(t, fakePath, []byte(script))
