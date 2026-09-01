@@ -3350,30 +3350,6 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 	return s.claimTask(ctx, agentID, pgtype.UUID{})
 }
 
-// failQueuedTasksRejectedByRuntimeAccess settles deterministic private-runtime
-// owner mismatches before the candidate query can hide them from the claim
-// loop. The SQL fence remains unchanged; only rows that can never be claimed
-// are moved to a terminal state with an actionable task-level diagnostic.
-func (s *TaskService) failQueuedTasksRejectedByRuntimeAccess(ctx context.Context, runtimeIDs []pgtype.UUID) error {
-	if len(runtimeIDs) == 0 {
-		return nil
-	}
-	tasks, err := s.Queries.FailQueuedTasksRejectedByRuntimeAccess(ctx, runtimeIDs)
-	if err != nil {
-		return fmt.Errorf("fail queued runtime access rejections: %w", err)
-	}
-	if len(tasks) == 0 {
-		return nil
-	}
-	s.HandleFailedTasks(ctx, tasks)
-	for _, task := range tasks {
-		if task.IssueID.Valid && task.Error.Valid {
-			s.createAgentComment(ctx, task.IssueID, task.AgentID, task.Error.String, "system", task.TriggerCommentID, task.ID)
-		}
-	}
-	return nil
-}
-
 // claimTask is the runtime-scoped claim primitive used by daemon poll paths.
 // The exported ClaimTask wrapper omits runtimeID and therefore resolves the
 // agent's currently bound runtime. Scoping the SQL claim itself prevents an
@@ -3588,20 +3564,9 @@ func (s *TaskService) ClaimTaskForRuntime(ctx context.Context, runtimeID pgtype.
 		return nil, nil
 	}
 
-	// Settle deterministic owner mismatches only after the empty-cache
-	// fast path. Enqueue invalidates EmptyClaim synchronously, so a newly
-	// queued rejected task still reaches this repair path without adding
-	// a Postgres round-trip to steady-state idle daemon polls.
-	if err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, []pgtype.UUID{runtimeID}); err != nil {
-		outcome = "error_runtime_access_repair"
-		return nil, err
-	}
-
-	// Sample the invalidation version AFTER repair. HandleFailedTasks
-	// invalidates EmptyClaim for settled rows, so this version represents
-	// the queue state that the candidate SELECT below is about to inspect.
-	// If a concurrent enqueue bumps the version before post-SELECT MarkEmpty,
-	// the next IsEmpty rejects that stale marker instead of hiding new work.
+	// Sample the invalidation version before the candidate SELECT. If a
+	// concurrent enqueue bumps the version before post-SELECT MarkEmpty, the
+	// next IsEmpty rejects that stale marker instead of hiding new work.
 	preSelectVersion := s.EmptyClaim.CurrentVersion(ctx, runtimeKey)
 
 	t0 := time.Now()
@@ -3853,9 +3818,8 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		return claimed[:maxTasks], nil
 	}
 
-	// 3. Empty-cache short-circuit for the remaining runtimes. Do not run
-	// mismatch repair for cached-idle runtimes: enqueue invalidates the cache,
-	// so work that actually needs repair cannot be hidden by this fast path.
+	// 3. Empty-cache short-circuit for the remaining runtimes. Enqueue
+	// invalidates the cache, so queued work cannot be hidden by this fast path.
 	nonEmpty := make([]pgtype.UUID, 0, len(uniqueIDs))
 	for _, rid := range uniqueIDs {
 		key := util.UUIDToString(rid)
@@ -3868,15 +3832,9 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 		return claimed, nil
 	}
 
-	// 4. Settle deterministic private-runtime owner mismatches only for
-	// runtimes that survived the empty-cache filter. Treat them as bad queue
-	// rows, not as authorization failures of the daemon claim request.
-	if err := s.failQueuedTasksRejectedByRuntimeAccess(ctx, nonEmpty); err != nil {
-		return nil, err
-	}
-
-	// Sample versions after repair because HandleFailedTasks invalidates the
-	// affected runtime's empty-claim generation.
+	// 4. Sample versions before the candidate SELECT. Runtimes with candidates
+	// remain non-empty; a concurrent enqueue bumps the version and prevents a
+	// stale MarkEmpty from hiding new work.
 	versions := make(map[string]int64, len(nonEmpty))
 	for _, rid := range nonEmpty {
 		key := util.UUIDToString(rid)

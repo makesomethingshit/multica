@@ -102,7 +102,7 @@ func TestRuntimeAccessGatesQueuedTaskClaims(t *testing.T) {
 		ownerlessAgent  bool
 		wantClaim       bool
 	}{
-		{name: "private runtime rejects foreign agent", visibility: "private", wantClaim: false, matchingBinding: true},
+		{name: "private runtime routes foreign agent to handler", visibility: "private", wantClaim: true, matchingBinding: true},
 		{name: "private runtime accepts owner agent", visibility: "private", sameOwner: true, matchingBinding: true, wantClaim: true},
 		{name: "private runtime routes ownerless agent to handler", visibility: "private", sameOwner: true, matchingBinding: true, ownerlessAgent: true, wantClaim: true},
 		{name: "public runtime accepts foreign agent", visibility: "public", wantClaim: true, matchingBinding: true},
@@ -263,92 +263,6 @@ func TestClaimTaskRejectsMismatchedAgentRuntime(t *testing.T) {
 	}
 	if status != "queued" {
 		t.Fatalf("task status = %q, want queued", status)
-	}
-}
-
-func TestClaimTaskFailsQueuedPrivateRuntimeOwnerMismatch(t *testing.T) {
-	ctx := context.Background()
-	fixture := newRuntimeClaimAccessFixture(t, "private", false, true, "queued")
-	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
-
-	claimed, err := svc.ClaimTaskForRuntime(ctx, fixture.runtimeID)
-	if err != nil {
-		t.Fatalf("claim task: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("claimed rejected task %s", util.UUIDToString(claimed.ID))
-	}
-
-	var status, errorMessage, failureReason string
-	if err := fixture.pool.QueryRow(ctx, `
-		SELECT status, error, failure_reason
-		FROM agent_task_queue
-		WHERE id = $1
-	`, fixture.taskID).Scan(&status, &errorMessage, &failureReason); err != nil {
-		t.Fatalf("read task state: %v", err)
-	}
-	if status != "failed" {
-		t.Fatalf("task status = %q, want failed", status)
-	}
-	if errorMessage != "This private runtime cannot run the assigned agent because the agent and runtime have different owners." {
-		t.Fatalf("task error = %q, want owner-mismatch diagnostic", errorMessage)
-	}
-	if failureReason != "invalid_task_identity" {
-		t.Fatalf("failure_reason = %q, want invalid_task_identity", failureReason)
-	}
-}
-
-func TestClaimTaskForRuntimeSettlesMismatchAndClaimsValidTask(t *testing.T) {
-	ctx := context.Background()
-	fixture := newRuntimeClaimAccessFixture(t, "private", false, true, "queued")
-
-	var workspaceID, runtimeOwnerID string
-	if err := fixture.pool.QueryRow(ctx, `
-		SELECT workspace_id::text, owner_id::text
-		FROM agent_runtime
-		WHERE id = $1
-	`, fixture.runtimeID).Scan(&workspaceID, &runtimeOwnerID); err != nil {
-		t.Fatalf("read runtime owner: %v", err)
-	}
-	fx := testutil.New(fixture.pool, workspaceID, runtimeOwnerID)
-	validAgentID := fx.Agent(t, "valid-claim-agent", util.UUIDToString(fixture.runtimeID), testutil.Cols{
-		"owner_id": runtimeOwnerID,
-	})
-	validIssueID := fx.Issue(t, "valid runtime claim")
-	validTaskID := fx.Task(t, validAgentID, testutil.Cols{
-		"runtime_id": util.UUIDToString(fixture.runtimeID),
-		"issue_id":   validIssueID,
-	})
-
-	svc := NewTaskService(db.New(fixture.pool), fixture.pool, nil, events.New())
-	claimed, err := svc.ClaimTaskForRuntime(ctx, fixture.runtimeID)
-	if err != nil {
-		t.Fatalf("claim task: %v", err)
-	}
-	if claimed == nil || util.UUIDToString(claimed.ID) != validTaskID {
-		t.Fatalf("claimed task = %+v, want %s", claimed, validTaskID)
-	}
-
-	var invalidStatus, invalidFailureReason, validStatus string
-	if err := fixture.pool.QueryRow(ctx, `
-		SELECT status, failure_reason
-		FROM agent_task_queue
-		WHERE id = $1
-	`, fixture.taskID).Scan(&invalidStatus, &invalidFailureReason); err != nil {
-		t.Fatalf("read invalid task state: %v", err)
-	}
-	if invalidStatus != "failed" || invalidFailureReason != "invalid_task_identity" {
-		t.Fatalf("invalid task state = %q/%q, want failed/invalid_task_identity", invalidStatus, invalidFailureReason)
-	}
-	if err := fixture.pool.QueryRow(ctx, `
-		SELECT status
-		FROM agent_task_queue
-		WHERE id = $1
-	`, validTaskID).Scan(&validStatus); err != nil {
-		t.Fatalf("read valid task state: %v", err)
-	}
-	if validStatus != "dispatched" {
-		t.Fatalf("valid task status = %q, want dispatched", validStatus)
 	}
 }
 
