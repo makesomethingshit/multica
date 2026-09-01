@@ -321,21 +321,28 @@ func (f *fakeIssues) PublishAttachmentsChanged(context.Context, db.Issue, pgtype
 }
 
 type fakeTasks struct {
-	mu                  sync.Mutex
-	called              bool
-	callCount           int
-	promotions          int
-	issueTaskPromotions []pgtype.UUID
-	forceFresh          bool
-	forceFreshArgs      []bool
-	initiator           pgtype.UUID
-	initiators          []pgtype.UUID
-	contextRevisions    []int64
-	bindingIDs          []pgtype.UUID
-	routeRevisions      []int64
-	err                 error
-	prepared            bool
-	prepareErr          error
+	mu                     sync.Mutex
+	called                 bool
+	callCount              int
+	promotions             int
+	issueTaskPromotions    []pgtype.UUID
+	snapshots              []snapshotCall
+	snapshotErr            error
+	forceFresh             bool
+	forceFreshArgs         []bool
+	initiator              pgtype.UUID
+	initiators             []pgtype.UUID
+	contextRevisions       []int64
+	bindingIDs             []pgtype.UUID
+	routeRevisions         []int64
+	err                  error
+	prepared               bool
+	prepareErr             error
+}
+
+type snapshotCall struct {
+	TaskID    pgtype.UUID
+	SessionID pgtype.UUID
 }
 
 func (f *fakeTasks) PromoteChannelChatTasksIfMediaReady(_ context.Context, _ pgtype.UUID) error {
@@ -377,6 +384,17 @@ func (f *fakeTasks) EnqueuePreparedChannelChatTaskInTx(ctx context.Context, _ pg
 	return f.EnqueueChannelChatTask(ctx, session, initiator, forceFresh, contextRevision, pgtype.UUID{}, 0)
 }
 func (f *fakeTasks) FinalizeChatTaskEnqueue(context.Context, db.AgentTaskQueue) {}
+func (f *fakeTasks) SnapshotChannelTaskDelivery(_ context.Context, taskID, sessionID pgtype.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshots = append(f.snapshots, snapshotCall{TaskID: taskID, SessionID: sessionID})
+	return f.snapshotErr
+}
+func (f *fakeTasks) snapshotCalls() []snapshotCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]snapshotCall(nil), f.snapshots...)
+}
 func (f *fakeTasks) wasPrepared() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2167,5 +2185,80 @@ func TestRouter_MediaDeadlineStartsBeforeAppend(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("resolver did not run")
+	}
+}
+
+func TestRouter_IssueCommand_SnapshotsDelivery(t *testing.T) {
+	h := newHarness(t)
+	taskID := uuidFromString(t, "aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	sessionID := h.binder.ensureID
+	h.binder.appendResult = AppendResult{DedupMarked: true, IssueCommand: &IssueCommand{Title: "Snapshot me", Description: ""}}
+	h.issues.result = service.IssueCreateResult{
+		Issue:          db.Issue{ID: uuidFromString(t, "77777777-7777-7777-7777-777777777777"), Number: 42, Title: "Snapshot me"},
+		AssignedTaskID: taskID,
+	}
+	if err := h.router.Handle(context.Background(), p2pMessage(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	calls := h.tasks.snapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected one delivery snapshot, got %d", len(calls))
+	}
+	if calls[0].TaskID != taskID || calls[0].SessionID != sessionID {
+		t.Fatalf("snapshot args mismatch: got %+v want task %v session %v", calls[0], taskID, sessionID)
+	}
+}
+
+func TestRouter_IssueCommand_SnapshotErrorDoesNotFailCreation(t *testing.T) {
+	h := newHarness(t)
+	taskID := uuidFromString(t, "bbbb1111-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	h.tasks.snapshotErr = errors.New("snapshot down")
+	h.binder.appendResult = AppendResult{DedupMarked: true, IssueCommand: &IssueCommand{Title: "Snapshot error", Description: ""}}
+	h.issues.result = service.IssueCreateResult{
+		Issue:          db.Issue{ID: uuidFromString(t, "77777777-7777-7777-7777-777777777777"), Number: 42, Title: "Snapshot error"},
+		AssignedTaskID: taskID,
+	}
+	if err := h.router.Handle(context.Background(), p2pMessage(t)); err != nil {
+		t.Fatalf("snapshot failure must not fail Handle: %v", err)
+	}
+	if !h.issues.called {
+		t.Fatal("issue must have been created despite snapshot error")
+	}
+	if len(h.tasks.snapshotCalls()) != 1 {
+		t.Fatalf("snapshot should have been attempted")
+	}
+	if !waitFor(time.Second, func() bool {
+		for _, r := range h.replier.calls() {
+			if r.IssueIdentifier == "MUL-42" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("expected issue-created reply despite snapshot error")
+	}
+}
+
+func TestRouter_IssueCommand_DuplicateDoesNotSnapshot(t *testing.T) {
+	h := newHarness(t)
+	h.binder.appendResult = AppendResult{
+		MessageID:   uuidFromString(t, "77777777-7777-4777-8777-777777777777"),
+		DedupMarked: true,
+		IssueCommand: &IssueCommand{
+			Title: "Existing issue",
+		},
+	}
+	duplicate := db.Issue{
+		ID:     uuidFromString(t, "88888888-8888-4888-8888-888888888888"),
+		Number: 44,
+		Title:  "Existing issue",
+	}
+	h.issues.result = service.IssueCreateResult{DuplicateIssue: &duplicate}
+	h.issues.err = service.ErrActiveDuplicate
+	if err := h.router.Handle(context.Background(), p2pMessage(t)); err != nil {
+		t.Fatalf("duplicate: %v", err)
+	}
+	if len(h.tasks.snapshotCalls()) != 0 {
+		t.Fatalf("duplicate must not snapshot delivery, got %d", len(h.tasks.snapshotCalls()))
 	}
 }

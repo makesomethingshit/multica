@@ -597,6 +597,22 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		// Same renderer the broadcast payload uses, so a degraded prefix can't
 		// show the chat "#42" while the realtime list shows "-42".
 		res.IssueIdentifier = service.IssueIdentifier(prefix, issueRes.Issue.Number)
+		// Snapshot the frozen channel route for the assigned issue task so a
+		// later task:completed can deliver the completion notification without
+		// live-resolving the (potentially rotated) binding. Best-effort:
+		// a missing binding fails closed and is warned without failing issue
+		// creation, which is already committed.
+		if deferredIssueTaskID.Valid && sessionID.Valid {
+			if err := r.tasks.SnapshotChannelTaskDelivery(ctx, deferredIssueTaskID, sessionID); err != nil {
+				r.logger.Warn("channel router: snapshot issue task delivery failed",
+					"channel_type", string(msg.Source.ChannelType),
+					"event_id", msg.EventID,
+					"issue_id", util.UUIDToString(issueRes.Issue.ID),
+					"task_id", util.UUIDToString(deferredIssueTaskID),
+					"error", err,
+				)
+			}
+		}
 		// IssueService.Create already enqueues the assigned agent's issue task.
 		// Scheduling the command as a chat run too makes the agent execute the
 		// same /issue input again. A synchronous issue command is terminal.
