@@ -2284,6 +2284,19 @@ func (s *TaskService) PromoteDeferredChannelIssueTask(ctx context.Context, taskI
 	return nil
 }
 
+// SnapshotChannelTaskDelivery persists a frozen channel route snapshot for an
+// issue task created via /issue. Chat tasks already snapshot via
+// EnqueueChannelChatTask; issue tasks must snapshot via the same
+// channel_task_delivery table so the existing outbound GetChannelTaskDelivery
+// fence and thread routing apply. Best-effort: a missing binding fails closed
+// and is logged without failing issue creation.
+func (s *TaskService) SnapshotChannelTaskDelivery(ctx context.Context, taskID, sessionID pgtype.UUID) error {
+	_, err := s.Queries.CreateChannelTaskDeliveryFromSession(ctx, db.CreateChannelTaskDeliveryFromSessionParams{
+		TaskID: taskID, ChatSessionID: sessionID,
+	})
+	return err
+}
+
 // DirectChatSendResult carries the rows a transactional direct-chat send
 // persisted, so the handler can broadcast the user message and shape its
 // response without re-reading them.
