@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1565,5 +1566,335 @@ func TestOpenclawExecuteAllowsCurrentVersion(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for result")
+	}
+}
+// -- openclaw capability-aware file transport --
+
+func TestBuildOpenclawArgsWithMessageFileOmitsMessageAndContainsFileFlag(t *testing.T) {
+	args := buildOpenclawArgsWithMessageFile("ses-file", "/tmp/message.txt", ExecOptions{
+		SystemPrompt: "ignore-me: file path already holds the combined prompt",
+	}, slog.Default())
+	if idx := indexOf(args, "--message"); idx != -1 {
+		t.Fatalf("--message must not appear when --message-file is used: %v", args)
+	}
+	mfIdx := indexOf(args, "--message-file")
+	if mfIdx == -1 || mfIdx+1 >= len(args) {
+		t.Fatalf("expected --message-file <path> in args: %v", args)
+	}
+	if args[mfIdx+1] != "/tmp/message.txt" {
+		t.Errorf("--message-file path: got %q, want %q", args[mfIdx+1], "/tmp/message.txt")
+	}
+	for _, want := range []string{"agent", "--json", "--session-id", "ses-file"} {
+		if indexOf(args, want) == -1 {
+			t.Errorf("expected %q in file-mode args: %v", want, args)
+		}
+	}
+}
+
+func TestBuildOpenclawArgsWithMessageFileRespectsGatewayAndFiltersBlocked(t *testing.T) {
+	args := buildOpenclawArgsWithMessageFile("ses-file-gw", "/tmp/m.txt", ExecOptions{
+		OpenclawMode: "gateway",
+		CustomArgs:   []string{"--local", "--message", "hijacked", "--message-file", "/tmp/evil.txt", "--agent", "from-custom"},
+	}, slog.Default())
+	if indexOf(args, "--local") != -1 {
+		t.Errorf("gateway file mode must not emit --local: %v", args)
+	}
+	if count := countOccurrences(args, "--message-file"); count != 1 {
+		t.Errorf("expected exactly one daemon --message-file, got %d: %v", count, args)
+	}
+	if count := countOccurrences(args, "--message"); count != 0 {
+		t.Errorf("expected no --message in file mode, got %d: %v", count, args)
+	}
+	if idx := indexOf(args, "--agent"); idx == -1 || args[idx+1] != "from-custom" {
+		t.Errorf("custom --agent should survive filtering: %v", args)
+	}
+}
+
+func TestWriteAndCleanupOpenclawMessageFileUTF8(t *testing.T) {
+	prompt := "hello \u2603 utf8: \u3053\u3093\u306b\u3061\u306f\nline2 with emoji \U0001f389"
+	path, err := writeOpenclawMessageFile(prompt)
+	if err != nil {
+		t.Fatalf("writeOpenclawMessageFile: %v", err)
+	}
+	defer cleanupOpenclawMessageFile(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read message file: %v", err)
+	}
+	if string(data) != prompt {
+		t.Errorf("file content mismatch: got %q, want %q", string(data), prompt)
+	}
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		t.Error("message file must not have a UTF-8 BOM")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Errorf("message file perms: got %04o, want 0600", info.Mode().Perm())
+	}
+	multi := "line1\nline2\n\nline4 with spaces  "
+	path2, err := writeOpenclawMessageFile(multi)
+	if err != nil {
+		t.Fatalf("write multiline: %v", err)
+	}
+	defer cleanupOpenclawMessageFile(path2)
+	data2, _ := os.ReadFile(path2)
+	if string(data2) != multi {
+		t.Errorf("multiline mismatch: got %q, want %q", string(data2), multi)
+	}
+	cleanupOpenclawMessageFile(path)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("cleanup did not remove %q: %v", path, err)
+	}
+}
+
+func TestOpenclawFiltersMessageFileCustomArg(t *testing.T) {
+	args := buildOpenclawArgs("task", "ses-mf", ExecOptions{
+		CustomArgs: []string{"--message-file", "/tmp/evil.txt", "--agent", "ok"},
+	}, slog.Default())
+	if count := countOccurrences(args, "--message-file"); count != 0 {
+		t.Errorf("--message-file should be blocked in inline mode: %v", args)
+	}
+	if count := countOccurrences(args, "--message"); count != 1 {
+		t.Errorf("expected daemon --message exactly once: %v", args)
+	}
+	if strings.Contains(strings.Join(args, " "), "/tmp/evil.txt") {
+		t.Errorf("custom --message-file value leaked: %v", args)
+	}
+}
+
+func TestProbeOpenclawMessageFileSupport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	t.Run("help advertises --message-file", func(t *testing.T) {
+		fakePath := filepath.Join(t.TempDir(), "openclaw")
+		script := "#!/bin/sh\n" +
+			"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\n" +
+			"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then\n" +
+			"  echo 'Usage: openclaw agent'; echo '  --message <text>'; echo '  --message-file <path>'; exit 0\n" +
+			"fi\n" +
+			"echo 'unexpected' >&2; exit 1\n"
+		writeTestExecutable(t, fakePath, []byte(script))
+		cmd := NewCommand(fakePath, nil)
+		supported, err := probeOpenclawMessageFileSupport(context.Background(), cmd)
+		if err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		if !supported {
+			t.Error("expected supported=true")
+		}
+	})
+	t.Run("help without --message-file", func(t *testing.T) {
+		fakePath := filepath.Join(t.TempDir(), "openclaw")
+		script := "#!/bin/sh\n" +
+			"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5'; exit 0; fi\n" +
+			"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then\n" +
+			"  echo 'Usage: openclaw agent'; echo '  --message <text>'; exit 0\n" +
+			"fi\n" +
+			"echo 'unexpected' >&2; exit 1\n"
+		writeTestExecutable(t, fakePath, []byte(script))
+		cmd := NewCommand(fakePath, nil)
+		supported, err := probeOpenclawMessageFileSupport(context.Background(), cmd)
+		if err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		if supported {
+			t.Error("expected supported=false")
+		}
+	})
+	t.Run("help command fails -> probe returns error", func(t *testing.T) {
+		fakePath := filepath.Join(t.TempDir(), "openclaw")
+		script := "#!/bin/sh\n" +
+			"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5'; exit 0; fi\n" +
+			"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then exit 127; fi\n" +
+			"exit 1\n"
+		writeTestExecutable(t, fakePath, []byte(script))
+		cmd := NewCommand(fakePath, nil)
+		_, err := probeOpenclawMessageFileSupport(context.Background(), cmd)
+		if err == nil {
+			t.Error("expected probe error on help failure")
+		}
+	})
+}
+
+func TestOpenclawExecuteLongPromptRejectsWithoutMessageFileSupport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5 c37871e'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: openclaw agent'; echo '  --message <text>'; exit 0; fi\n" +
+		"echo 'should not be reached for long prompt' >&2; exit 99\n"
+	writeTestExecutable(t, fakePath, []byte(script))
+	openclawMessageFileSupportCache = sync.Map{}
+	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	longPrompt := strings.Repeat("x", openclawMessageFileThreshold+1)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 5 * time.Second})
+	if err == nil {
+		t.Fatal("expected Execute to reject long prompt without --message-file, got nil")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "command line too long") {
+		t.Errorf("error must not be the raw OS message: %q", msg)
+	}
+	for _, want := range []string{"command-line limit", "--message-file", "openclaw update"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q: %q", want, msg)
+		}
+	}
+	if strings.Contains(msg, "openclaw returned no parseable output") {
+		t.Errorf("must not fall through to parse error: %q", msg)
+	}
+}
+
+func TestOpenclawExecuteShortPromptStillWorksWithoutMessageFileSupport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5 c37871e'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: openclaw agent'; echo '  --message <text>'; exit 0; fi\n" +
+		"exit 0\n"
+	writeTestExecutable(t, fakePath, []byte(script))
+	openclawMessageFileSupportCache = sync.Map{}
+	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "short prompt", ExecOptions{Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("short prompt should not be rejected: %v", err)
+	}
+	go func() { for range session.Messages {} }()
+	select {
+	case res := <-session.Result:
+		if strings.Contains(res.Error, "openclaw update") || strings.Contains(res.Error, "command-line limit") {
+			t.Errorf("short prompt hit long-prompt gate: %+v", res)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout waiting for result")
+	}
+}
+
+func TestOpenclawExecuteLongPromptViaMessageFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "openclaw")
+	argvPath := filepath.Join(dir, "argv.txt")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1 c0ffee'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: openclaw agent'; echo '  --message <text>'; echo '  --message-file <path>'; exit 0; fi\n" +
+		"printf '%s\n' \"$@\" > \"" + argvPath + "\"\n" +
+		"MF=\"\"; NEXT=0; for a in \"$@\"; do if [ \"$NEXT\" = 1 ]; then MF=\"$a\"; break; fi; if [ \"$a\" = \"--message-file\" ]; then NEXT=1; fi; done\n" +
+		"TEXT=\"\"; if [ -n \"$MF\" ] && [ -f \"$MF\" ]; then TEXT=$(cat \"$MF\"); fi\n" +
+		"ESC=$(printf '%s' \"$TEXT\" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '\"%s\"' \"$TEXT\")\n" +
+		"printf '{\"payloads\":[{\"text\":%s}],\"meta\":{\"durationMs\":1,\"agentMeta\":{\"sessionId\":\"ses-file-ok\"}}}' \"$ESC\"\n" +
+		"exit 0\n"
+	writeTestExecutable(t, fakePath, []byte(script))
+	openclawMessageFileSupportCache = sync.Map{}
+	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	longPrompt := "START-\u2603-utf8-" + strings.Repeat("x", 6000) + "\nline2 \U0001f389\nEND"
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("Execute with --message-file: %v", err)
+	}
+	var text string
+	go func() { for m := range session.Messages { if m.Type == MessageText { text += m.Content } } }()
+	result := <-session.Result
+	if result.Status != "completed" {
+		t.Fatalf("result: %+v", result)
+	}
+	if result.Output != longPrompt {
+		t.Errorf("output mismatch: got %d bytes, want %d", len(result.Output), len(longPrompt))
+	}
+	if text != longPrompt {
+		t.Errorf("streamed text mismatch: got %d bytes", len(text))
+	}
+	argvRaw, _ := os.ReadFile(argvPath)
+	argv := string(argvRaw)
+	if strings.Contains(argv, "START-\u2603") {
+		t.Errorf("prompt leaked into argv: %q", argv)
+	}
+	if !strings.Contains(argv, "--message-file") {
+		t.Errorf("expected --message-file in argv: %q", argv)
+	}
+	lines := strings.Split(argv, "\n")
+	for _, l := range lines { if strings.TrimSpace(l) == "--message" { t.Errorf("--message token leaked into argv in file mode: %q", argv) } }
+}
+
+func TestOpenclawExecuteGatewayLongPromptViaMessageFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "openclaw")
+	argvPath := filepath.Join(dir, "argv.txt")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo '--message-file <path>'; exit 0; fi\n" +
+		"printf '%s\n' \"$@\" > \"" + argvPath + "\"\n" +
+		"printf '{\"payloads\":[{\"text\":\"ok\"}],\"meta\":{}}'\n" +
+		"exit 0\n"
+	writeTestExecutable(t, fakePath, []byte(script))
+	openclawMessageFileSupportCache = sync.Map{}
+	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	longPrompt := strings.Repeat("g", openclawMessageFileThreshold+500)
+	session, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 10 * time.Second, OpenclawMode: "gateway"})
+	if err != nil {
+		t.Fatalf("gateway long prompt: %v", err)
+	}
+	go func() { for range session.Messages {} }()
+	<-session.Result
+	argvRaw, _ := os.ReadFile(argvPath)
+	argv := string(argvRaw)
+	if strings.Contains(argv, "--local") {
+		t.Errorf("gateway mode must not include --local even with --message-file: %q", argv)
+	}
+	if !strings.Contains(argv, "--message-file") {
+		t.Errorf("expected --message-file in gateway argv: %q", argv)
+	}
+}
+
+func TestOpenclawExecuteSystemPromptCombinedIntoMessageFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	dir := t.TempDir()
+	fakePath := filepath.Join(dir, "openclaw")
+	argvPath := filepath.Join(dir, "argv2.txt")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo '--message-file <path>'; exit 0; fi\n" +
+		"printf '%s\n' \"$@\" > \"" + argvPath + "\"\n" +
+		"MF=\"\"; NEXT=0; for a in \"$@\"; do if [ \"$NEXT\" = 1 ]; then MF=\"$a\"; break; fi; if [ \"$a\" = \"--message-file\" ]; then NEXT=1; fi; done\n" +
+		"if [ -n \"$MF\" ] && [ -f \"$MF\" ]; then cat \"$MF\" > \"" + filepath.Join(dir, "msg.txt") + "\"\n" +
+		"printf '{\"payloads\":[{\"text\":\"ok\"}],\"meta\":{}}'\n" +
+		"exit 0\n"
+	writeTestExecutable(t, fakePath, []byte(script))
+	openclawMessageFileSupportCache = sync.Map{}
+	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	session, err := backend.Execute(ctx, "user prompt", ExecOptions{Timeout: 10 * time.Second, SystemPrompt: "SYS"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	go func() { for range session.Messages {} }()
+	<-session.Result
+	data, _ := os.ReadFile(filepath.Join(dir, "msg.txt"))
+	if string(data) != "SYS\n\nuser prompt" {
+		t.Errorf("combined prompt mismatch: got %q", string(data))
 	}
 }
