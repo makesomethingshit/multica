@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
@@ -59,13 +60,11 @@ type AgentResponse struct {
 	// it with a bound-but-offline runtime (a different user story: reconnect the
 	// machine vs. pick a new one).
 	RuntimeBound bool `json:"runtime_bound"`
-	// RuntimeStatus and RuntimeLastSeenAt are the privacy-safe liveness
-	// projection for a runtime that may be hidden from the caller's runtime
-	// list. They deliberately carry no device, owner, configuration, or
-	// credential fields; clients use them only when the full runtime row is
-	// unavailable.
-	RuntimeStatus     string  `json:"runtime_status,omitempty"`
-	RuntimeLastSeenAt *string `json:"runtime_last_seen_at,omitempty"`
+	// RuntimeAvailability is the coarse liveness projection for a runtime that
+	// may be hidden from the caller's runtime list. It deliberately carries no
+	// timestamp, device, owner, configuration, or credential fields; clients
+	// use it only when the full runtime row is unavailable.
+	RuntimeAvailability string `json:"runtime_availability,omitempty"`
 	Name              string  `json:"name"`
 	Description       string  `json:"description"`
 	// Instructions is what this agent's owner wrote. For a system agent it
@@ -983,18 +982,18 @@ func computeTaskKind(t db.AgentTaskQueue) string {
 	return "direct"
 }
 
-// loadAgentRuntimeLiveness returns only the status fields needed to derive
+// loadAgentRuntimeAvailability returns only a coarse liveness bucket for
 // agent presence. Runtime rows are loaded internally even when the caller is
-// not allowed to list or inspect the private runtime; only the two redacted
-// fields are copied onto an agent response.
-func (h *Handler) loadAgentRuntimeLiveness(ctx context.Context, agents []db.Agent, workspaceID string) (map[string]db.AgentRuntime, error) {
+// not allowed to list or inspect the private runtime; no runtime fields are
+// copied onto an agent response.
+func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.Agent, workspaceID string, now time.Time) (map[string]string, error) {
 	runtimeIDs := make([]pgtype.UUID, 0, len(agents))
 	for _, agent := range agents {
 		if agent.RuntimeID.Valid {
 			runtimeIDs = append(runtimeIDs, agent.RuntimeID)
 		}
 	}
-	result := make(map[string]db.AgentRuntime, len(runtimeIDs))
+	result := make(map[string]string, len(runtimeIDs))
 	if len(runtimeIDs) == 0 {
 		return result, nil
 	}
@@ -1009,14 +1008,25 @@ func (h *Handler) loadAgentRuntimeLiveness(ctx context.Context, agents []db.Agen
 		if uuidToString(runtime.WorkspaceID) != workspaceID {
 			continue
 		}
-		result[uuidToString(runtime.ID)] = runtime
+		result[uuidToString(runtime.ID)] = deriveAgentRuntimeAvailability(runtime, now)
 	}
 	return result, nil
 }
 
-func applyAgentRuntimeLiveness(resp *AgentResponse, runtime db.AgentRuntime) {
-	resp.RuntimeStatus = runtime.Status
-	resp.RuntimeLastSeenAt = timestampToPtr(runtime.LastSeenAt)
+func deriveAgentRuntimeAvailability(runtime db.AgentRuntime, now time.Time) string {
+	status := pgtype.Text{String: runtime.Status, Valid: runtime.Status != ""}
+	switch deriveSquadMemberStatus(false, status, runtime.LastSeenAt, false, now) {
+	case "idle":
+		return "online"
+	case "unstable":
+		return "unstable"
+	default:
+		return "offline"
+	}
+}
+
+func applyAgentRuntimeAvailability(resp *AgentResponse, availability string) {
+	resp.RuntimeAvailability = availability
 }
 
 func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
@@ -1038,9 +1048,9 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to list agents")
 		return
 	}
-	runtimeLivenessByID, err := h.loadAgentRuntimeLiveness(r.Context(), agents, workspaceID)
+	runtimeAvailabilityByID, err := h.loadAgentRuntimeAvailability(r.Context(), agents, workspaceID, time.Now())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load agent runtime liveness")
+		writeError(w, http.StatusInternalServerError, "failed to load agent runtime availability")
 		return
 	}
 
@@ -1094,8 +1104,8 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		resp := h.agentToResponse(a)
-		if runtime, ok := runtimeLivenessByID[resp.RuntimeID]; ok {
-			applyAgentRuntimeLiveness(&resp, runtime)
+		if availability, ok := runtimeAvailabilityByID[resp.RuntimeID]; ok {
+			applyAgentRuntimeAvailability(&resp, availability)
 		}
 		applyInvocationTargetsToResponse(&resp, targets)
 		if skills, ok := skillMap[resp.ID]; ok {
@@ -1146,13 +1156,13 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := h.agentToResponse(agent)
-	runtimeLiveness, err := h.loadAgentRuntimeLiveness(r.Context(), []db.Agent{agent}, workspaceID)
+	runtimeAvailability, err := h.loadAgentRuntimeAvailability(r.Context(), []db.Agent{agent}, workspaceID, time.Now())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load agent runtime liveness")
+		writeError(w, http.StatusInternalServerError, "failed to load agent runtime availability")
 		return
 	}
-	if runtime, ok := runtimeLiveness[resp.RuntimeID]; ok {
-		applyAgentRuntimeLiveness(&resp, runtime)
+	if availability, ok := runtimeAvailability[resp.RuntimeID]; ok {
+		applyAgentRuntimeAvailability(&resp, availability)
 	}
 	if !h.enrichAgentResponseWithTargetsHTTP(w, r, &resp, agent.ID) {
 		return

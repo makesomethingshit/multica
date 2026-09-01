@@ -408,8 +408,7 @@ describe("buildPresenceMap", () => {
     const shared = makeAgent({
       id: "shared",
       runtime_id: "private-runtime",
-      runtime_status: "online",
-      runtime_last_seen_at: "2026-04-27T11:59:50Z",
+      runtime_availability: "online",
     });
     const map = buildPresenceMap({
       agents: [shared],
@@ -426,8 +425,7 @@ describe("buildPresenceMap", () => {
     const shared = makeAgent({
       id: "shared",
       runtime_id: "private-runtime",
-      runtime_status: "offline",
-      runtime_last_seen_at: "2026-04-27T11:59:00Z",
+      runtime_availability: "unstable",
     });
     const map = buildPresenceMap({
       agents: [shared],

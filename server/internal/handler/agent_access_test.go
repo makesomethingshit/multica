@@ -7,11 +7,42 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+func TestDeriveAgentRuntimeAvailability(t *testing.T) {
+	now := time.Date(2026, time.April, 27, 12, 0, 0, 0, time.UTC)
+	timestamp := func(at time.Time) pgtype.Timestamptz {
+		return pgtype.Timestamptz{Time: at, Valid: true}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		status string
+		seen   pgtype.Timestamptz
+		want   string
+	}{
+		{name: "online", status: "online", want: "online"},
+		{name: "recent loss", status: "offline", seen: timestamp(now.Add(-time.Minute)), want: "unstable"},
+		{name: "offline", status: "offline", seen: timestamp(now.Add(-10 * time.Minute)), want: "offline"},
+		{name: "missing heartbeat", status: "offline", want: "offline"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := deriveAgentRuntimeAvailability(db.AgentRuntime{
+				Status:     tc.status,
+				LastSeenAt: tc.seen,
+			}, now)
+			if got != tc.want {
+				t.Fatalf("deriveAgentRuntimeAvailability = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 // TestMemberAllowedToViewAgent_Pure exercises the pure predicate that drives
 // the private-agent VIEW gate. For a private agent it must allow:
@@ -191,11 +222,12 @@ func TestListAgents_FiltersPrivateForPlainMember(t *testing.T) {
 	}
 }
 
-// TestListAgents_SharedAgentCarriesPrivateRuntimeLiveness verifies the
+// TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability verifies the
 // privacy-safe bridge used by presence derivation: a member may see a shared
-// agent's runtime liveness even when that private runtime is absent from their
-// runtime list, but no runtime detail fields are added to the agent response.
-func TestListAgents_SharedAgentCarriesPrivateRuntimeLiveness(t *testing.T) {
+// agent's coarse runtime availability even when that private runtime is absent
+// from their runtime list, but no runtime detail fields are added to the agent
+// response.
+func TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -244,11 +276,8 @@ func TestListAgents_SharedAgentCarriesPrivateRuntimeLiveness(t *testing.T) {
 	if shared == nil {
 		t.Fatalf("shared agent %s missing from member list", agentID)
 	}
-	if shared.RuntimeStatus != "online" {
-		t.Fatalf("runtime_status = %q, want online", shared.RuntimeStatus)
-	}
-	if shared.RuntimeLastSeenAt == nil {
-		t.Fatal("runtime_last_seen_at is nil for live private runtime")
+	if shared.RuntimeAvailability != "online" {
+		t.Fatalf("runtime_availability = %q, want online", shared.RuntimeAvailability)
 	}
 	var wire []map[string]json.RawMessage
 	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
@@ -258,10 +287,19 @@ func TestListAgents_SharedAgentCarriesPrivateRuntimeLiveness(t *testing.T) {
 		if string(item["id"]) != strconv.Quote(agentID) {
 			continue
 		}
-		for _, field := range []string{"device_info", "metadata", "daemon_id"} {
+		for _, field := range []string{
+			"device_info",
+			"metadata",
+			"daemon_id",
+			"runtime_status",
+			"runtime_last_seen_at",
+		} {
 			if _, ok := item[field]; ok {
 				t.Errorf("agent response leaked runtime field %q", field)
 			}
+		}
+		if string(item["runtime_availability"]) != strconv.Quote("online") {
+			t.Errorf("runtime_availability = %s, want online", item["runtime_availability"])
 		}
 	}
 
@@ -274,8 +312,8 @@ func TestListAgents_SharedAgentCarriesPrivateRuntimeLiveness(t *testing.T) {
 	if err := json.Unmarshal(detailW.Body.Bytes(), &detail); err != nil {
 		t.Fatalf("decode GetAgent response: %v", err)
 	}
-	if detail.RuntimeStatus != "online" || detail.RuntimeLastSeenAt == nil {
-		t.Fatalf("GetAgent liveness = (%q, %v), want online with timestamp", detail.RuntimeStatus, detail.RuntimeLastSeenAt)
+	if detail.RuntimeAvailability != "online" {
+		t.Fatalf("GetAgent runtime_availability = %q, want online", detail.RuntimeAvailability)
 	}
 }
 

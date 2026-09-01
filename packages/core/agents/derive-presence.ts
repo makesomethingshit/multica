@@ -21,14 +21,16 @@ import type {
 
 type RuntimeLiveness = Pick<AgentRuntime, "status" | "last_seen_at">;
 
-function runtimeLivenessFromAgent(agent: Agent): RuntimeLiveness | null {
-  if (agent.runtime_status !== "online" && agent.runtime_status !== "offline") {
+function runtimeAvailabilityFromAgent(agent: Agent): AgentAvailability | null {
+  const availability = agent.runtime_availability;
+  if (
+    availability !== "online" &&
+    availability !== "unstable" &&
+    availability !== "offline"
+  ) {
     return null;
   }
-  return {
-    status: agent.runtime_status,
-    last_seen_at: agent.runtime_last_seen_at ?? null,
-  };
+  return availability;
 }
 
 // AgentAvailability mirrors RuntimeHealth's reachability buckets but folds
@@ -120,10 +122,9 @@ export function deriveAgentPresenceDetail(input: DerivePresenceInput): AgentPres
     };
   }
 
-  const availability = deriveAgentAvailability(
-    input.runtime ?? runtimeLivenessFromAgent(input.agent),
-    input.now,
-  );
+  const availability = input.runtime
+    ? deriveAgentAvailability(input.runtime, input.now)
+    : runtimeAvailabilityFromAgent(input.agent) ?? "offline";
   const detail = deriveWorkloadDetail(input.tasks);
 
   return {

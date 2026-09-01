@@ -150,8 +150,7 @@ describe("AgentActivityHoverContent", () => {
       {
         id: "agent-1",
         runtime_id: "private-runtime",
-        runtime_status: "online",
-        runtime_last_seen_at: "2026-06-08T07:59:50Z",
+        runtime_availability: "online",
       } as Agent,
     ];
 
