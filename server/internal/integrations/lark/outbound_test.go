@@ -34,6 +34,10 @@ type fakePatcherQueries struct {
 	created             []CreateOutboundCardMessageParams
 	createReturn        OutboundCardMessage
 	statusUpdates       []UpdateOutboundCardStatusParams
+	issue               db.Issue
+	issueErr            error
+	workspace           db.Workspace
+	workspaceErr        error
 }
 
 func (f *fakePatcherQueries) GetAgentTask(ctx context.Context, id pgtype.UUID) (db.AgentTaskQueue, error) {
@@ -83,6 +87,12 @@ func (f *fakePatcherQueries) UpdateLarkOutboundCardStatus(ctx context.Context, a
 	defer f.mu.Unlock()
 	f.statusUpdates = append(f.statusUpdates, arg)
 	return nil
+}
+func (f *fakePatcherQueries) GetIssue(ctx context.Context, id pgtype.UUID) (db.Issue, error) {
+	return f.issue, f.issueErr
+}
+func (f *fakePatcherQueries) GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error) {
+	return f.workspace, f.workspaceErr
 }
 
 type fakeCredentials struct{ secret string }
@@ -857,7 +867,7 @@ func TestPatcherClearsTypingOnTaskCancelled(t *testing.T) {
 	}
 }
 
-// Deleting a chat session cancels its queued turns and deletes the Lark binding
+	// Deleting a chat session cancels its queued turns and deletes the Lark binding
 // in one transaction, then broadcasts the cancels after that transaction
 // commits. By the time the Patcher sees them the binding row is gone, so every
 // step that reads it — the Patcher's own lookup and the credential resolution
@@ -916,5 +926,191 @@ func TestPatcherClearsTypingAfterSessionDeleteRemovedTheBinding(t *testing.T) {
 	if len(api.sent) != 0 || len(api.textSent) != 0 || len(api.patched) != 0 {
 		t.Errorf("a cancelled run must post nothing; sent=%d textSent=%d patched=%d",
 			len(api.sent), len(api.textSent), len(api.patched))
+	}
+}
+
+func TestPatcherIssueCompleted_SendsToOriginatingGroup(t *testing.T) {
+	p, q, api := newTestPatcher(t)
+	taskID := uuidFromString(t, "eeaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	issueID := uuidFromString(t, "ffaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	q.task = db.AgentTaskQueue{ID: taskID, IssueID: issueID}
+	q.delivery = db.ChannelTaskDelivery{
+		TaskID: taskID, BindingID: uuidFromString(t, "bb111111-bb11-bb11-bb11-bbbbbbbbbbbb"),
+		InstallationID: q.installation.ID, ChannelType: channelTypeFeishu,
+		ChannelChatID: "oc_group_chat", ChatType: "group",
+		ChannelMessageID: pgtype.Text{String: "om_origin", Valid: true},
+	}
+	q.issue = db.Issue{ID: issueID, WorkspaceID: uuidFromString(t, "22222222-2222-2222-2222-222222222222"), Number: 42, Title: "Fix login"}
+	q.workspace = db.Workspace{IssuePrefix: "MUL"}
+
+	p.handleEvent(events.Event{
+		Type:   protocol.EventTaskCompleted,
+		TaskID: uuidString(taskID),
+		Payload: map[string]any{
+			"task_id":  uuidString(taskID),
+			"issue_id": uuidString(issueID),
+			"status":   "completed",
+		},
+	})
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.textSent) != 1 {
+		t.Fatalf("issue completed must send one text message; got %d", len(api.textSent))
+	}
+	got := api.textSent[0]
+	if got.ChatID != "oc_group_chat" {
+		t.Errorf("chat_id = %q, want oc_group_chat", got.ChatID)
+	}
+	if !strings.Contains(got.Text, "MUL-42") || !strings.Contains(got.Text, "Fix login") {
+		t.Errorf("completion text must contain identifier and title; got %q", got.Text)
+	}
+	if !strings.Contains(got.Text, "✅ Completed") {
+		t.Errorf("completion text must carry checkmark; got %q", got.Text)
+	}
+	if got.ReplyTarget.IsSet() {
+		t.Errorf("group non-thread completion must be chat-level; got %+v", got.ReplyTarget)
+	}
+}
+
+func TestPatcherIssueCompleted_ThreadedGroup(t *testing.T) {
+	p, q, api := newTestPatcher(t)
+	taskID := uuidFromString(t, "eebbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	issueID := uuidFromString(t, "ffbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	q.task = db.AgentTaskQueue{ID: taskID, IssueID: issueID}
+	q.delivery = db.ChannelTaskDelivery{
+		TaskID: taskID, BindingID: uuidFromString(t, "bb222222-bb22-bb22-bb22-bbbbbbbbbbbb"),
+		InstallationID: q.installation.ID, ChannelType: channelTypeFeishu,
+		ChannelChatID: "oc_group_chat:omt_topic", ChatType: "group",
+		ChannelMessageID: pgtype.Text{String: "om_thread_trigger", Valid: true},
+		ChannelThreadID:  pgtype.Text{String: "omt_topic", Valid: true},
+		Config:           []byte(`{"chat_id":"oc_group_chat"}`),
+	}
+	q.issue = db.Issue{ID: issueID, WorkspaceID: uuidFromString(t, "22222222-2222-2222-2222-222222222222"), Number: 44, Title: "Threaded"}
+	q.workspace = db.Workspace{IssuePrefix: "MUL"}
+
+	p.handleEvent(events.Event{
+		Type:   protocol.EventTaskCompleted,
+		TaskID: uuidString(taskID),
+		Payload: map[string]any{
+			"task_id":  uuidString(taskID),
+			"issue_id": uuidString(issueID),
+			"status":   "completed",
+		},
+	})
+
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.textSent) != 1 {
+		t.Fatalf("threaded issue completed must send one message; got %d", len(api.textSent))
+	}
+	got := api.textSent[0]
+	if got.ChatID != "oc_group_chat" {
+		t.Errorf("chat_id = %q, want real chat_id from config", got.ChatID)
+	}
+	if got.ReplyTarget.MessageID != "om_thread_trigger" || !got.ReplyTarget.InThread {
+		t.Errorf("expected thread reply target {om_thread_trigger InThread:true}, got %+v", got.ReplyTarget)
+	}
+}
+
+func TestPatcherIssueCompleted_DropsChatTask(t *testing.T) {
+	p, q, api := newTestPatcher(t)
+	taskID := uuidFromString(t, "eecccccc-cccc-cccc-cccc-cccccccccccc")
+	// Chat task: has ChatSessionID
+	q.task = db.AgentTaskQueue{ID: taskID, ChatSessionID: q.binding.ChatSessionID}
+	q.delivery = db.ChannelTaskDelivery{
+		TaskID: taskID, BindingID: q.binding.ID, InstallationID: q.installation.ID,
+		ChannelType: channelTypeFeishu, ChannelChatID: q.binding.ChannelChatID, ChatType: q.binding.ChatType,
+	}
+	p.handleEvent(events.Event{
+		Type:   protocol.EventTaskCompleted,
+		TaskID: uuidString(taskID),
+		Payload: map[string]any{
+			"task_id":         uuidString(taskID),
+			"chat_session_id": uuidString(q.binding.ChatSessionID),
+			"status":          "completed",
+		},
+	})
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.textSent) != 0 || len(api.sent) != 0 {
+		t.Fatalf("chat task TaskCompleted must be dropped to avoid double-send; got text=%d card=%d", len(api.textSent), len(api.sent))
+	}
+}
+
+func TestPatcherIssueCompleted_DropsWebIssue(t *testing.T) {
+	p, q, api := newTestPatcher(t)
+	taskID := uuidFromString(t, "eedddddd-dddd-dddd-dddd-dddddddddddd")
+	issueID := uuidFromString(t, "ffdddddd-dddd-dddd-dddd-dddddddddddd")
+	q.task = db.AgentTaskQueue{ID: taskID, IssueID: issueID}
+	q.deliveryErr = pgx.ErrNoRows
+	q.issue = db.Issue{ID: issueID, WorkspaceID: uuidFromString(t, "22222222-2222-2222-2222-222222222222"), Number: 7}
+	p.handleEvent(events.Event{
+		Type:   protocol.EventTaskCompleted,
+		TaskID: uuidString(taskID),
+		Payload: map[string]any{
+			"task_id":  uuidString(taskID),
+			"issue_id": uuidString(issueID),
+			"status":   "completed",
+		},
+	})
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.textSent) != 0 || len(api.sent) != 0 {
+		t.Fatalf("web issue without delivery must not send; got text=%d card=%d", len(api.textSent), len(api.sent))
+	}
+}
+
+func TestPatcherIssueCompleted_DropsWrongChannel(t *testing.T) {
+	p, q, api := newTestPatcher(t)
+	taskID := uuidFromString(t, "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+	issueID := uuidFromString(t, "ffeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+	q.task = db.AgentTaskQueue{ID: taskID, IssueID: issueID}
+	q.delivery = db.ChannelTaskDelivery{
+		TaskID: taskID, BindingID: uuidFromString(t, "bb333333-bb33-bb33-bb33-bbbbbbbbbbbb"),
+		InstallationID: q.installation.ID, ChannelType: "slack",
+		ChannelChatID: "C123", ChatType: "group",
+	}
+	p.handleEvent(events.Event{
+		Type:   protocol.EventTaskCompleted,
+		TaskID: uuidString(taskID),
+		Payload: map[string]any{
+			"task_id":  uuidString(taskID),
+			"issue_id": uuidString(issueID),
+			"status":   "completed",
+		},
+	})
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.textSent) != 0 || len(api.sent) != 0 {
+		t.Fatalf("wrong channel delivery must not be consumed by lark; got text=%d card=%d", len(api.textSent), len(api.sent))
+	}
+}
+
+func TestPatcherIssueCompleted_DropsRevokedInstallation(t *testing.T) {
+	p, q, api := newTestPatcher(t)
+	taskID := uuidFromString(t, "eeffffff-ffff-ffff-ffff-ffffffffffff")
+	issueID := uuidFromString(t, "ffff0000-ffff-ffff-ffff-ffffffffffff")
+	q.task = db.AgentTaskQueue{ID: taskID, IssueID: issueID}
+	q.delivery = db.ChannelTaskDelivery{
+		TaskID: taskID, BindingID: uuidFromString(t, "bb444444-bb44-bb44-bb44-bbbbbbbbbbbb"),
+		InstallationID: q.installation.ID, ChannelType: channelTypeFeishu,
+		ChannelChatID: "oc_group_chat", ChatType: "group",
+	}
+	q.installation.Status = "revoked"
+	q.issue = db.Issue{ID: issueID, WorkspaceID: uuidFromString(t, "22222222-2222-2222-2222-222222222222"), Number: 8}
+	p.handleEvent(events.Event{
+		Type:   protocol.EventTaskCompleted,
+		TaskID: uuidString(taskID),
+		Payload: map[string]any{
+			"task_id":  uuidString(taskID),
+			"issue_id": uuidString(issueID),
+			"status":   "completed",
+		},
+	})
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.textSent) != 0 || len(api.sent) != 0 {
+		t.Fatalf("revoked installation must not send; got text=%d card=%d", len(api.textSent), len(api.sent))
 	}
 }

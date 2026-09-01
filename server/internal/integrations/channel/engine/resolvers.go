@@ -422,6 +422,7 @@ type TaskEnqueuer interface {
 	FinalizeChatTaskEnqueue(ctx context.Context, task db.AgentTaskQueue)
 	PromoteChannelChatTasksIfMediaReady(ctx context.Context, sessionID pgtype.UUID) error
 	PromoteDeferredChannelIssueTask(ctx context.Context, taskID pgtype.UUID) error
+	SnapshotChannelTaskDelivery(ctx context.Context, taskID, sessionID pgtype.UUID) error
 }
 
 // SessionReader reads the rows the debounced flush + /issue identifier need.
