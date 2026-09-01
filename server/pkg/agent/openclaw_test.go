@@ -1867,6 +1867,55 @@ func TestOpenclawExecuteGatewayLongPromptViaMessageFile(t *testing.T) {
 	}
 }
 
+func TestOpenclawMessageFileSupportCacheDoesNotPinFalse(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fixture is POSIX-only")
+	}
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	argvPath := filepath.Join(t.TempDir(), "argv-cache.txt")
+	unsupported := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: openclaw agent'; echo '  --message <text>'; exit 0; fi\n" +
+		"printf '%s\\n' \"$@\" > \"" + argvPath + "\"\n" +
+		"printf '{\"payloads\":[{\"text\":\"ok\"}],\"meta\":{}}'\n"
+	writeTestExecutable(t, fakePath, []byte(unsupported))
+	openclawMessageFileSupportCache = sync.Map{}
+	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	longPrompt := strings.Repeat("x", openclawMessageFileThreshold+500)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 10 * time.Second})
+	if err == nil {
+		t.Fatalf("expected rejection on first run (unsupported)")
+	}
+	if _, ok := openclawMessageFileSupportCache.Load(fakePath); ok {
+		t.Fatalf("false probe must not be cached; got entry for %q", fakePath)
+	}
+	// In-place upgrade: same path now advertises --message-file.
+	supported := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo '--message-file <path>'; exit 0; fi\n" +
+		"printf '%s\\n' \"$@\" > \"" + argvPath + "\"\n" +
+		"MF=\"\"; NEXT=0; for a in \"$@\"; do if [ \"$NEXT\" = 1 ]; then MF=\"$a\"; break; fi; if [ \"$a\" = \"--message-file\" ]; then NEXT=1; fi; done\n" +
+		"if [ -n \"$MF\" ] && [ -f \"$MF\" ]; then cat \"$MF\" > \"" + filepath.Join(filepath.Dir(argvPath), "msg2.txt") + "\"\n" +
+		"printf '{\"payloads\":[{\"text\":\"ok\"}],\"meta\":{}}'\n" +
+		"exit 0\n"
+	writeTestExecutable(t, fakePath, []byte(supported))
+	session, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatalf("expected Execute to succeed after in-place upgrade on same path: %v", err)
+	}
+	go func() { for range session.Messages {} }()
+	<-session.Result
+	argvRaw, _ := os.ReadFile(argvPath)
+	if !strings.Contains(string(argvRaw), "--message-file") {
+		t.Fatalf("expected --message-file after upgrade; argv=%q", string(argvRaw))
+	}
+	if v, ok := openclawMessageFileSupportCache.Load(fakePath); !ok || !v.(bool) {
+		t.Fatalf("expected cached true after successful probe")
+	}
+}
+
 func TestOpenclawExecuteSystemPromptCombinedIntoMessageFile(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script fixture is POSIX-only")

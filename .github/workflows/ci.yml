@@ -629,6 +629,20 @@ jobs:
         # that stops matching) is visible in the log instead of passing as "ok".
         run: go test ./pkg/agent -v -run '^(TestCursorExecutePromptSurvivesPowerShellShim|TestPiExecutePromptSurvivesPowerShellShim|TestQwenExecutePromptSurvivesPowerShellShim|TestPlatformCursorInvocation|TestPlatformCopilotInvocation|TestPlatformPiInvocation|TestPlatformQwenInvocation)' -count=1 -timeout=5m
 
+      - name: Test Windows OpenClaw long prompt via --message-file on .cmd shim
+        if: ${{ needs.changes.outputs.backend == 'true' }}
+        working-directory: server
+        # The OpenClaw fix (PUCK-112) moves long prompts off argv onto
+        # --message-file so a Windows .cmd shim never sees a command line past
+        # either the cmd.exe 8191-char or the CreateProcess 32767-char limit.
+        # Only a real cmd.exe host proves the file transport through the shim:
+        # that a 6KB+ UTF-8 prompt (including multi-byte) survives, that argv
+        # on the native child contains --message-file and no prompt fragment,
+        # and that the temp file is removed after the run. Scoped to the
+        # windows-tagged test by exact name; -v so a skip is visible in the
+        # log instead of passing silently as "ok".
+        run: go test ./pkg/agent -v -run '^TestOpenclawExecuteLongPromptViaMessageFileOnWindowsShim$' -count=1 -timeout=5m
+
       - name: Test Windows OpenCode oversized prompt reaches stdin
         if: ${{ needs.changes.outputs.backend == 'true' }}
         working-directory: server

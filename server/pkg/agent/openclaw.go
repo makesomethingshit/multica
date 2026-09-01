@@ -58,12 +58,17 @@ const openclawMessageFileThreshold = 8000
 
 // openclawMessageFileSupportCache caches per-executable probe results for
 // `openclaw agent --help` containing --message-file. Key is runtimeCmd.Path.
+// Only positive (true) results are cached — a false from an older build must
+// not outlive an in-place upgrade on the same path (otherwise a long prompt
+// stays rejected until the daemon restarts).
 var openclawMessageFileSupportCache sync.Map // map[string]bool
 
 // isOpenclawMessageFileSupported reports whether the cached probe for runtimeCmd
 // indicates --message-file is available. Uncached executables are probed via
 // `openclaw agent --help`; probe errors are treated as unknown (false) and
-// not cached so a later retry can succeed after an upgrade.
+// not cached so a later retry can succeed after an upgrade. Only true is
+// cached, so an in-place `openclaw update` on the same path is observed on
+// the next call.
 func isOpenclawMessageFileSupported(ctx context.Context, runtimeCmd Command) bool {
 	if v, ok := openclawMessageFileSupportCache.Load(runtimeCmd.Path); ok {
 		return v.(bool)
@@ -76,7 +81,9 @@ func isOpenclawMessageFileSupported(ctx context.Context, runtimeCmd Command) boo
 		}
 		return false
 	}
-	openclawMessageFileSupportCache.Store(runtimeCmd.Path, supported)
+	if supported {
+		openclawMessageFileSupportCache.Store(runtimeCmd.Path, true)
+	}
 	return supported
 }
 
