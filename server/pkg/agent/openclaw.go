@@ -12,9 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -40,88 +40,23 @@ var openclawVersionPattern = regexp.MustCompile(`(\d+)\.(\d+)\.(\d+)`)
 // openclawBlockedArgs are flags hardcoded by the daemon that must not be
 // overridden by user-configured custom_args.
 var openclawBlockedArgs = map[string]blockedArgMode{
-	"--local":        blockedStandalone, // local mode for daemon execution
-	"--json":         blockedStandalone, // JSON output for daemon communication
-	"--session-id":   blockedWithValue,  // managed by daemon for session resumption
-	"--message":      blockedWithValue,  // prompt is set by daemon
-	"-m":             blockedWithValue,  // alias for --message
-	"--message-file": blockedWithValue,  // prompt file is set by daemon when --message-file is supported
-	"--model":        blockedWithValue,  // openclaw agent does not accept --model; model is bound at registration via `openclaw agents add/update --model`
-	"--system-prompt": blockedWithValue, // openclaw agent does not accept --system-prompt; instructions are injected into --message
+	"--local":         blockedStandalone, // local mode for daemon execution
+	"--json":          blockedStandalone, // JSON output for daemon communication
+	"--session-id":    blockedWithValue,  // managed by daemon for session resumption
+	"--message":       blockedWithValue,  // prompt is set by daemon
+	"-m":              blockedWithValue,  // alias for --message
+	"--message-file":  blockedWithValue,  // prompt file is set by daemon when --message-file is supported
+	"--model":         blockedWithValue,  // openclaw agent does not accept --model; model is bound at registration via `openclaw agents add/update --model`
+	"--system-prompt": blockedWithValue,  // openclaw agent does not accept --system-prompt; instructions are injected into --message
 }
 
-// openclawMessageFileThreshold is the byte length above which a prompt is
-// considered "long" for Windows argv purposes. 8191 is the cmd.exe limit
-// for .cmd shims; 32767 is the CreateProcess limit. A conservative 8000
-// leaves headroom for the remaining argv while still catching any prompt
-// that would overflow a shim before the OS reports "command line too long".
-const openclawMessageFileThreshold = 8000
-
-// openclawMessageFileSupportCache caches per-executable+version probe results
-// for `openclaw agent --help` containing --message-file. Key is
-// openclawMessageFileCacheKey(runtimeCmd, version). Only positive (true) results
-// are cached — a false from an older build must not outlive an in-place
-// upgrade on the same path (otherwise a long prompt stays rejected until the
-// daemon restarts), and a cached true must not survive a downgrade or a
-// PATH/symlink swap to a different binary.
-var openclawMessageFileSupportCache sync.Map // map[string]bool
-
-func openclawMessageFileCacheKey(runtimeCmd Command, version string) string {
-	return runtimeCmd.cacheKey() + "\x00" + version
-}
-
-func probeOpenclawVersionString(ctx context.Context, runtimeCmd Command) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, detectVersionTimeout)
-	defer cancel()
-	cmd := runtimeCmd.exec(ctx, "--version")
-	hideAgentWindow(cmd)
-	cmd.WaitDelay = 2 * time.Second
-	data, err := combinedOutputOwned(cmd, runtimeCmd.logger)
-	out := string(data)
-	ver, ok := parseOpenclawVersion(out)
-	if err != nil {
-		if ok && errors.Is(err, exec.ErrWaitDelay) {
-			if runtimeCmd.logger != nil {
-				runtimeCmd.logger.Warn("agent: CLI answered version but left pipes open; using answer", "command", runtimeCmd.String(), "probe", "openclaw --version")
-			}
-			return ver, nil
-		}
-		return "", err
-	}
-	if !ok {
-		return "", fmt.Errorf("could not parse openclaw version from output: %q", strings.TrimSpace(out))
-	}
-	return ver, nil
-}
-
-// isOpenclawMessageFileSupported reports whether the probe for runtimeCmd
-// indicates --message-file is available. The cache is keyed by
-// executable identity (runtimeCmd.cacheKey) plus the detected version, so a
-// downgrade, symlink swap, or PATH change invalidates a stale true.
-// Probe errors are treated as unknown (false) and not cached so a later
-// retry can succeed after an upgrade. Only true+version is cached, so an
-// in-place `openclaw update` on the same path is observed on the next call.
-func isOpenclawMessageFileSupported(ctx context.Context, runtimeCmd Command) bool {
-	version, err := probeOpenclawVersionString(ctx, runtimeCmd)
-	if err != nil {
-		supported, pErr := probeOpenclawMessageFileSupport(ctx, runtimeCmd)
-		if pErr != nil {
-			return false
-		}
-		return supported
-	}
-	key := openclawMessageFileCacheKey(runtimeCmd, version)
-	if v, ok := openclawMessageFileSupportCache.Load(key); ok {
-		return v.(bool)
-	}
-	supported, err := probeOpenclawMessageFileSupport(ctx, runtimeCmd)
-	if err != nil {
+func isWindowsCommandShim(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".cmd", ".bat":
+		return true
+	default:
 		return false
 	}
-	if supported {
-		openclawMessageFileSupportCache.Store(key, true)
-	}
-	return supported
 }
 
 // probeOpenclawMessageFileSupport runs `openclaw agent --help` and reports
@@ -186,7 +121,8 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	if execPath == "" {
 		execPath = "openclaw"
 	}
-	if _, err := exec.LookPath(execPath); err != nil {
+	lookedUp, err := exec.LookPath(execPath)
+	if err != nil {
 		return nil, fmt.Errorf("openclaw executable not found at %q: %w", execPath, err)
 	}
 
@@ -205,19 +141,14 @@ func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	if opts.SystemPrompt != "" {
 		finalPrompt = opts.SystemPrompt + "\n\n" + prompt
 	}
-	supportsFile := isOpenclawMessageFileSupported(ctx, b.cfg.commandAt(execPath))
-	isLong := len(finalPrompt) > openclawMessageFileThreshold
-	if isLong && !supportsFile {
-		cancel()
-		return nil, fmt.Errorf("prompt is %d bytes and exceeds the Windows command-line limit for %q; "+
-			"this openclaw build does not support --message-file. "+
-			"Upgrade to openclaw >= 2026.7.1-2 (`openclaw update`) to send long prompts via --message-file, "+
-			"or shorten the task prompt", len(finalPrompt), execPath)
+	useMessageFile := false
+	if runtime.GOOS == "windows" && isWindowsCommandShim(lookedUp) {
+		supported, err := probeOpenclawMessageFileSupport(ctx, b.cfg.commandAt(execPath))
+		useMessageFile = err == nil && supported
 	}
 	var messageFilePath string
 	var args []string
-	if supportsFile {
-		var err error
+	if useMessageFile {
 		messageFilePath, err = writeOpenclawMessageFile(finalPrompt)
 		if err != nil {
 			cancel()
