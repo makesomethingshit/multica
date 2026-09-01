@@ -1743,57 +1743,32 @@ func TestOpenclawExecuteLongPromptRejectsWithoutMessageFileSupport(t *testing.T)
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script fixture is POSIX-only")
 	}
-	// Use explicit shim-path semantics so the threshold matches the
-	// Windows .cmd boundary even on Linux: openclaw.cmd is rejected at
-	// 6000 while a bare "openclaw" binary keeps the 30000 native
-	// fallback. See openclawShimThreshold / openclawNativeThreshold.
-	for _, tc := range []struct {
-		name         string
-		suffix       string
-		wantRejected bool
-		promptLen    int
-	}{
-		{"shim is rejected at ~6.2KB without --message-file", ".cmd", true, openclawShimThreshold + 1},
-		{"shim at reproduction size 6200 is rejected without --message-file", ".cmd", true, 6200},
-		{"shim just below 6000 is not rejected without --message-file", ".cmd", false, 5999},
-		{"native 6200 is not rejected without --message-file (POSIX inline fallback)", "", false, 6200},
-		{"native only rejected past 30000 without --message-file", "", true, openclawNativeThreshold + 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fakePath := filepath.Join(t.TempDir(), "openclaw"+tc.suffix)
-			script := "#!/bin/sh\n" +
-				"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5 c37871e'; exit 0; fi\n" +
-				"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: openclaw agent'; echo '  --message <text>'; exit 0; fi\n" +
-				"echo 'should not be reached for long prompt' >&2; exit 99\n"
-			writeTestExecutable(t, fakePath, []byte(script))
-			openclawMessageFileSupportCache = sync.Map{}
-			backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
-			longPrompt := strings.Repeat("x", tc.promptLen)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			_, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 5 * time.Second})
-			if tc.wantRejected {
-				if err == nil {
-					t.Fatal("expected Execute to reject without --message-file, got nil")
-				}
-				msg := err.Error()
-				if strings.Contains(msg, "command line too long") {
-					t.Errorf("error must not be the raw OS message: %q", msg)
-				}
-				for _, want := range []string{"command-line limit", "--message-file", "openclaw update"} {
-					if !strings.Contains(msg, want) {
-						t.Errorf("error missing %q: %q", want, msg)
-					}
-				}
-				if strings.Contains(msg, "openclaw returned no parseable output") {
-					t.Errorf("must not fall through to parse error: %q", msg)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("expected inline fallback, got rejection: %v", err)
-				}
-			}
-		})
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5 c37871e'; exit 0; fi\n" +
+		"if [ \"$1\" = \"agent\" ] && [ \"$2\" = \"--help\" ]; then echo 'Usage: openclaw agent'; echo '  --message <text>'; exit 0; fi\n" +
+		"echo 'should not be reached for long prompt' >&2; exit 99\n"
+	writeTestExecutable(t, fakePath, []byte(script))
+	openclawMessageFileSupportCache = sync.Map{}
+	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
+	longPrompt := strings.Repeat("x", openclawMessageFileThreshold+1)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 5 * time.Second})
+	if err == nil {
+		t.Fatal("expected Execute to reject long prompt without --message-file, got nil")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "command line too long") {
+		t.Errorf("error must not be the raw OS message: %q", msg)
+	}
+	for _, want := range []string{"command-line limit", "--message-file", "openclaw update"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q: %q", want, msg)
+		}
+	}
+	if strings.Contains(msg, "openclaw returned no parseable output") {
+		t.Errorf("must not fall through to parse error: %q", msg)
 	}
 }
 
@@ -1831,10 +1806,7 @@ func TestOpenclawExecuteLongPromptViaMessageFile(t *testing.T) {
 		t.Skip("shell-script fixture is POSIX-only")
 	}
 	dir := t.TempDir()
-	// Name with .cmd so the 6000 shim threshold fires on Linux too;
-	// bare "openclaw" would hit the 30000 native threshold and keep
-	// --message fallback for this ~6.5KB prompt.
-	fakePath := filepath.Join(dir, "openclaw.cmd")
+	fakePath := filepath.Join(dir, "openclaw")
 	argvPath := filepath.Join(dir, "argv.txt")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1 c0ffee'; exit 0; fi\n" +
@@ -1848,10 +1820,7 @@ func TestOpenclawExecuteLongPromptViaMessageFile(t *testing.T) {
 	writeTestExecutable(t, fakePath, []byte(script))
 	openclawMessageFileSupportCache = sync.Map{}
 	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
-	// Construct a prompt strictly above the shim threshold (6000) so the
-	// capability-aware path uses --message-file on Linux via the .cmd-like
-	// fixture — mirrors Windows openclaw.cmd at the 6.2KB repro size.
-	longPrompt := "START-\u2603-utf8-" + strings.Repeat("x", openclawShimThreshold) + "\nline2 \U0001f389\nEND"
+	longPrompt := "START-\u2603-utf8-" + strings.Repeat("x", 6000) + "\nline2 \U0001f389\nEND"
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	session, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 10 * time.Second})
@@ -1904,9 +1873,7 @@ func TestOpenclawExecuteGatewayLongPromptViaMessageFile(t *testing.T) {
 		t.Skip("shell-script fixture is POSIX-only")
 	}
 	dir := t.TempDir()
-	// Use .cmd shim so 6000 threshold fires on Linux too and the
-	// --message-file path is exercised without needing 30KB.
-	fakePath := filepath.Join(dir, "openclaw.cmd")
+	fakePath := filepath.Join(dir, "openclaw")
 	argvPath := filepath.Join(dir, "argv.txt")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\n" +
@@ -1919,7 +1886,7 @@ func TestOpenclawExecuteGatewayLongPromptViaMessageFile(t *testing.T) {
 	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	longPrompt := strings.Repeat("g", openclawShimThreshold+500)
+	longPrompt := strings.Repeat("g", openclawMessageFileThreshold+500)
 	session, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 10 * time.Second, OpenclawMode: "gateway"})
 	if err != nil {
 		t.Fatalf("gateway long prompt: %v", err)
@@ -1940,9 +1907,7 @@ func TestOpenclawMessageFileSupportCacheDoesNotPinFalse(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script fixture is POSIX-only")
 	}
-	// Use explicit .cmd shim so the 6000 shim threshold applies even on Linux;
-	// native binaries use 30000 and would not reject the 6500-byte prompt.
-	fakePath := filepath.Join(t.TempDir(), "openclaw.cmd")
+	fakePath := filepath.Join(t.TempDir(), "openclaw")
 	argvPath := filepath.Join(t.TempDir(), "argv-cache.txt")
 	unsupported := "#!/bin/sh\n" +
 		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.5.5'; exit 0; fi\n" +
@@ -1952,7 +1917,7 @@ func TestOpenclawMessageFileSupportCacheDoesNotPinFalse(t *testing.T) {
 	writeTestExecutable(t, fakePath, []byte(unsupported))
 	openclawMessageFileSupportCache = sync.Map{}
 	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
-	longPrompt := strings.Repeat("x", openclawShimThreshold+500)
+	longPrompt := strings.Repeat("x", openclawMessageFileThreshold+500)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_, err := backend.Execute(ctx, longPrompt, ExecOptions{Timeout: 10 * time.Second})
@@ -2033,7 +1998,7 @@ func TestOpenclawExecuteSystemPromptCombinedIntoMessageFile(t *testing.T) {
 		t.Skip("shell-script fixture is POSIX-only")
 	}
 	dir := t.TempDir()
-	fakePath := filepath.Join(dir, "openclaw.cmd")
+	fakePath := filepath.Join(dir, "openclaw")
 	argvPath := filepath.Join(dir, "argv2.txt")
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = \"--version\" ]; then echo 'openclaw 2026.7.1'; exit 0; fi\n" +
@@ -2048,7 +2013,7 @@ func TestOpenclawExecuteSystemPromptCombinedIntoMessageFile(t *testing.T) {
 	backend, _ := New("openclaw", Config{ExecutablePath: fakePath, Logger: slog.Default()})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	session, err := backend.Execute(ctx, "user prompt", ExecOptions{Timeout: 10 * time.Second, SystemPrompt: strings.Repeat("X", openclawShimThreshold) + " SYS"})
+	session, err := backend.Execute(ctx, "user prompt", ExecOptions{Timeout: 10 * time.Second, SystemPrompt: "SYS"})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
