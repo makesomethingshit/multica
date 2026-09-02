@@ -1748,7 +1748,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		// same transaction; a rejected task is settled via FailTask and skipped
 		// while valid tasks in the same batch continue.
 		commentBackedTask := task.TriggerCommentID.Valid || len(task.CoalescedCommentIds) > 0
-		receipt, settledFailure, ferr := h.finalizeClaimDelivery(r.Context(), &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID, db.CreateTaskTokenParams{
+		receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID, db.CreateTaskTokenParams{
 			ID:          dbid.NewV7(),
 			TokenHash:   auth.HashToken(tokenStr),
 			TaskID:      task.ID,
@@ -1766,7 +1766,12 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		if settledFailure != nil {
+		if deliveryFailure != nil {
+			if !deliveryFailure.settled {
+				slog.Error("batch claim: delivery rejection settlement failed",
+					"task_id", uuidToString(task.ID), "outcome", deliveryFailure.outcome,
+					"error", deliveryFailure.message)
+			}
 			continue
 		}
 		resp.AuthToken = tokenStr
@@ -1798,9 +1803,9 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 //
 // On mismatch the task is settled through the existing
 // failClaimedTaskBeforeLaunch -> TaskService.FailTask path and never returned
-// to the daemon. The settled failure is reported via onSettled so the caller
-// can keep its poll semantics (singular: 200 {"task":null}; batch: skip the
-// task, keep returning valid ones).
+// to the daemon. The delivery failure reports whether settlement succeeded so
+// callers can keep their poll semantics (singular: 200 {"task":null} only
+// after settlement; batch: skip the task, keep returning valid ones).
 func (h *Handler) finalizeClaimDelivery(
 	ctx context.Context,
 	task *db.AgentTaskQueue,
@@ -1810,14 +1815,14 @@ func (h *Handler) finalizeClaimDelivery(
 	deliveredCommentIDs []pgtype.UUID,
 	recordCommentReceipt bool,
 	daemonTokens ...db.CreateDaemonTokenParams,
-) (receipt []pgtype.UUID, settledFailure *claimBuildFailure, err error) {
+) (receipt []pgtype.UUID, deliveryFailure *claimBuildFailure, err error) {
 	var agentOwnerID pgtype.UUID
-	authorize := func(qtx *db.Queries) error {
+	authorize := func(qtx *db.Queries, tokenParams *db.CreateTaskTokenParams) error {
 		// FOR UPDATE on the runtime row: any concurrent
 		// UpsertAgentRuntime/visibility flip that would change owner_id or
 		// visibility blocks until this transaction commits, so the values read
 		// here are the ones delivery is authorized against.
-		locked, lerr := qtx.LockAgentRuntimeByID(ctx, runtime.ID)
+		locked, lerr := qtx.LockAgentRuntime(ctx, runtime.ID)
 		if lerr != nil {
 			return fmt.Errorf("lock runtime for delivery authorization: %w", lerr)
 		}
@@ -1839,6 +1844,16 @@ func (h *Handler) finalizeClaimDelivery(
 				Detail: "private runtime does not permit task agent at delivery gate",
 			}
 		}
+		if !locked.OwnerID.Valid {
+			return &service.ClaimDeliveryAuthzError{
+				Reason: "error_runtime_owner_missing",
+				Detail: "runtime owner missing before task delivery",
+			}
+		}
+		// The runtime row is locked for the duration of FinalizeTaskClaim. Use
+		// its current owner as the task-token identity rather than the stale
+		// claim-time snapshot captured by the caller.
+		tokenParams.UserID = locked.OwnerID
 		return nil
 	}
 
@@ -1863,7 +1878,9 @@ func (h *Handler) finalizeClaimDelivery(
 		return nil, failure, nil
 	default:
 		userMessage := "This private runtime cannot run the assigned agent because the agent and runtime have different owners."
-		if !agentOwnerID.Valid {
+		if authzErr.Reason == "error_runtime_owner_missing" {
+			userMessage = "This runtime cannot run the assigned agent because the runtime has no owner."
+		} else if !agentOwnerID.Valid {
 			userMessage = "This private runtime cannot run the assigned agent because the agent has no owner."
 		}
 		failure := h.failClaimedTaskBeforeLaunch(
@@ -3464,7 +3481,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to mint Remote MCP daemon token")
 		return
 	}
-	receipt, settledFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, db.CreateTaskTokenParams{
+	receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, db.CreateTaskTokenParams{
 		ID:          dbid.NewV7(),
 		TokenHash:   auth.HashToken(tokenStr),
 		TaskID:      task.ID,
@@ -3485,12 +3502,17 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to finalize task claim")
 		return
 	}
-	if settledFailure != nil {
+	if deliveryFailure != nil {
+		if !deliveryFailure.settled {
+			outcome = deliveryFailure.outcome
+			writeError(w, deliveryFailure.status, deliveryFailure.message)
+			return
+		}
 		// The final delivery gate rejected the task (agent rebound, or the
 		// runtime's current ownership no longer permits this agent). The task
 		// is already terminal via the FailTask path — return the same empty
 		// successful poll the queued-mismatch settle path returns.
-		outcome = settledFailure.outcome
+		outcome = deliveryFailure.outcome
 		payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": nil})
 		return
 	}

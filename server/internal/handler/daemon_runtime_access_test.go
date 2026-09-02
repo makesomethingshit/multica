@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -12,9 +13,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
-	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
@@ -277,6 +278,12 @@ func (h *Handler) finalizeClaimDeliveryForTest(
 	if err != nil {
 		return AgentTaskResponse{}, nil, 0, 0, nil, fmt.Errorf("load runtime: %w", err)
 	}
+	return h.finalizeClaimDeliveryForTestWithRuntime(r, task, runtime, runtimeID, runtimeWorkspaceID)
+}
+
+func (h *Handler) finalizeClaimDeliveryForTestWithRuntime(
+	r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string,
+) (AgentTaskResponse, []pgtype.UUID, int, int, *claimBuildFailure, error) {
 	resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, buildFailure := h.buildClaimedTaskResponse(
 		r, task, runtime, runtimeID, runtimeWorkspaceID,
 	)
@@ -296,7 +303,7 @@ func (h *Handler) finalizeClaimDeliveryForTest(
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, nil, fmt.Errorf("remote mcp token: %w", derr)
 	}
 	commentBackedTask := task.TriggerCommentID.Valid || len(task.CoalescedCommentIds) > 0
-	receipt, settledFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, db.CreateTaskTokenParams{
+	receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, db.CreateTaskTokenParams{
 		ID:          dbid.NewV7(),
 		TokenHash:   auth.HashToken(tokenStr),
 		TaskID:      task.ID,
@@ -308,8 +315,8 @@ func (h *Handler) finalizeClaimDeliveryForTest(
 	if ferr != nil {
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, nil, ferr
 	}
-	if settledFailure != nil {
-		return AgentTaskResponse{}, deliveredCommentIDs, agentSkillCount, builtinSkillCount, settledFailure, nil
+	if deliveryFailure != nil {
+		return AgentTaskResponse{}, deliveredCommentIDs, agentSkillCount, builtinSkillCount, deliveryFailure, nil
 	}
 	resp.AuthToken = tokenStr
 	resp.RemoteMCPDaemonToken = remoteMCPToken
@@ -390,6 +397,210 @@ func TestClaimTaskByRuntime_RuntimeOwnerChangedAfterClaimNeverDelivered(t *testi
 	}()).Want(http.StatusOK)
 	if strings.TrimSpace(w.Body.String()) != `{"task":null}` {
 		t.Fatalf("post-settle poll body = %q, want empty successful poll", w.Body.String())
+	}
+}
+
+// PUCK-89 blocker 1: a public runtime may keep delivering after its owner
+// changes, but the task token must identify the owner from the locked runtime
+// row rather than the claim-time snapshot.
+func TestFinalizeClaimDelivery_UsesCurrentRuntimeOwnerForTaskToken(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	newOwnerID := dbfx.User(t, "Public delivery owner", "public-delivery-owner-"+uuid.NewString()+"@example.com")
+	dbfx.Member(t, testWorkspaceID, newOwnerID, "member")
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Public delivery owner runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Public delivery owner agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+
+	task, err := testHandler.TaskService.ClaimTaskForRuntime(ctx, parseUUID(runtimeID))
+	if err != nil || task == nil {
+		t.Fatalf("claim task: task=%v err=%v", task, err)
+	}
+	runtimeSnapshot, err := testHandler.Queries.GetAgentRuntimeForWorkspace(ctx, db.GetAgentRuntimeForWorkspaceParams{
+		ID:          parseUUID(runtimeID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load claim-time runtime: %v", err)
+	}
+	if !runtimeSnapshot.OwnerID.Valid {
+		t.Fatal("claim-time runtime owner unexpectedly missing")
+	}
+	dbfx.Exec(t, `UPDATE agent_runtime SET visibility = 'public', owner_id = $1 WHERE id = $2`, newOwnerID, runtimeID)
+
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
+		testWorkspaceID, "public-delivery-owner-change")
+	resp, _, _, _, failure, finalizeErr := testHandler.finalizeClaimDeliveryForTestWithRuntime(
+		req, task, runtimeSnapshot, runtimeID, testWorkspaceID,
+	)
+	if finalizeErr != nil {
+		t.Fatalf("finalize delivery: %v", finalizeErr)
+	}
+	if failure != nil {
+		t.Fatalf("delivery failure = %+v, want successful public delivery", failure)
+	}
+	if resp.AuthToken == "" {
+		t.Fatal("successful delivery did not return a task token")
+	}
+
+	var tokenOwnerID string
+	dbfx.QueryRow(t, `SELECT user_id::text FROM task_token WHERE task_id = $1`, taskID).Scan(&tokenOwnerID)
+	if tokenOwnerID != newOwnerID {
+		t.Fatalf("task token user_id = %q, want current runtime owner %q", tokenOwnerID, newOwnerID)
+	}
+}
+
+// PUCK-89 blocker 1: if the locked runtime loses its owner after claim, the
+// stale claim-time owner must never be used to mint a task credential.
+func TestFinalizeClaimDelivery_CurrentRuntimeOwnerMissingNeverMintsToken(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Ownerless delivery runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Ownerless delivery agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+
+	task, err := testHandler.TaskService.ClaimTaskForRuntime(ctx, parseUUID(runtimeID))
+	if err != nil || task == nil {
+		t.Fatalf("claim task: task=%v err=%v", task, err)
+	}
+	runtimeSnapshot, err := testHandler.Queries.GetAgentRuntimeForWorkspace(ctx, db.GetAgentRuntimeForWorkspaceParams{
+		ID:          parseUUID(runtimeID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load claim-time runtime: %v", err)
+	}
+	if !runtimeSnapshot.OwnerID.Valid {
+		t.Fatal("claim-time runtime owner unexpectedly missing")
+	}
+	dbfx.Exec(t, `UPDATE agent_runtime SET visibility = 'public', owner_id = NULL WHERE id = $1`, runtimeID)
+
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
+		testWorkspaceID, "ownerless-delivery")
+	resp, _, _, _, failure, finalizeErr := testHandler.finalizeClaimDeliveryForTestWithRuntime(
+		req, task, runtimeSnapshot, runtimeID, testWorkspaceID,
+	)
+	if finalizeErr != nil {
+		t.Fatalf("finalize delivery: %v", finalizeErr)
+	}
+	if failure == nil || !failure.settled {
+		t.Fatalf("delivery failure = %+v, want settled ownerless-runtime failure", failure)
+	}
+	if resp.AuthToken != "" || resp.RemoteMCPDaemonToken != "" {
+		t.Fatalf("ownerless delivery returned credentials %q/%q", resp.AuthToken, resp.RemoteMCPDaemonToken)
+	}
+	var tokenCount int
+	dbfx.QueryRow(t, `SELECT count(*) FROM task_token WHERE task_id = $1`, taskID).Scan(&tokenCount)
+	if tokenCount != 0 {
+		t.Fatalf("task token count = %d, want 0", tokenCount)
+	}
+	var status, errorMessage string
+	dbfx.QueryRow(t, `SELECT status, error FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status, &errorMessage)
+	if status != "failed" || !strings.Contains(errorMessage, "runtime has no owner") {
+		t.Fatalf("task state = %q/%q, want failed ownerless-runtime settlement", status, errorMessage)
+	}
+}
+
+func injectFailTaskSettlementFailure(t *testing.T, ctx context.Context, taskID string) {
+	t.Helper()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	functionName := "puck89_fail_task_" + suffix
+	triggerName := "puck89_fail_task_trg_" + suffix
+	t.Cleanup(func() {
+		testPool.Exec(ctx, fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON agent_task_queue", triggerName))
+		testPool.Exec(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
+	})
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`
+CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+	IF NEW.status = 'failed' THEN
+		RAISE EXCEPTION 'injected FailTask settlement failure';
+	END IF;
+	RETURN NEW;
+END
+$fn$;
+`, functionName)); err != nil {
+		t.Fatalf("create FailTask fault function: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`
+CREATE TRIGGER %s
+BEFORE UPDATE ON agent_task_queue
+FOR EACH ROW WHEN (OLD.id = '%s'::uuid AND NEW.status = 'failed')
+EXECUTE FUNCTION %s();
+`, triggerName, taskID, functionName)); err != nil {
+		t.Fatalf("create FailTask fault trigger: %v", err)
+	}
+}
+
+func injectRuntimeOwnerFlipAfterClaim(t *testing.T, ctx context.Context, taskID, runtimeID, ownerID string) {
+	t.Helper()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	functionName := "puck89_flip_runtime_owner_" + suffix
+	triggerName := "puck89_flip_runtime_owner_trg_" + suffix
+	t.Cleanup(func() {
+		testPool.Exec(ctx, fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON agent_task_queue", triggerName))
+		testPool.Exec(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
+	})
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`
+CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+	UPDATE agent_runtime SET owner_id = '%s'::uuid WHERE id = '%s'::uuid;
+	RETURN NEW;
+END
+$fn$;
+`, functionName, ownerID, runtimeID)); err != nil {
+		t.Fatalf("create runtime-owner flip function: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`
+CREATE TRIGGER %s
+AFTER UPDATE ON agent_task_queue
+FOR EACH ROW WHEN (OLD.id = '%s'::uuid AND OLD.status = 'queued' AND NEW.status = 'dispatched')
+EXECUTE FUNCTION %s();
+`, triggerName, taskID, functionName)); err != nil {
+		t.Fatalf("create runtime-owner flip trigger: %v", err)
+	}
+}
+
+// PUCK-89 blocker 2: a final authorization rejection whose FailTask
+// settlement fails is an HTTP error, not a successful empty poll. The exact
+// claim is requeued and no token is inserted.
+func TestFinalizeClaimDelivery_SettlementFailureIsUnsettled(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	foreignOwnerID := dbfx.User(t, "Settlement failure owner", "settlement-failure-owner-"+uuid.NewString()+"@example.com")
+	dbfx.Member(t, testWorkspaceID, foreignOwnerID, "member")
+	runtimeID := createClaimReclaimRuntime(t, ctx, "Settlement failure runtime")
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, "Settlement failure agent")
+	taskID := seedQueuedIssueTask(t, ctx, agentID, runtimeID, issueID)
+	injectRuntimeOwnerFlipAfterClaim(t, ctx, taskID, runtimeID, foreignOwnerID)
+	injectFailTaskSettlementFailure(t, ctx, taskID)
+
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
+		testWorkspaceID, "settlement-failure")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	w := httptest.NewRecorder()
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("claim status = %d, want 500: %s", w.Code, w.Body.String())
+	}
+	if strings.TrimSpace(w.Body.String()) == `{"task":null}` {
+		t.Fatal("settlement failure was hidden as a successful empty poll")
+	}
+	var tokenCount int
+	dbfx.QueryRow(t, `SELECT count(*) FROM task_token WHERE task_id = $1`, taskID).Scan(&tokenCount)
+	if tokenCount != 0 {
+		t.Fatalf("task token count = %d, want 0", tokenCount)
+	}
+	var status string
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status)
+	if status != "queued" {
+		t.Fatalf("task status = %q, want queued after settlement failure requeue", status)
 	}
 }
 

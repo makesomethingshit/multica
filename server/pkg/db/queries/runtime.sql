@@ -46,16 +46,6 @@ FOR UPDATE;
 SELECT * FROM agent_runtime
 WHERE id = $1 AND workspace_id = $2;
 
--- name: LockAgentRuntimeByID :one
--- Row-level exclusive lock on one runtime row, looked up without any
--- workspace filter. Used by the daemon claim's final delivery gate so the
--- ownership re-check and the task-token write share one transaction: a
--- concurrent UpsertAgentRuntime that would change owner_id blocks until the
--- gate commits, so a stale owner decision can never reach delivery.
-SELECT * FROM agent_runtime
-WHERE id = $1
-FOR UPDATE;
-
 -- name: UpsertAgentRuntime :one
 -- (xmax = 0) AS inserted distinguishes a fresh insert (true) from an upsert
 -- that updated an existing row (false). Analytics reads this to fire

@@ -3644,15 +3644,17 @@ func (e *ClaimDeliveryAuthzError) Error() string {
 // atomic unit: a concurrent runtime re-registration that would change owner_id
 // blocks until the gate commits, so the owner the gate authorized against is
 // the owner the tokens were minted for — no stale-snapshot delivery window.
-// The closure returns a *ClaimDeliveryAuthzError to reject delivery (every
-// other error rolls the claim back like any other finalize failure).
+// The closure receives the in-transaction token params so it can normalize
+// identity fields from the locked rows before the token is inserted. It
+// returns a *ClaimDeliveryAuthzError to reject delivery (every other error
+// rolls the claim back like any other finalize failure).
 func (s *TaskService) FinalizeTaskClaim(
 	ctx context.Context,
 	task db.AgentTaskQueue,
 	token db.CreateTaskTokenParams,
 	deliveredCommentIDs []pgtype.UUID,
 	recordCommentReceipt bool,
-	authorize func(qtx *db.Queries) error,
+	authorize func(qtx *db.Queries, token *db.CreateTaskTokenParams) error,
 	daemonTokens ...db.CreateDaemonTokenParams,
 ) ([]pgtype.UUID, error) {
 	if len(daemonTokens) > 1 {
@@ -3661,7 +3663,7 @@ func (s *TaskService) FinalizeTaskClaim(
 	receipt := task.DeliveredCommentIds
 	err := s.runInTx(ctx, func(qtx *db.Queries) error {
 		if authorize != nil {
-			if err := authorize(qtx); err != nil {
+			if err := authorize(qtx, &token); err != nil {
 				return fmt.Errorf("authorize claim delivery: %w", err)
 			}
 		}
