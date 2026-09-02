@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -1607,5 +1608,161 @@ func TestListIssuesPropertyFilterOperators(t *testing.T) {
 	}
 	if rowsResponse.Total != 1 || len(rowsResponse.Rows) != 1 || rowsResponse.Rows[0].Issue.ID != hasAll {
 		t.Fatalf("table rows operator filter wrong: total=%d rows=%d", rowsResponse.Total, len(rowsResponse.Rows))
+	}
+}
+
+// TestPropertyContainsPrefilterCompilationUnit pins which contains needles get
+// the bigram prefilter that migration 446's index serves. The prefilter matches
+// against the jsonb text form of the whole properties object, so a needle that
+// jsonb escapes on serialization (", \, control characters) must compile
+// without it — the alternative would silently drop matching rows.
+func TestPropertyContainsPrefilterCompilationUnit(t *testing.T) {
+	defID := uuid.NewString()
+	compile := func(t *testing.T, needle string) (propertyOperatorPattern, json.RawMessage, string) {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{defID: []any{map[string]any{"op": "contains", "value": needle}}})
+		if err != nil {
+			t.Fatalf("marshal filter: %v", err)
+		}
+		w := httptest.NewRecorder()
+		groups, ok := parsePropertiesFilterParam(w, string(raw))
+		if !ok {
+			t.Fatalf("parse %q: %s", needle, w.Body.String())
+		}
+		pattern, isOp := parseOperatorPattern(groups[0][0])
+		if !isOp {
+			t.Fatalf("%q did not compile to an operator pattern", needle)
+		}
+		var args []any
+		addArg := func(v any) string {
+			args = append(args, v)
+			return fmt.Sprintf("$%d", len(args))
+		}
+		return pattern, groups[0][0], propertiesFilterPredicate(groups, addArg)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		needle        string
+		wantPrefilter string
+	}{
+		{"plain ascii", "world", "world"},
+		// LIKE wildcards are escaped identically on both sides, so they stay
+		// prefilterable — the escape is a backslash in the pattern, not in the
+		// serialized value.
+		{"like wildcards", "50% off_now", `50\% off\_now`},
+		{"cjk", "中文属性", "中文属性"},
+		// Short needles are prefiltered too: pg_bigm indexes 1- and
+		// 2-character keywords, which is the capability it exists for over
+		// pg_trgm, and one CJK character is already a word.
+		{"single character", "x", "x"},
+		{"single cjk character", "文", "文"},
+		{"double quote", `say "hi"`, ""},
+		{"backslash", `C:\logs`, ""},
+		{"tab", "col\tvalue", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pattern, alt, sql := compile(t, tc.needle)
+			if pattern.Prefilter != tc.wantPrefilter {
+				t.Fatalf("prefilter for %q: got %q, want %q", tc.needle, pattern.Prefilter, tc.wantPrefilter)
+			}
+			// The static open_only unroll keys off the presence of the JSON
+			// member, so an unsafe needle must omit it rather than carry "".
+			var members map[string]json.RawMessage
+			if err := json.Unmarshal(alt, &members); err != nil {
+				t.Fatalf("decode alternative: %v", err)
+			}
+			_, hasMember := members["prefilter"]
+			if hasMember != (tc.wantPrefilter != "") {
+				t.Fatalf("alternative %s: prefilter member present=%v, want %v", alt, hasMember, tc.wantPrefilter != "")
+			}
+			hasClause := strings.Contains(sql, "LOWER(i.properties::text) LIKE LOWER(")
+			if hasClause != (tc.wantPrefilter != "") {
+				t.Fatalf("predicate %s: prefilter clause present=%v, want %v", sql, hasClause, tc.wantPrefilter != "")
+			}
+			// The per-key check is authoritative on every path, prefiltered or
+			// not.
+			if !strings.Contains(sql, "ILIKE") || !strings.Contains(sql, "jsonb_typeof") {
+				t.Fatalf("predicate lost its per-key contains check: %s", sql)
+			}
+		})
+	}
+}
+
+// TestPropertyContainsPrefilterKeepsResultsExact runs the needles above against
+// real rows on both serving paths. The prefilter is lossy by design, so the
+// property under test is that it never changes an answer: needles jsonb escapes
+// must still match, and a needle that only appears elsewhere in the object —
+// under another definition, or in a definition id — must still miss.
+func TestPropertyContainsPrefilterKeepsResultsExact(t *testing.T) {
+	text := createTestProperty(t, map[string]any{"name": "PF" + uuid.NewString()[:8], "type": "text"})
+	other := createTestProperty(t, map[string]any{"name": "PO" + uuid.NewString()[:8], "type": "text"})
+
+	listIDs := func(t *testing.T, defID, needle string, openOnly bool) map[string]bool {
+		t.Helper()
+		buf, err := json.Marshal(map[string]any{defID: []any{map[string]any{"op": "contains", "value": needle}}})
+		if err != nil {
+			t.Fatalf("marshal filter: %v", err)
+		}
+		query := "/api/issues?limit=50&properties=" + url.QueryEscape(string(buf))
+		if openOnly {
+			query += "&open_only=true"
+		}
+		var resp struct {
+			Issues []IssueResponse `json:"issues"`
+		}
+		testutil.Call(t, testHandler.ListIssues, newRequest(http.MethodGet, query, nil)).
+			Want(http.StatusOK).JSON(&resp)
+		present := make(map[string]bool, len(resp.Issues))
+		for _, issue := range resp.Issues {
+			present[issue.ID] = true
+		}
+		return present
+	}
+
+	for _, tc := range []struct {
+		name   string
+		value  string
+		needle string
+	}{
+		{"plain ascii", "plain value", "in val"},
+		{"double quote", `he said "yes" loudly`, `"yes"`},
+		// jsonb doubles the backslash, so the needle's literal form is absent
+		// from properties::text — a prefiltered lookup would find nothing.
+		{"backslash", `C:\bin`, `C:\bin`},
+		{"tab", "column\tvalue", "\tvalue"},
+		{"cjk", "中文属性值", "文属"},
+		{"like wildcards", "100% done_now", "% done_"},
+		{"case folded", "MiXeD Case", "mixed ca"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hit := createPropertyTestIssue(t, "prefilter hit")
+			// The decoy carries the identical string under a different
+			// definition: it is in LOWER(properties::text) exactly like the
+			// hit's, so only the per-key check can tell the two apart.
+			decoy := createPropertyTestIssue(t, "prefilter decoy")
+			if w := setIssuePropertyRaw(t, hit, text.ID, tc.value); w.Code != http.StatusOK {
+				t.Fatalf("seed hit: %d %s", w.Code, w.Body.String())
+			}
+			if w := setIssuePropertyRaw(t, decoy, other.ID, tc.value); w.Code != http.StatusOK {
+				t.Fatalf("seed decoy: %d %s", w.Code, w.Body.String())
+			}
+
+			for _, openOnly := range []bool{false, true} {
+				present := listIDs(t, text.ID, tc.needle, openOnly)
+				if !present[hit] {
+					t.Fatalf("open_only=%v: contains %q missed the issue holding %q", openOnly, tc.needle, tc.value)
+				}
+				if present[decoy] {
+					t.Fatalf("open_only=%v: contains %q matched another definition's value", openOnly, tc.needle)
+				}
+				// A definition id is part of the object's text form but never
+				// part of a value, so the prefilter alone must not surface the
+				// row.
+				if byDefID := listIDs(t, text.ID, text.ID[:8], openOnly); byDefID[hit] {
+					t.Fatalf("open_only=%v: contains matched a definition id, not a value", openOnly)
+				}
+			}
+		})
 	}
 }

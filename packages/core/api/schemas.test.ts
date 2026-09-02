@@ -1588,6 +1588,48 @@ describe("RuntimeModelListRequestSchema", () => {
     expect(parsed.cached).toBeUndefined();
   });
 
+  // MUL-6961: models the runtime cannot run arrive in their OWN list. The
+  // separation is the compatibility contract — a client that never learned the
+  // field reads `models` and therefore cannot offer one — so the schema must
+  // keep them apart rather than folding them together.
+  it("parses unavailable models without letting them into the selectable list", () => {
+    const parsed = parseWithFallback(
+      {
+        ...completed,
+        unavailable_models: [
+          {
+            id: "cc-update-required-1",
+            label: "Fable 5.1 (disabled)",
+            reason: "Update to 2.1.255+ to use Fable 5.1",
+          },
+        ],
+      },
+      RuntimeModelListRequestSchema,
+      MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
+      { endpoint: "test" },
+    );
+    expect(parsed.unavailable_models?.[0]?.id).toBe("cc-update-required-1");
+    expect(parsed.unavailable_models?.[0]?.reason).toBe(
+      "Update to 2.1.255+ to use Fable 5.1",
+    );
+    expect(parsed.models?.map((m) => m.id)).not.toContain(
+      "cc-update-required-1",
+    );
+  });
+
+  // An older daemon or server sends no such key. The picker then shows no
+  // unavailable section, which is exactly the pre-MUL-6961 behaviour.
+  it("tolerates a backend that omits unavailable models entirely", () => {
+    const parsed = parseWithFallback(
+      completed,
+      RuntimeModelListRequestSchema,
+      MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
+      { endpoint: "test" },
+    );
+    expect(parsed.unavailable_models).toBeUndefined();
+    expect(parsed.models?.length).toBe(1);
+  });
+
   it("treats an older daemon that omits explicit-standard support as unsupported", () => {
     const model = completed.models[0]!;
     const {

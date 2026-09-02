@@ -318,11 +318,22 @@ var issueSubscriberRemoveCmd = &cobra.Command{
 
 // Execution history subcommands.
 
+// headerActiveRunsTruncated mirrors handler.HeaderActiveRunsTruncated. Declared
+// as a literal rather than imported because the CLI does not depend on the
+// handler package (same convention as headerTimelineTruncated in
+// `issue timeline`).
+const headerActiveRunsTruncated = "X-Active-Runs-Truncated"
+
 var issueRunsCmd = &cobra.Command{
 	Use:   "runs <issue-id>",
 	Short: "List execution history for an issue",
-	Args:  exactArgs(1),
-	RunE:  runIssueRuns,
+	Long: "List agent task runs for an issue.\n\n" +
+		"Defaults to this issue's full execution history, newest first. Narrow it to " +
+		"work in flight with --active, or widen it across the sub-issue family with " +
+		"--siblings when you need to know whether another agent is already working " +
+		"next to you.",
+	Args: exactArgs(1),
+	RunE: runIssueRuns,
 }
 
 var issueRunMessagesCmd = &cobra.Command{
@@ -566,6 +577,8 @@ func init() {
 	// issue runs
 	issueRunsCmd.Flags().String("output", "table", "Output format: table or json")
 	issueRunsCmd.Flags().Bool("full-id", false, "Show full task UUIDs in table output")
+	issueRunsCmd.Flags().Bool("active", false, "Only in-flight runs (queued, dispatched, running, waiting_local_directory) instead of the full execution history. Answers \"is an agent working on this right now\" without pulling every past run.")
+	issueRunsCmd.Flags().Bool("siblings", false, "Widen to this issue's sub-issue family — its parent (or itself, when it has no parent) plus every child of that parent — so you can see whether another run is already working alongside you before starting overlapping code or PR work. Implies --active. Returns a compact per-run row (task, issue, agent, status, started) rather than the full execution-log record. Ordered running-first, newest-first within a status, and capped at 20 rows; when the cap truncates the answer the CLI says so on stderr, so a short list is never mistaken for a complete one. Advisory only: it reports work in flight, it does not reserve or serialise anything.")
 
 	// issue usage
 	issueUsageCmd.Flags().String("output", "table", "Output format: table or json")
@@ -2146,9 +2159,37 @@ func runIssueRuns(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolve issue: %w", err)
 	}
 
+	activeOnly, _ := cmd.Flags().GetBool("active")
+	siblings, _ := cmd.Flags().GetBool("siblings")
+
+	params := url.Values{}
+	if siblings {
+		// The server implies active for a family read, so --siblings alone is
+		// enough; sending both keeps the request self-describing.
+		params.Set("scope", "family")
+		params.Set("active", "true")
+	} else if activeOnly {
+		params.Set("active", "true")
+	}
+
+	path := "/api/issues/" + issueRef.ID + "/task-runs"
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+
 	var runs []map[string]any
-	if err := client.GetJSON(ctx, "/api/issues/"+issueRef.ID+"/task-runs", &runs); err != nil {
+	respHeaders, err := client.GetJSONWithHeaders(ctx, path, &runs)
+	if err != nil {
 		return fmt.Errorf("list runs: %w", err)
+	}
+	// A truncated coordination read and a complete one look identical in the
+	// body, and reading the first as the second is exactly the wrong
+	// conclusion: "no run on that sibling" when the answer was simply cut off.
+	// Same stderr convention as the comment-list paging cursors.
+	if respHeaders.Get(headerActiveRunsTruncated) == "true" {
+		fmt.Fprintln(os.Stderr,
+			"warning: active runs truncated by the server cap: more runs are in flight than this read returns. "+
+				"\"No run on that issue\" cannot be concluded from this read.")
 	}
 
 	output, _ := cmd.Flags().GetString("output")
@@ -2158,6 +2199,32 @@ func runIssueRuns(cmd *cobra.Command, args []string) error {
 
 	actors := loadActorDisplayLookup(ctx, client)
 	fullID, _ := cmd.Flags().GetBool("full-id")
+
+	// The family read returns a different, deliberately smaller row than the
+	// execution log — no completed_at or error, because every row in it is
+	// still in flight — and it spans issues, so it needs a column saying which.
+	// On a single-issue read that column would repeat the argument on every
+	// line, so it stays off there.
+	if siblings {
+		headers := []string{"TASK", "ISSUE", "AGENT", "STATUS", "STARTED"}
+		rows := make([][]string, 0, len(runs))
+		for _, r := range runs {
+			started := strVal(r, "started_at")
+			if len(started) >= 16 {
+				started = started[:16]
+			}
+			rows = append(rows, []string{
+				displayID(strVal(r, "task_id"), fullID),
+				strVal(r, "issue_identifier"),
+				actors.agent(strVal(r, "agent_id")),
+				strVal(r, "status"),
+				started,
+			})
+		}
+		cli.PrintTable(os.Stdout, headers, rows)
+		return nil
+	}
+
 	headers := []string{"ID", "AGENT", "STATUS", "STARTED", "COMPLETED", "ERROR"}
 	rows := make([][]string, 0, len(runs))
 	for _, r := range runs {

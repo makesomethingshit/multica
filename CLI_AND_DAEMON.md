@@ -701,6 +701,23 @@ multica issue runs <issue-id>
 multica issue runs <issue-id> --full-id
 multica issue runs <issue-id> --output json
 
+# Only work in flight (queued / dispatched / running / waiting_local_directory)
+multica issue runs <issue-id> --active --output json
+
+# ...and across the sub-issue family: the issue's parent (or itself, when it has
+# no parent) plus every child of that parent, each row labelled with its issue.
+# Answers "is another agent already working next to me?" before you start
+# overlapping code or PR work. Advisory only — it reserves nothing.
+#
+# Returns a compact per-run row — task_id, issue_id, issue_identifier,
+# issue_title, agent_id, status, created_at, started_at — not the full
+# execution-log record. Follow a task_id with `issue run-messages` for detail.
+#
+# Ordered running-first, newest-first within a status, capped at 20 rows. When
+# the cap truncates the answer the server sets X-Active-Runs-Truncated and the
+# CLI warns on stderr, so a short list is never mistaken for a complete one.
+multica issue runs <issue-id> --siblings --output json
+
 # View messages for a specific execution run
 multica issue run-messages <task-id>
 multica issue run-messages <short-task-id> --issue <issue-id>
