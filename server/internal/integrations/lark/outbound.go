@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -469,7 +469,7 @@ func (p *Patcher) handleIssueCompleted(ctx context.Context, taskID pgtype.UUID, 
 	if ws, werr := p.queries.GetWorkspace(ctx, issue.WorkspaceID); werr == nil {
 		prefix = ws.IssuePrefix
 	}
-	identifier := issueIdentifier(prefix, issue.Number)
+	identifier := service.IssueIdentifier(prefix, issue.Number)
 	// TaskService.CompleteTask explicitly does NOT change issue status
 	// (task.go:4230), so this notification is for the agent run/task
 	// completing, not the issue reaching done/in_review. An in_progress
@@ -486,13 +486,6 @@ func (p *Patcher) handleIssueCompleted(ctx context.Context, taskID pgtype.UUID, 
 		})
 		return err
 	})
-}
-
-func issueIdentifier(prefix string, number int32) string {
-	if prefix == "" {
-		return "#" + strconv.Itoa(int(number))
-	}
-	return prefix + "-" + strconv.Itoa(int(number))
 }
 
 func taskCompletedText(identifier, title string) string {
