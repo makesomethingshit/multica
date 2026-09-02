@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -518,28 +519,23 @@ func TestMUL6886_ChannelIsolation_GREEN(t *testing.T) {
 	if runtimeID == "" {
 		t.Fatalf("runtimeID empty")
 	}
-	var tB string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, chat_session_id, status, priority, chat_input_task_id)
-		VALUES ($1, $2, $3, 'queued', 2, gen_random_uuid())
-		RETURNING id::text
-	`, agentID, runtimeID, sessionID).Scan(&tB); err != nil {
-		t.Fatalf("insert channel B task: %v", err)
-	}
+	tB := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":      runtimeID,
+		"chat_session_id": sessionID,
+		"status":          "queued",
+		"priority":        2,
+	})
 	if tB == "" {
 		t.Fatalf("tB empty")
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE agent_task_queue SET chat_input_task_id=id WHERE id=$1`, tB); err != nil {
-		t.Fatalf("update chat_input_task_id: %v", err)
-	}
-	var msgID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO chat_message (chat_session_id, role, content, task_id, channel_ingested)
-		VALUES ($1, 'user', 'user channel B', $2, TRUE)
-		RETURNING id::text
-	`, sessionID, tB).Scan(&msgID); err != nil {
-		t.Fatalf("insert channel message: %v", err)
-	}
+	dbfx.Exec(t, `UPDATE agent_task_queue SET chat_input_task_id = id WHERE id = $1`, tB)
+	msgID := dbfx.Insert(t, "chat_message", testutil.Cols{
+		"chat_session_id":  sessionID,
+		"role":             "user",
+		"content":          "user channel B",
+		"task_id":          tB,
+		"channel_ingested": true,
+	})
 	if msgID == "" {
 		t.Fatalf("msgID empty")
 	}
