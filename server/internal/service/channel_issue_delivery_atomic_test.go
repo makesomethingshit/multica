@@ -181,6 +181,17 @@ func TestChannelIssueDelivery_SnapshotFailureRollsBack(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM issue WHERE workspace_id = $1`, workspaceID).Scan(&beforeCount); err != nil {
 		t.Fatalf("count before: %v", err)
 	}
+	var beforeDeliveryCount, beforeOrphanDeliveryCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_task_delivery`).Scan(&beforeDeliveryCount); err != nil {
+		t.Fatalf("count deliveries before: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM channel_task_delivery d
+		LEFT JOIN agent_task_queue t ON t.id = d.task_id
+		WHERE t.id IS NULL`).Scan(&beforeOrphanDeliveryCount); err != nil {
+		t.Fatalf("count orphan deliveries before: %v", err)
+	}
 
 	_, err := issueService.Create(ctx, IssueCreateParams{
 		WorkspaceID:  workspaceUUID,
@@ -212,6 +223,23 @@ func TestChannelIssueDelivery_SnapshotFailureRollsBack(t *testing.T) {
 	}
 	if taskCount != 0 {
 		t.Fatalf("tasks for failed channel issue = %d, want 0", taskCount)
+	}
+	var afterDeliveryCount, afterOrphanDeliveryCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_task_delivery`).Scan(&afterDeliveryCount); err != nil {
+		t.Fatalf("count deliveries after: %v", err)
+	}
+	if afterDeliveryCount != beforeDeliveryCount {
+		t.Fatalf("delivery count after failed snapshot = %d, want %d", afterDeliveryCount, beforeDeliveryCount)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM channel_task_delivery d
+		LEFT JOIN agent_task_queue t ON t.id = d.task_id
+		WHERE t.id IS NULL`).Scan(&afterOrphanDeliveryCount); err != nil {
+		t.Fatalf("count orphan deliveries after: %v", err)
+	}
+	if afterOrphanDeliveryCount != beforeOrphanDeliveryCount {
+		t.Fatalf("orphan deliveries after failed snapshot = %d, want %d", afterOrphanDeliveryCount, beforeOrphanDeliveryCount)
 	}
 }
 
@@ -374,23 +402,38 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 	if _, err := q.GetChannelTaskDelivery(ctx, firstTaskID); err != nil {
 		t.Fatalf("initial channel issue task should have delivery: %v", err)
 	}
-	// Delete the first task so subsequent enqueues are not blocked by duplicate pending.
-	pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(firstTaskID))
-	pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(firstTaskID))
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, result.Issue.ID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, result.Issue.ID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM issue WHERE id = $1`, result.Issue.ID)
+	})
+	// Finish the first task so subsequent enqueues are not blocked by duplicate
+	// pending, but keep its delivery row to prove the route snapshot belongs to
+	// that task only.
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, util.UUIDToString(firstTaskID)); err != nil {
+		t.Fatalf("complete initial task for follow-up checks: %v", err)
+	}
+	var initialDeliveryCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, firstTaskID).Scan(&initialDeliveryCount); err != nil {
+		t.Fatalf("count initial delivery: %v", err)
+	}
+	if initialDeliveryCount != 1 {
+		t.Fatalf("initial delivery count after task completion = %d, want 1", initialDeliveryCount)
+	}
 
-	// Web task for same issue (no OriginType) should not inherit delivery.
+	// Ordinary assignment/update task for the same issue must not inherit the
+	// initial route snapshot, even though the durable issue provenance remains.
 	webIssue := issue
-	webIssue.OriginType = pgtype.Text{}
-	webIssue.OriginID = pgtype.UUID{}
 	webTask, err := taskService.EnqueueTaskForIssue(ctx, webIssue)
 	if err != nil {
-		t.Logf("web task enqueue: %v", err)
-	} else {
-		if _, err := q.GetChannelTaskDelivery(ctx, webTask.ID); err == nil {
-			t.Fatalf("web task should not have delivery, but found one for %v", webTask.ID)
-		}
-		pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(webTask.ID))
-		pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(webTask.ID))
+		t.Fatalf("ordinary follow-up task enqueue: %v", err)
+	}
+	if _, err := q.GetChannelTaskDelivery(ctx, webTask.ID); err == nil {
+		t.Fatalf("ordinary follow-up task should not have delivery, but found one for %v", webTask.ID)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(webTask.ID)); err != nil {
+		t.Fatalf("cleanup ordinary follow-up task: %v", err)
 	}
 
 	// Comment-triggered task should not inherit delivery.
@@ -404,7 +447,7 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 	commentUUID := util.MustParseUUID(commentID)
 	commentTask, err := taskService.EnqueueTaskForIssue(ctx, issue, commentUUID)
 	if err != nil {
-		t.Logf("comment task enqueue: %v", err)
+		t.Fatalf("comment task enqueue: %v", err)
 	} else {
 		if _, err := q.GetChannelTaskDelivery(ctx, commentTask.ID); err == nil {
 			t.Fatalf("comment-triggered task should not inherit delivery, but found one for %v", commentTask.ID)
@@ -413,14 +456,10 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 		pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(commentTask.ID))
 	}
 
-	// Rerun task should not inherit delivery.
-	rerunSourceTask, err := taskService.EnqueueTaskForIssue(ctx, issue)
+	// Public rerun path should not inherit delivery.
+	rerunTask, err := taskService.RerunIssue(ctx, issue.ID, firstTaskID, pgtype.UUID{}, userUUID, func(db.Agent) bool { return true })
 	if err != nil {
-		t.Fatalf("create rerun source task: %v", err)
-	}
-	rerunTask, err := taskService.enqueueIssueTask(ctx, issue, pgtype.UUID{}, false, "", pgtype.UUID{}, rerunSourceTask.ID, pgtype.Timestamptz{})
-	if err != nil {
-		t.Logf("rerun task enqueue: %v", err)
+		t.Fatalf("rerun task enqueue: %v", err)
 	} else {
 		if _, err := q.GetChannelTaskDelivery(ctx, rerunTask.ID); err == nil {
 			t.Fatalf("rerun task should not inherit delivery, but found one for %v", rerunTask.ID)
@@ -428,8 +467,6 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 		pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(rerunTask.ID))
 		pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(rerunTask.ID))
 	}
-	pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(rerunSourceTask.ID))
-	pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(rerunSourceTask.ID))
 }
 
 func TestChannelIssueDelivery_BindingDeletedOrdinaryEnqueueStillSucceeds(t *testing.T) {
@@ -494,14 +531,25 @@ func TestChannelIssueDelivery_BindingDeletedOrdinaryEnqueueStillSucceeds(t *test
 	if _, err := q.GetChannelTaskDelivery(ctx, firstResult.AssignedTaskID); err != nil {
 		t.Fatalf("first channel issue should have delivery: %v", err)
 	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, firstResult.Issue.ID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, firstResult.Issue.ID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM issue WHERE id = $1`, firstResult.Issue.ID)
+	})
 
 	// Delete the originating binding.
 	if _, err := pool.Exec(ctx, `DELETE FROM channel_chat_session_binding WHERE chat_session_id = $1`, util.UUIDToString(chatSessionID)); err != nil {
 		t.Fatalf("delete binding: %v", err)
 	}
-	// Delete the first task so the follow-up is not blocked by duplicate pending.
-	pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(firstResult.AssignedTaskID))
-	pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(firstResult.AssignedTaskID))
+	// Finish the first task so the follow-up is not blocked by duplicate
+	// pending. Its frozen delivery must survive the binding deletion.
+	if _, err := pool.Exec(ctx, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, util.UUIDToString(firstResult.AssignedTaskID)); err != nil {
+		t.Fatalf("complete first task after binding delete: %v", err)
+	}
+	if _, err := q.GetChannelTaskDelivery(ctx, firstResult.AssignedTaskID); err != nil {
+		t.Fatalf("first task delivery should survive binding delete: %v", err)
+	}
 
 	// Ordinary enqueue after binding delete should still succeed (without delivery) and not be blocked.
 	ordinaryIssueID := firstResult.Issue.ID
@@ -524,7 +572,4 @@ func TestChannelIssueDelivery_BindingDeletedOrdinaryEnqueueStillSucceeds(t *test
 	if _, err := q.GetChannelTaskDelivery(ctx, followUpTask.ID); err == nil {
 		t.Fatalf("ordinary follow-up task after binding delete should not have delivery")
 	}
-	// First task's delivery should still be intact (already deleted, so check it was deleted).
-	// The important part is that the first task's delivery was not affected by the binding delete
-	// beyond the initial snapshot - it was already snapshotted.
 }
