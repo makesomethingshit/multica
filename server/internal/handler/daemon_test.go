@@ -235,7 +235,9 @@ func setTaskPrepareLeaseForTest(t *testing.T, ctx context.Context, taskID, expir
 }
 
 func claimTaskByRuntimeForTest(t *testing.T, runtimeID string) (*struct {
-	ID string `json:"id"`
+	ID             string `json:"id"`
+	PriorSessionID string `json:"prior_session_id"`
+	PriorWorkDir   string `json:"prior_work_dir"`
 }, string) {
 	t.Helper()
 
@@ -246,7 +248,9 @@ func claimTaskByRuntimeForTest(t *testing.T, runtimeID string) (*struct {
 
 	var resp struct {
 		Task *struct {
-			ID string `json:"id"`
+			ID             string `json:"id"`
+			PriorSessionID string `json:"prior_session_id"`
+			PriorWorkDir   string `json:"prior_work_dir"`
 		} `json:"task"`
 	}
 	w.JSON(&resp)
@@ -339,10 +343,14 @@ func TestClaimTaskByRuntime_ChatIntroGateClearsAfterUserReplies(t *testing.T) {
 	}
 }
 
-// TestClaimTaskByRuntime_QuickCreateOriginFenceStatusMatrix pins the claim
-// fence between a quick-create origin task and the issue it creates. Every
-// aged non-terminal origin, including deferred rows promoted during polling,
-// keeps the issue task queued; terminal origins release it.
+// TestClaimTaskByRuntime_QuickCreateOriginFenceStatusMatrix pins the bounded
+// soft-ordering fence between a quick-create origin task and the issue it
+// creates. A RECENT origin in one of the active handoff states
+// (queued/dispatched/running/waiting_local_directory) keeps the issue task
+// queued; 'deferred' is not an active handoff blocker; once the candidate
+// outlives the 2-minute quickCreateHandoffWait window it claims COLD (no
+// session/workdir inheritance) even while the origin is still active; terminal
+// origins release it.
 func TestClaimTaskByRuntime_QuickCreateOriginFenceStatusMatrix(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -359,11 +367,13 @@ func TestClaimTaskByRuntime_QuickCreateOriginFenceStatusMatrix(t *testing.T) {
 		"runtime_id": runtimeID,
 		"priority":   -1,
 		"status":     "running",
+		"session_id": "qc-origin-session",
+		"work_dir":   "/tmp/qc-origin-workdir",
 	})
-	// A queued/deferred origin would otherwise be the first candidate for the
-	// runtime. This active quick-create-shaped row keeps that source occupied,
-	// so the assertion exercises the issue-origin fence rather than candidate
-	// ordering.
+	// A queued origin would otherwise be the next candidate once the issue
+	// task is fenced out. This active quick-create-shaped row keeps that slot
+	// occupied, so a nil claim proves the issue-origin fence blocked the
+	// candidate rather than the origin having been claimed instead.
 	dbfx.Task(t, agentID, testutil.Cols{
 		"runtime_id": runtimeID,
 		"priority":   -2,
@@ -371,25 +381,39 @@ func TestClaimTaskByRuntime_QuickCreateOriginFenceStatusMatrix(t *testing.T) {
 	})
 
 	cases := []struct {
-		name     string
-		status   string
-		terminal bool
+		name        string
+		status      string
+		fireAt      string
+		candidateAt string
+		terminal    bool
+		wantBlocked bool
+		wantCold    bool
 	}{
-		{name: "queued aged", status: "queued"},
-		{name: "dispatched aged", status: "dispatched"},
-		{name: "running aged", status: "running"},
-		{name: "waiting local directory aged", status: "waiting_local_directory"},
-		{name: "deferred aged", status: "deferred"},
-		{name: "completed release", status: "completed", terminal: true},
-		{name: "failed release", status: "failed", terminal: true},
-		{name: "cancelled release", status: "cancelled", terminal: true},
+		{name: "recent queued origin blocks", status: "queued", candidateAt: "now()", wantBlocked: true},
+		{name: "recent dispatched origin blocks", status: "dispatched", candidateAt: "now()", wantBlocked: true},
+		{name: "recent running origin blocks", status: "running", candidateAt: "now()", wantBlocked: true},
+		{name: "recent waiting local directory origin blocks", status: "waiting_local_directory", candidateAt: "now()", wantBlocked: true},
+		// The fence uses a positive active-status list, never a broad negative
+		// filter, so a non-fireable deferred row — and any future task state —
+		// never becomes a permanent handoff blocker. fire_at stays in the
+		// future because the claim path promotes DUE deferred rows to queued
+		// before claiming, which would make this an ordinary queued-origin
+		// case instead of proving deferred itself is not a blocker.
+		{name: "deferred origin is not a handoff blocker", status: "deferred", fireAt: "now() + interval '1 hour'", candidateAt: "now()", wantCold: true},
+		// Task liveness wins after the 2-minute handoff window: an aged
+		// candidate claims cold while the origin is still active.
+		{name: "aged running origin cold-claims", status: "running", candidateAt: "now() - interval '3 minutes'", wantCold: true},
+		{name: "aged dispatched origin cold-claims", status: "dispatched", candidateAt: "now() - interval '3 minutes'", wantCold: true},
+		{name: "completed release", status: "completed", candidateAt: "now()", terminal: true},
+		{name: "failed release", status: "failed", candidateAt: "now()", terminal: true},
+		{name: "cancelled release", status: "cancelled", candidateAt: "now()", terminal: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fireAt := "NULL"
-			if tc.status == "deferred" {
-				fireAt = "now() - interval '365 days'"
+			if tc.fireAt != "" {
+				fireAt = tc.fireAt
 			}
 			dbfx.Exec(t, `
 				UPDATE agent_task_queue
@@ -410,10 +434,30 @@ func TestClaimTaskByRuntime_QuickCreateOriginFenceStatusMatrix(t *testing.T) {
 				"runtime_id": runtimeID,
 				"issue_id":   issueID,
 				"priority":   1,
+				"created_at": testutil.Raw(tc.candidateAt),
 			})
 
 			claimed, body := claimTaskByRuntimeForTest(t, runtimeID)
-			if tc.terminal {
+			switch {
+			case tc.wantBlocked:
+				if claimed != nil {
+					t.Fatalf("recent active origin %q should block candidate %s, got %s: %s", tc.status, candidateID, claimed.ID, body)
+				}
+				dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'cancelled', completed_at = now() WHERE id = $1`, candidateID)
+			case tc.wantCold:
+				if claimed == nil {
+					t.Fatalf("candidate %s should claim past the handoff bound (origin %q): %s", candidateID, tc.status, body)
+				}
+				if claimed.ID != candidateID {
+					t.Fatalf("claimed task = %s, want candidate %s: %s", claimed.ID, candidateID, body)
+				}
+				// Aged fallback claims must cold-start: the still-active origin's
+				// session and workdir must never leak into the claim response.
+				if claimed.PriorSessionID != "" || claimed.PriorWorkDir != "" {
+					t.Fatalf("cold claim after the handoff bound must not inherit session %q or workdir %q from the active origin", claimed.PriorSessionID, claimed.PriorWorkDir)
+				}
+				dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, candidateID)
+			default:
 				if claimed == nil {
 					t.Fatalf("terminal origin %q should release candidate %s: %s", tc.status, candidateID, body)
 				}
@@ -421,12 +465,7 @@ func TestClaimTaskByRuntime_QuickCreateOriginFenceStatusMatrix(t *testing.T) {
 					t.Fatalf("claimed task = %s, want candidate %s: %s", claimed.ID, candidateID, body)
 				}
 				dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, candidateID)
-				return
 			}
-			if claimed != nil {
-				t.Fatalf("non-terminal origin %q should block candidate %s, got %s: %s", tc.status, candidateID, claimed.ID, body)
-			}
-			dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'cancelled', completed_at = now() WHERE id = $1`, candidateID)
 		})
 	}
 }

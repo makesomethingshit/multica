@@ -2624,7 +2624,10 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			// after the terminal write. A first issue claim can land in that small
 			// window, so fall back to the issue's exact origin row instead of
 			// relying only on the (agent, issue) lookup. Only terminal origins
-			// are used; active origins are ordered by ClaimAgentTask.
+			// are used: ClaimAgentTask soft-orders a first issue task behind its
+			// exact active origin only inside the bounded quickCreateHandoffWait
+			// window, and an aged fallback claim starts cold — so a still-active
+			// origin never contributes a session or workdir here.
 			if !priorFound && quickCreateOrigin != nil && quickCreateOriginIsTerminal(quickCreateOrigin.Status) {
 				src := *quickCreateOrigin
 				if src.SessionRolloutMissing {

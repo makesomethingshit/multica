@@ -1603,15 +1603,26 @@ WHERE id = (
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => $4::double precision)
       )
-      AND NOT EXISTS (
-          SELECT 1
-          FROM issue handoff_issue
-          JOIN agent_task_queue origin ON origin.id = handoff_issue.origin_id
-          WHERE handoff_issue.id = atq.issue_id
-            AND handoff_issue.origin_type = 'quick_create'
-            AND origin.agent_id = atq.agent_id
-            AND origin.runtime_id = atq.runtime_id
-            AND origin.status NOT IN ('completed', 'failed', 'cancelled')
+      -- Soft-order the first task of a quick-created issue behind its exact
+      -- origin task, but only inside a bounded window. The positive
+      -- active-status list (never a broad negative filter) keeps 'deferred' —
+      -- and any future task state — from becoming a permanent handoff
+      -- blocker, and the age bound (quick_create_handoff_wait_secs) prevents
+      -- an orphaned/stuck origin from blocking the issue forever: once the
+      -- candidate outlives the window it claims cold even while the origin
+      -- is still active.
+      AND (
+          atq.created_at <= now() - make_interval(secs => $5::double precision)
+          OR NOT EXISTS (
+              SELECT 1
+              FROM issue handoff_issue
+              JOIN agent_task_queue origin ON origin.id = handoff_issue.origin_id
+              WHERE handoff_issue.id = atq.issue_id
+                AND handoff_issue.origin_type = 'quick_create'
+                AND origin.agent_id = atq.agent_id
+                AND origin.runtime_id = atq.runtime_id
+                AND origin.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+          )
       )
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
@@ -1638,10 +1649,11 @@ RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, c
 `
 
 type ClaimAgentTaskParams struct {
-	PrepareLeaseSecs float64     `json:"prepare_lease_secs"`
-	AgentID          pgtype.UUID `json:"agent_id"`
-	RuntimeID        pgtype.UUID `json:"runtime_id"`
-	RuntimeStaleSecs float64     `json:"runtime_stale_secs"`
+	PrepareLeaseSecs           float64     `json:"prepare_lease_secs"`
+	AgentID                    pgtype.UUID `json:"agent_id"`
+	RuntimeID                  pgtype.UUID `json:"runtime_id"`
+	RuntimeStaleSecs           float64     `json:"runtime_stale_secs"`
+	QuickCreateHandoffWaitSecs float64     `json:"quick_create_handoff_wait_secs"`
 }
 
 // Claims the next queued task for an agent on one healthy runtime, enforcing
@@ -1660,6 +1672,7 @@ func (q *Queries) ClaimAgentTask(ctx context.Context, arg ClaimAgentTaskParams) 
 		arg.AgentID,
 		arg.RuntimeID,
 		arg.RuntimeStaleSecs,
+		arg.QuickCreateHandoffWaitSecs,
 	)
 	var i AgentTaskQueue
 	err := row.Scan(

@@ -41,10 +41,11 @@ func TestRuntimeHealthGatesClaimsAndStaleDispatchRecovery(t *testing.T) {
 
 	claim := func(runtime string) (db.AgentTaskQueue, error) {
 		return q.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-			AgentID:          util.MustParseUUID(agentID),
-			RuntimeID:        util.MustParseUUID(runtime),
-			PrepareLeaseSecs: 60,
-			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+			AgentID:                    util.MustParseUUID(agentID),
+			RuntimeID:                  util.MustParseUUID(runtime),
+			PrepareLeaseSecs:           60,
+			RuntimeStaleSecs:           RuntimeClaimFreshnessSeconds,
+			QuickCreateHandoffWaitSecs: quickCreateHandoffWait.Seconds(),
 		})
 	}
 	assertNoClaim := func(label, runtime string) {

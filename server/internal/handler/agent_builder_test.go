@@ -1114,10 +1114,11 @@ func TestDeleteBuilderSessionLocksAgentBeforeTasks(t *testing.T) {
 		t.Fatal("delete did not wait for the builder agent lock")
 	}
 	claimed, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-		AgentID:          agent.ID,
-		RuntimeID:        agent.RuntimeID,
-		PrepareLeaseSecs: 30,
-		RuntimeStaleSecs: service.RuntimeClaimFreshnessSeconds,
+		AgentID:                    agent.ID,
+		RuntimeID:                  agent.RuntimeID,
+		PrepareLeaseSecs:           30,
+		RuntimeStaleSecs:           service.RuntimeClaimFreshnessSeconds,
+		QuickCreateHandoffWaitSecs: 120, // service.quickCreateHandoffWait; this test has no qc origin
 	})
 	if err != nil {
 		t.Fatalf("claim while delete waits for agent lock: %v", err)
