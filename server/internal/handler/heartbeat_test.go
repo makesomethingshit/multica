@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/events"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
 // fakeLivenessStore lets tests drive every Available / Touch / IsAliveBatch
@@ -236,6 +238,47 @@ func TestRecordHeartbeat_OfflineToOnlineForcesDBWrite(t *testing.T) {
 	status, _, _ := readRuntimeRow(t, runtimeID)
 	if status != "online" {
 		t.Fatalf("expected status=online after offline→online heartbeat, got %q", status)
+	}
+}
+
+// TestRecordHeartbeat_RecoveryPublishesOnce verifies that a heartbeat-only
+// offline -> online recovery wakes presence clients, while the next ordinary
+// online heartbeat stays silent.
+func TestRecordHeartbeat_RecoveryPublishesOnce(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := createRuntimeLocalSkillTestRuntime(t, testUserID)
+	setRuntimeStatus(t, runtimeID, "offline")
+	setRuntimeLastSeenAt(t, runtimeID, time.Now())
+
+	h := *testHandler
+	h.Bus = events.New()
+	h.LivenessStore = NewNoopLivenessStore()
+	h.HeartbeatScheduler = NewPassthroughHeartbeatScheduler(h.Queries)
+	var refreshes []events.Event
+	h.Bus.Subscribe(protocol.EventDaemonRegister, func(event events.Event) {
+		refreshes = append(refreshes, event)
+	})
+
+	if err := h.recordHeartbeat(context.Background(), loadRuntime(t, runtimeID)); err != nil {
+		t.Fatalf("recovery recordHeartbeat: %v", err)
+	}
+	if len(refreshes) != 1 {
+		t.Fatalf("recovery should publish one daemon refresh, got %d", len(refreshes))
+	}
+	if refreshes[0].WorkspaceID != testWorkspaceID {
+		t.Fatalf("refresh workspace_id = %q, want %q", refreshes[0].WorkspaceID, testWorkspaceID)
+	}
+	if payload, ok := refreshes[0].Payload.(map[string]any); !ok || payload["action"] != "heartbeat_recovery" {
+		t.Fatalf("refresh payload = %#v, want heartbeat_recovery", refreshes[0].Payload)
+	}
+
+	if err := h.recordHeartbeat(context.Background(), loadRuntime(t, runtimeID)); err != nil {
+		t.Fatalf("ordinary recordHeartbeat: %v", err)
+	}
+	if len(refreshes) != 1 {
+		t.Fatalf("ordinary online heartbeat published %d refreshes, want 1 total", len(refreshes))
 	}
 }
 

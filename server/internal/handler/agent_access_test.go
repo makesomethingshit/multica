@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -240,39 +241,22 @@ func TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability(t *testing.T) {
 	}
 
 	runtimeID, runtimeOwnerID, memberID := runtimeVisibilityFixture(t)
-	var agentID string
-	if err := testPool.QueryRow(context.Background(), `
-		INSERT INTO agent (
-			workspace_id, name, description, runtime_mode, runtime_config,
-			runtime_id, visibility, permission_mode, max_concurrent_tasks, owner_id,
-			instructions, custom_env, custom_args
-		)
-		VALUES ($1, 'shared-private-runtime-agent', '', 'cloud', '{}'::jsonb,
-		        $2, 'workspace', 'public_to', 1, $3, '', '{}'::jsonb, '[]'::jsonb)
-		RETURNING id
-	`, testWorkspaceID, runtimeID, runtimeOwnerID).Scan(&agentID); err != nil {
-		t.Fatalf("create shared agent: %v", err)
-	}
-	t.Cleanup(func() {
-		testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID)
+	agentID := dbfx.Agent(t, "shared-private-runtime-agent", runtimeID, testutil.Cols{
+		"visibility":      "workspace",
+		"permission_mode": "public_to",
+		"owner_id":        runtimeOwnerID,
 	})
-	if _, err := testPool.Exec(context.Background(), `
-		INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
-		VALUES ($1, 'workspace', $2)
-	`, agentID, testWorkspaceID); err != nil {
-		t.Fatalf("share agent with workspace: %v", err)
-	}
+	dbfx.Insert(t, "agent_invocation_target", testutil.Cols{
+		"agent_id":    agentID,
+		"target_type": "workspace",
+		"target_id":   testWorkspaceID,
+	})
 
-	w := httptest.NewRecorder()
-	testHandler.ListAgents(w, newRequestAs(memberID, "GET", "/api/agents", nil))
-	if w.Code != http.StatusOK {
-		t.Fatalf("ListAgents as shared member: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
+	listResponse := testutil.Call(t, testHandler.ListAgents,
+		newRequestAs(memberID, "GET", "/api/agents", nil)).Want(http.StatusOK)
 
 	var responses []AgentResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &responses); err != nil {
-		t.Fatalf("decode ListAgents response: %v", err)
-	}
+	listResponse.JSON(&responses)
 	var shared *AgentResponse
 	for i := range responses {
 		if responses[i].ID == agentID {
@@ -287,9 +271,7 @@ func TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability(t *testing.T) {
 		t.Fatalf("runtime_availability = %q, want online", shared.RuntimeAvailability)
 	}
 	var wire []map[string]json.RawMessage
-	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
-		t.Fatalf("decode raw ListAgents response: %v", err)
-	}
+	listResponse.JSON(&wire)
 	for _, item := range wire {
 		if string(item["id"]) != strconv.Quote(agentID) {
 			continue
@@ -310,15 +292,10 @@ func TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability(t *testing.T) {
 		}
 	}
 
-	detailW := httptest.NewRecorder()
-	testHandler.GetAgent(detailW, withURLParam(newRequestAs(memberID, "GET", "/api/agents/"+agentID, nil), "id", agentID))
-	if detailW.Code != http.StatusOK {
-		t.Fatalf("GetAgent as shared member: expected 200, got %d: %s", detailW.Code, detailW.Body.String())
-	}
 	var detail AgentResponse
-	if err := json.Unmarshal(detailW.Body.Bytes(), &detail); err != nil {
-		t.Fatalf("decode GetAgent response: %v", err)
-	}
+	testutil.Call(t, testHandler.GetAgent,
+		withURLParam(newRequestAs(memberID, "GET", "/api/agents/"+agentID, nil), "id", agentID)).
+		Want(http.StatusOK).JSON(&detail)
 	if detail.RuntimeAvailability != "online" {
 		t.Fatalf("GetAgent runtime_availability = %q, want online", detail.RuntimeAvailability)
 	}

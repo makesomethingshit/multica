@@ -1233,7 +1233,17 @@ func (h *Handler) recordHeartbeat(ctx context.Context, rt db.AgentRuntime) error
 	// Either bumps last_seen_at on an already-online row (Touch + race
 	// fallback) or flips status from offline to online. The scheduler
 	// chooses sync vs batched per case; see HeartbeatScheduler doc.
-	return h.HeartbeatScheduler.Schedule(ctx, rt)
+	recovered, err := h.HeartbeatScheduler.Schedule(ctx, rt)
+	if err != nil {
+		return err
+	}
+	if recovered {
+		// Reuse daemon:register so web and mobile invalidate both runtime and
+		// agent projections. This is emitted only for an actual recovery;
+		// ordinary online heartbeats stay silent.
+		h.PublishRuntimeRefresh(uuidToString(rt.WorkspaceID), "system", "", "heartbeat_recovery")
+	}
+	return nil
 }
 
 // heartbeatMetrics carries per-stage timings out of processHeartbeat so the

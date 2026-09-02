@@ -33,7 +33,7 @@ describe("workspaceBySlugOptions", () => {
 });
 
 describe("agentListOptions", () => {
-  it("polls only while any agent is online or unstable", () => {
+  it("polls only while any agent is unstable", () => {
     const options = agentListOptions("ws-1");
     const interval = options.refetchInterval;
     expect(typeof interval).toBe("function");
@@ -44,7 +44,7 @@ describe("agentListOptions", () => {
 
     expect(
       queryState([{ runtime_availability: "online" } as Agent]),
-    ).toBe(30_000);
+    ).toBe(false);
     expect(
       queryState([{ runtime_availability: "unstable" } as Agent]),
     ).toBe(30_000);
