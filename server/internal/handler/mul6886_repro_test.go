@@ -12,11 +12,13 @@ import (
 // Baseline: upstream/main 2e297451001e65f78721efc24e36e7939e0f0ed6 (2026-09-01) + fork HEAD 15d904a99
 // Repro command: go test ./internal/handler -run TestMUL6886 -count=1 -v
 // Scope: strictly "claimed but non-terminal direct-chat follow-up" (queued,
-// dispatched, running, waiting_local_directory). A completed/failed/cancelled
-// successor is intentionally excluded — transcript is left as
-// user A -> user B -> assistant B -> Stopped.(A) to avoid rewriting terminal
-// history (see TestMUL6886_CompletedTerminalNegative_GREEN). This is an intended
-// boundary, not a bug. Deferred and channel batches are likewise never moved.
+// dispatched, running, waiting_local_directory). Terminal successors
+// (completed/failed/cancelled) are intentionally out of scope for this change
+// because correcting them would require rewriting already-finalized turn
+// history — the residual ordering (user A -> user B -> assistant B ->
+// Stopped.(A)) is a known follow-up candidate, not intended behavior
+// (see TestMUL6886_CompletedTerminalNegative_GREEN). Deferred and channel
+// batches are likewise never moved.
 // Predicate: IN ('queued','dispatched','running','waiting_local_directory') —
 // all proven by TestMUL6886_ActiveStates_Table. Retry children
 // (chat_input_task_id != id) remain excluded (TestMUL6886_RetryExclusion_GREEN).

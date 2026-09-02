@@ -3127,12 +3127,14 @@ type ReanchorNextQueuedDirectChatInputParams struct {
 // waiting/running via the same fixture updated in-place).
 //
 // Scope is strictly "claimed but non-terminal direct-chat follow-up".
-// A completed/failed/cancelled successor already has a terminal transcript and
-// is intentionally excluded to avoid rewriting finalized history: in that case
-// the transcript is left as user A -> user B -> assistant B -> Stopped.(A)
-// (see TestMUL6886_CompletedTerminalNegative_GREEN). This is an intended
-// boundary, not a bug. Deferred (including retry children via
-// chat_input_task_id != id) and channel batches are likewise never moved.
+// Terminal successors (completed/failed/cancelled) are intentionally out of
+// scope here because correcting them would require rewriting already-finalized
+// turn history: in that case the transcript is left as user A -> user B ->
+// assistant B -> Stopped.(A) (see
+// TestMUL6886_CompletedTerminalNegative_GREEN). That residual ordering is a
+// known follow-up candidate, not intended behavior. Deferred (including retry
+// children via chat_input_task_id != id) and channel batches are likewise
+// never moved.
 func (q *Queries) ReanchorNextQueuedDirectChatInput(ctx context.Context, arg ReanchorNextQueuedDirectChatInputParams) error {
 	_, err := q.db.Exec(ctx, reanchorNextQueuedDirectChatInput, arg.ChatSessionID, arg.AssistantCreatedAt)
 	return err
