@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -612,12 +611,8 @@ func TestFinalizeClaimDelivery_SettlementFailureIsUnsettled(t *testing.T) {
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
 		testWorkspaceID, "settlement-failure")
 	req = withURLParam(req, "runtimeId", runtimeID)
-	w := httptest.NewRecorder()
-	testHandler.ClaimTaskByRuntime(w, req)
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("claim status = %d, want 500: %s", w.Code, w.Body.String())
-	}
-	if strings.TrimSpace(w.Body.String()) == `{"task":null}` {
+	w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusInternalServerError)
+	if strings.TrimSpace(w.Text()) == `{"task":null}` {
 		t.Fatal("settlement failure was hidden as a successful empty poll")
 	}
 	var tokenCount int
