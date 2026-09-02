@@ -2,9 +2,7 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -72,17 +70,11 @@ func TestSendChatMessage_RuntimeAccessDeniedReturnsStructuredConflict(t *testing
 	req := newRequest(http.MethodPost, "/api/chat/sessions/"+sessionID+"/messages", map[string]any{"content": "please help"})
 	req = withURLParam(req, "sessionId", sessionID)
 	req = withChatTestWorkspaceCtx(t, req)
-	w := httptest.NewRecorder()
-	testHandler.SendChatMessage(w, req)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("SendChatMessage status = %d, want 409: %s", w.Code, w.Body.String())
-	}
+	w := testutil.Call(t, testHandler.SendChatMessage, req).Want(http.StatusConflict)
 	var body struct {
 		ReasonCode string `json:"reason_code"`
 	}
-	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
-		t.Fatalf("decode chat response: %v", err)
-	}
+	w.JSON(&body)
 	if body.ReasonCode != string(ReasonRuntimeAccessDenied) {
 		t.Fatalf("reason_code = %q, want %s", body.ReasonCode, ReasonRuntimeAccessDenied)
 	}
@@ -102,15 +94,11 @@ func TestCommentMention_RuntimeAccessDeniedReportsTargetAndNotice(t *testing.T) 
 	agentID := createRuntimeAccessDeniedAgent(t, ctx, runtimeID, "Mention access denied agent")
 	issueID := createMentionFixtureIssue(t, ctx, "mention access denied issue")
 
-	w := httptest.NewRecorder()
 	req := newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{
 		"content": "[@Agent](mention://agent/" + agentID + ") please help",
 	})
 	req = withURLParam(req, "id", issueID)
-	testHandler.CreateComment(w, req)
-	if w.Code != http.StatusCreated && w.Code != http.StatusOK {
-		t.Fatalf("CreateComment status = %d, want 200/201: %s", w.Code, w.Body.String())
-	}
+	w := testutil.Call(t, testHandler.CreateComment, req).WantOneOf(http.StatusOK, http.StatusCreated)
 	var body struct {
 		TriggerOutcomes []struct {
 			TargetID   string `json:"target_id"`
@@ -118,9 +106,7 @@ func TestCommentMention_RuntimeAccessDeniedReportsTargetAndNotice(t *testing.T) 
 			ReasonCode string `json:"reason_code"`
 		} `json:"trigger_outcomes"`
 	}
-	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
-		t.Fatalf("decode comment response: %v", err)
-	}
+	w.JSON(&body)
 	found := false
 	for _, outcome := range body.TriggerOutcomes {
 		if outcome.TargetID == agentID {

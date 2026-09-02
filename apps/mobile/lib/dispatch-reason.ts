@@ -28,6 +28,11 @@ export function sendFailureMessage(err: unknown): string {
       return "You no longer have permission to run this agent, so the message was not sent.";
     case "agent_runtime_required":
       return "Bind a runtime to this agent before sending a message.";
+    case "runtime_access_denied":
+      // The agent's owner cannot execute it on the selected private runtime.
+      // Retrying never fixes this — the fix is making that runtime public or
+      // rebinding/copying the agent to a runtime its owner can use.
+      return "Message not sent — this agent can't run on its private runtime. Make the runtime public, or rebind/copy the agent to a runtime its owner can use.";
     default:
       return "Your message could not be sent. Please try again.";
   }

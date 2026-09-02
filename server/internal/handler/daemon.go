@@ -1743,9 +1743,12 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		// Route through the SAME finalization as the per-runtime endpoint so the
 		// token and the comment-delivery receipt (delivered_comment_ids for
 		// comment/coalesced-comment tasks) are persisted atomically; on failure
-		// the exact claim is requeued and omitted from this batch.
+		// the exact claim is requeued and omitted from this batch. The shared
+		// final delivery gate re-verifies current runtime ownership inside the
+		// same transaction; a rejected task is settled via FailTask and skipped
+		// while valid tasks in the same batch continue.
 		commentBackedTask := task.TriggerCommentID.Valid || len(task.CoalescedCommentIds) > 0
-		receipt, ferr := h.TaskService.FinalizeTaskClaim(r.Context(), task, db.CreateTaskTokenParams{
+		receipt, settledFailure, ferr := h.finalizeClaimDelivery(r.Context(), &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID, db.CreateTaskTokenParams{
 			ID:          dbid.NewV7(),
 			TokenHash:   auth.HashToken(tokenStr),
 			TaskID:      task.ID,
@@ -1763,6 +1766,9 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
+		if settledFailure != nil {
+			continue
+		}
 		resp.AuthToken = tokenStr
 		resp.RemoteMCPDaemonToken = remoteMCPToken
 		resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
@@ -1775,6 +1781,99 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			"total_ms", time.Since(start).Milliseconds())
 	}
 	writeMeasuredJSON(w, http.StatusOK, map[string]any{"tasks": out})
+}
+
+// finalizeClaimDelivery is the shared final delivery gate for the singular and
+// batch claim paths. It re-verifies the current agent/runtime authorization
+// INSIDE the FinalizeTaskClaim transaction, under a FOR UPDATE row lock on the
+// runtime row, so the decision and the task-token mint commit atomically:
+//
+//   - runtime.owner_id is re-read authoritatively (no stale claim-time
+//     snapshot), and a concurrent re-registration that would change owner_id
+//     blocks until this gate commits — closing the TOCTOU window between the
+//     claim-time runtime read and daemon delivery (PUCK-89 blocker 1);
+//   - the private-runtime owner fence re-runs against the locked row;
+//   - agent.runtime_id still equals the claimed task's runtime (rebind fence);
+//   - agent ownership still satisfies the private-runtime binding.
+//
+// On mismatch the task is settled through the existing
+// failClaimedTaskBeforeLaunch -> TaskService.FailTask path and never returned
+// to the daemon. The settled failure is reported via onSettled so the caller
+// can keep its poll semantics (singular: 200 {"task":null}; batch: skip the
+// task, keep returning valid ones).
+func (h *Handler) finalizeClaimDelivery(
+	ctx context.Context,
+	task *db.AgentTaskQueue,
+	runtime db.AgentRuntime,
+	runtimeID, runtimeWorkspaceID string,
+	token db.CreateTaskTokenParams,
+	deliveredCommentIDs []pgtype.UUID,
+	recordCommentReceipt bool,
+	daemonTokens ...db.CreateDaemonTokenParams,
+) (receipt []pgtype.UUID, settledFailure *claimBuildFailure, err error) {
+	var agentOwnerID pgtype.UUID
+	authorize := func(qtx *db.Queries) error {
+		// FOR UPDATE on the runtime row: any concurrent
+		// UpsertAgentRuntime/visibility flip that would change owner_id or
+		// visibility blocks until this transaction commits, so the values read
+		// here are the ones delivery is authorized against.
+		locked, lerr := qtx.LockAgentRuntimeByID(ctx, runtime.ID)
+		if lerr != nil {
+			return fmt.Errorf("lock runtime for delivery authorization: %w", lerr)
+		}
+		agent, aerr := qtx.GetAgentForUpdate(ctx, task.AgentID)
+		if aerr != nil {
+			return fmt.Errorf("re-read agent for delivery authorization: %w", aerr)
+		}
+		if agent.RuntimeID != task.RuntimeID {
+			return &service.ClaimDeliveryAuthzError{
+				Reason: "error_agent_runtime_changed",
+				Detail: "agent runtime changed before delivery",
+			}
+		}
+		if locked.Visibility == "private" && locked.OwnerID.Valid &&
+			(!agent.OwnerID.Valid || agent.OwnerID != locked.OwnerID) {
+			agentOwnerID = agent.OwnerID
+			return &service.ClaimDeliveryAuthzError{
+				Reason: "error_runtime_access_denied",
+				Detail: "private runtime does not permit task agent at delivery gate",
+			}
+		}
+		return nil
+	}
+
+	receipt, err = h.TaskService.FinalizeTaskClaim(ctx, *task, token, deliveredCommentIDs, recordCommentReceipt, authorize, daemonTokens...)
+	if err == nil {
+		return receipt, nil, nil
+	}
+	var authzErr *service.ClaimDeliveryAuthzError
+	if !errors.As(err, &authzErr) {
+		return nil, nil, err
+	}
+	// Authorization rejected at the delivery boundary: settle through the
+	// existing failure path so the task never reaches the daemon.
+	switch authzErr.Reason {
+	case "error_agent_runtime_changed":
+		failure := h.failClaimedTaskBeforeLaunch(
+			ctx, task,
+			"The agent moved to another runtime before this task could start. Retry the task to run it on the agent's current runtime.",
+			taskfailure.ReasonInvalidTaskIdentity,
+			"error_agent_runtime_changed", http.StatusConflict, "agent runtime changed before task delivery",
+		)
+		return nil, failure, nil
+	default:
+		userMessage := "This private runtime cannot run the assigned agent because the agent and runtime have different owners."
+		if !agentOwnerID.Valid {
+			userMessage = "This private runtime cannot run the assigned agent because the agent has no owner."
+		}
+		failure := h.failClaimedTaskBeforeLaunch(
+			ctx, task,
+			userMessage,
+			taskfailure.ReasonInvalidTaskIdentity,
+			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
+		)
+		return nil, failure, nil
+	}
 }
 
 // claimBuildFailure captures a pre-response failure from
@@ -3365,7 +3464,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to mint Remote MCP daemon token")
 		return
 	}
-	receipt, ferr := h.TaskService.FinalizeTaskClaim(r.Context(), *task, db.CreateTaskTokenParams{
+	receipt, settledFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, db.CreateTaskTokenParams{
 		ID:          dbid.NewV7(),
 		TokenHash:   auth.HashToken(tokenStr),
 		TaskID:      task.ID,
@@ -3384,6 +3483,15 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		// would invalidate that already-authorized execution.
 		requeueFailedClaim("token_and_delivery_receipt")
 		writeError(w, http.StatusInternalServerError, "failed to finalize task claim")
+		return
+	}
+	if settledFailure != nil {
+		// The final delivery gate rejected the task (agent rebound, or the
+		// runtime's current ownership no longer permits this agent). The task
+		// is already terminal via the FailTask path — return the same empty
+		// successful poll the queued-mismatch settle path returns.
+		outcome = settledFailure.outcome
+		payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": nil})
 		return
 	}
 	resp.AuthToken = tokenStr

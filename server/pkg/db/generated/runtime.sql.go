@@ -842,6 +842,42 @@ func (q *Queries) LockAgentRuntime(ctx context.Context, id pgtype.UUID) (AgentRu
 	return i, err
 }
 
+const lockAgentRuntimeByID = `-- name: LockAgentRuntimeByID :one
+SELECT id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name FROM agent_runtime
+WHERE id = $1
+FOR UPDATE
+`
+
+// Row-level exclusive lock on one runtime row, looked up without any
+// workspace filter. Used by the daemon claim's final delivery gate so the
+// ownership re-check and the task-token write share one transaction: a
+// concurrent UpsertAgentRuntime that would change owner_id blocks until the
+// gate commits, so a stale owner decision can never reach delivery.
+func (q *Queries) LockAgentRuntimeByID(ctx context.Context, id pgtype.UUID) (AgentRuntime, error) {
+	row := q.db.QueryRow(ctx, lockAgentRuntimeByID, id)
+	var i AgentRuntime
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.DaemonID,
+		&i.Name,
+		&i.RuntimeMode,
+		&i.Provider,
+		&i.Status,
+		&i.DeviceInfo,
+		&i.Metadata,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OwnerID,
+		&i.LegacyDaemonID,
+		&i.Visibility,
+		&i.ProfileID,
+		&i.CustomName,
+	)
+	return i, err
+}
+
 const lockRuntimesForMerge = `-- name: LockRuntimesForMerge :many
 SELECT id FROM agent_runtime
 WHERE id = ANY($1::uuid[])
