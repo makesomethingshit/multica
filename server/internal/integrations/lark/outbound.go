@@ -316,11 +316,13 @@ func (p *Patcher) processEvent(ctx context.Context, e events.Event) error {
 		return nil
 	}
 
-	// Issue-only completion path. Chat tasks also emit TaskCompleted but
-	// are already handled via ChatDone; the exclusive IssueID.Valid &&
-	// !ChatSessionID.Valid guard prevents double-send and keeps ordinary
-	// chat replies from leaking into the Feishu group.
 	if e.Type == protocol.EventTaskCompleted {
+		if chatSessionID.Valid {
+			// Chat tasks already emitted ChatDone with the real reply;
+			// reacting to TaskCompleted would duplicate the bubble or
+			// resurrect the "Done." fallback. Return before any DB work.
+			return nil
+		}
 		return p.handleIssueCompleted(ctx, taskID, e)
 	}
 
@@ -426,16 +428,6 @@ func (p *Patcher) processEvent(ctx context.Context, e events.Event) error {
 }
 
 func (p *Patcher) handleIssueCompleted(ctx context.Context, taskID pgtype.UUID, _ events.Event) error {
-	task, err := p.queries.GetAgentTask(ctx, taskID)
-	if err != nil {
-		return fmt.Errorf("load agent task: %w", err)
-	}
-	// Exclusive issue-only guard: ordinary chat tasks (ChatSessionID.Valid)
-	// must not be delivered here — they already have a ChatDone bubble and
-	// would double-send or resurrect "Done.".
-	if !task.IssueID.Valid || task.ChatSessionID.Valid {
-		return nil
-	}
 	delivery, err := p.queries.GetChannelTaskDelivery(ctx, taskID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -444,6 +436,13 @@ func (p *Patcher) handleIssueCompleted(ctx context.Context, taskID pgtype.UUID, 
 		return fmt.Errorf("lookup lark task delivery: %w", err)
 	}
 	if delivery.ChannelType != channelTypeFeishu {
+		return nil
+	}
+	task, err := p.queries.GetAgentTask(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("load agent task: %w", err)
+	}
+	if !task.IssueID.Valid || task.ChatSessionID.Valid {
 		return nil
 	}
 	binding := ChatSessionBinding{
