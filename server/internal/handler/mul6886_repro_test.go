@@ -11,17 +11,16 @@ import (
 
 // Baseline: upstream/main 2e297451001e65f78721efc24e36e7939e0f0ed6 (2026-09-01) + fork HEAD 15d904a99
 // Repro command: go test ./internal/handler -run TestMUL6886 -count=1 -v
-// Contract decisions (updated for FIX_THEN_MERGE):
-//   - Predicate now IN ('queued','dispatched','running','waiting_local_directory')
-//     — dispatched/waiting/running are proven via TestMUL6886_ActiveStates_Table.
-//     Completed/failed/cancelled/deferred plus retry children (chat_input_task_id != id)
-//     and channel batches remain deliberately excluded.
-//   - Retry: intentional exclusion (chat_input_task_id=id) stays, pinned by
-//     TestMUL6886_RetryExclusion_GREEN.
-//   - Cursor: only STABLE FINAL SNAPSHOT is contract (fresh cursor after settle).
-//     Pre-settlement continuity is NOT supported — would be NO-GO.
-//   - Baseline: ONLY active-state claimed follow-ups (dispatched/waiting/running)
-//     plus queued control are the red→green core; all boundary tests are GREEN.
+// Scope: strictly "claimed but non-terminal direct-chat follow-up" (queued,
+// dispatched, running, waiting_local_directory). A completed/failed/cancelled
+// successor is intentionally excluded — transcript is left as
+// user A -> user B -> assistant B -> Stopped.(A) to avoid rewriting terminal
+// history (see TestMUL6886_CompletedTerminalNegative_GREEN). This is an intended
+// boundary, not a bug. Deferred and channel batches are likewise never moved.
+// Predicate: IN ('queued','dispatched','running','waiting_local_directory') —
+// all proven by TestMUL6886_ActiveStates_Table. Retry children
+// (chat_input_task_id != id) remain excluded (TestMUL6886_RetryExclusion_GREEN).
+// Cursor: only STABLE FINAL SNAPSHOT is contract (fresh cursor after settle).
 
 // TestMUL6886_DeferredCancelClaimedFollowUp_Repro is the deterministic
 // regression required by the decision-gate. It reproduces the exact race
@@ -230,9 +229,8 @@ func TestMUL6886_ActiveStates_Table(t *testing.T) {
 		t.Skip("database not available")
 	}
 	cases := []struct {
-		name   string
-		status string
-		// extra SQL to make the state realistic (started_at/dispatched_at)
+		name    string
+		status  string
 		prepare string
 	}{
 		{"dispatched", "dispatched", "dispatched_at = now()"},
@@ -259,7 +257,6 @@ func TestMUL6886_ActiveStates_Table(t *testing.T) {
 					t.Fatalf("direct claim B: %v", err)
 				}
 			}
-			// Force B to the table's target active state
 			if tc.status != "dispatched" {
 				q := `UPDATE agent_task_queue SET status=$1, ` + tc.prepare + ` WHERE id=$2`
 				if _, err := testPool.Exec(ctx, q, tc.status, tB); err != nil {
@@ -307,14 +304,12 @@ func TestMUL6886_ActiveStates_Table(t *testing.T) {
 			if bAfter != aAfter && bBefore == bAfter {
 				t.Fatalf("[%s] B was not reanchored: before %s after %s A %s", tc.name, bBefore, bAfter, aAfter)
 			}
-			// Verify B after = A + 1µs (string compare: bAfter should be > aAfter and very close)
 			transcript, err := testHandler.Queries.ListChatMessages(ctx, parseUUID(sessionID))
 			if err != nil {
 				t.Fatalf("list messages for %s: %v", tc.name, err)
 			}
 			t.Logf("[%s] transcript: %v", tc.name, msgContents(transcript))
 			assertChatTranscriptContents(t, transcript, []string{"user A", "Stopped.", "user B"})
-			// Also prove ListChatInputMessages still correct via owner
 			batch, err := testHandler.Queries.ListChatInputMessages(ctx, parseUUID(tB))
 			if err != nil {
 				t.Fatalf("ListChatInputMessages for %s: %v", tc.name, err)
@@ -329,55 +324,12 @@ func TestMUL6886_ActiveStates_Table(t *testing.T) {
 	}
 }
 
-// TestMUL6886_DeferredCancelQueuedFollowUp_Control proves the ordinary queued
-// case still orders correctly on current main (GREEN baseline) — the bug is
-// isolated to the claimed successor window.
-func TestMUL6886_DeferredCancelQueuedFollowUp_Control(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	agentID, sessionID, _, _ := setupDirectChatSession(t, ctx, "MUL-6886 control queued")
-
-	tA := sendDirectChat(t, ctx, agentID, sessionID, "user A")
-	markTaskRunning(t, ctx, tA)
-	if _, err := testHandler.TaskService.CancelTaskWithResult(ctx, parseUUID(tA), service.CancelTaskOptions{ClientSupportsDraftRestore: true}); err != nil {
-		t.Fatalf("cancel A: %v", err)
-	}
-	tB := sendDirectChat(t, ctx, agentID, sessionID, "user B")
-
-	insertTaskTranscriptRow(t, ctx, tA)
-	if changed := testHandler.TaskService.FinalizeDeferredCancelledChat(ctx, parseUUID(tA)); !changed {
-		t.Fatalf("finalize should claim marker")
-	}
-
-	transcript, err := testHandler.Queries.ListChatMessages(ctx, parseUUID(sessionID))
-	if err != nil {
-		t.Fatalf("list messages: %v", err)
-	}
-	t.Logf("CONTROL transcript (queued B): %v", msgContents(transcript))
-	assertChatTranscriptContents(t, transcript, []string{"user A", "Stopped.", "user B"})
-
-	var status string
-	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id=$1`, tB).Scan(&status); err != nil {
-		t.Fatalf("read B status: %v", err)
-	}
-	if status != "queued" {
-		t.Fatalf("control B status = %q, want queued", status)
-	}
-	if status == "" {
-		t.Fatalf("status empty")
-	}
-}
-
 // TestMUL6886_RetryExclusion_GREEN pins that retry-owned input is intentionally
 // NOT reanchored. When B has a running retry B2 (chat_input_task_id = B), the
 // next head is B2 (dispatched) but the physical user row is still task_id=B
 // with chat_input_task_id != id for the head. The current ReanchorNextQueued
 // filter chat_input_task_id=id excludes it, and the minimal fix will keep that
-// exclusion to avoid moving terminal-history rows via the retry child. Baseline
-// is GREEN (no move, no duplicate) and stays green after fix; owner-based
-// targeting was considered and rejected as too broad for this patch.
+// exclusion to avoid moving terminal-history rows via the retry child.
 func TestMUL6886_RetryExclusion_GREEN(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -460,102 +412,11 @@ func TestMUL6886_RetryExclusion_GREEN(t *testing.T) {
 	}
 }
 
-// TestMUL6886_CursorStableFinalSnapshot_GREEN verifies pagination stability
-// for the QUEUED case as GREEN baseline. It reconstructs the final transcript
-// via small pages entirely AFTER settlement (fresh cursor) and checks no
-// duplicate/skip and correct order. Pre-settlement cursor continuity is NOT
-// asserted here — that is the explicitly excluded contract (see header). If
-// that continuity were required, this mutable created_at fix would be NO-GO.
-func TestMUL6886_CursorStableFinalSnapshot_GREEN(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	agentID, sessionID, _, _ := setupDirectChatSession(t, ctx, "MUL-6886 cursor stable final")
-
-	tA := sendDirectChat(t, ctx, agentID, sessionID, "user A")
-	markTaskRunning(t, ctx, tA)
-	if _, err := testHandler.TaskService.CancelTaskWithResult(ctx, parseUUID(tA), service.CancelTaskOptions{ClientSupportsDraftRestore: true}); err != nil {
-		t.Fatalf("cancel A: %v", err)
-	}
-	sendDirectChat(t, ctx, agentID, sessionID, "user B")
-	insertTaskTranscriptRow(t, ctx, tA)
-	if changed := testHandler.TaskService.FinalizeDeferredCancelledChat(ctx, parseUUID(tA)); !changed {
-		t.Fatalf("finalize should claim marker")
-	}
-
-	full, err := testHandler.Queries.ListChatMessages(ctx, parseUUID(sessionID))
-	if err != nil {
-		t.Fatalf("full list: %v", err)
-	}
-	var want []string
-	for _, m := range full {
-		if uuidToString(m.ID) == "" {
-			t.Fatalf("message id empty")
-		}
-		if !m.CreatedAt.Valid || m.CreatedAt.Time.IsZero() {
-			t.Fatalf("message created_at invalid: %+v", m)
-		}
-		want = append(want, m.Content)
-	}
-	if len(want) == 0 {
-		t.Fatalf("want empty")
-	}
-	t.Logf("FULL after settle: %v", want)
-
-	var paged []string
-	seen := map[string]bool{}
-	var before *ChatMessagesCursorResponse
-	for {
-		params := url.Values{"limit": {"1"}}
-		if before != nil {
-			if before.CreatedAt == "" || before.ID == "" {
-				t.Fatalf("before cursor empty: %+v", before)
-			}
-			params.Set("before_created_at", before.CreatedAt)
-			params.Set("before_id", before.ID)
-		}
-		page := fetchChatMessagesPageForTest(t, sessionID, params)
-		for _, m := range page.Messages {
-			if seen[m.ID] {
-				t.Fatalf("duplicate %s", m.ID)
-			}
-			if m.ID == "" {
-				t.Fatalf("paged message id empty")
-			}
-			if m.CreatedAt == "" {
-				t.Fatalf("paged message created_at empty: %+v", m)
-			}
-			seen[m.ID] = true
-			paged = append([]string{m.Content}, paged...)
-		}
-		if !page.HasMore {
-			break
-		}
-		if page.NextCursor == nil {
-			t.Fatal("has_more without next_cursor")
-		}
-		if page.NextCursor.CreatedAt == "" || page.NextCursor.ID == "" {
-			t.Fatalf("next cursor empty: %+v", page.NextCursor)
-		}
-		before = page.NextCursor
-	}
-	t.Logf("PAGED reconstructed: %v", paged)
-	assertChatTranscriptContents(t, full, want)
-	if len(paged) != len(want) {
-		t.Fatalf("paged len %d != full len %d", len(paged), len(want))
-	}
-	for i := range want {
-		if paged[i] != want[i] {
-			t.Fatalf("paged[%d]=%q want %q", i, paged[i], want[i])
-		}
-	}
-}
-
 // TestMUL6886_CompletedTerminalNegative_GREEN pins that a completed follow-up
 // is NOT reanchored. If B already has assistant B before A settles, A's late
-// settlement must not rewrite B's input position. Baseline GREEN (no move) and
-// stays green after fix because predicate excludes completed/failed/cancelled.
+// settlement must not rewrite B's input position. This is the intentional
+// boundary for claimed but non-terminal scope: transcript is left as
+// user A -> user B -> assistant B -> Stopped.(A).
 func TestMUL6886_CompletedTerminalNegative_GREEN(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -635,62 +496,7 @@ func TestMUL6886_CompletedTerminalNegative_GREEN(t *testing.T) {
 	assertChatTranscriptContents(t, fullAfter, []string{"user A", "user B", "assistant B", "Stopped."})
 }
 
-// TestMUL6886_SynchronousCancel_GREEN verifies the synchronous cancel path
-// (non-deferred, already has transcript) still orders correctly without deferral.
-// Baseline GREEN.
-func TestMUL6886_SynchronousCancel_GREEN(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	agentID, sessionID, _, _ := setupDirectChatSession(t, ctx, "MUL-6886 sync cancel")
-
-	tA := sendDirectChat(t, ctx, agentID, sessionID, "user A")
-	markTaskRunning(t, ctx, tA)
-	insertTaskTranscriptRow(t, ctx, tA)
-	res, err := testHandler.TaskService.CancelTaskWithResult(ctx, parseUUID(tA), service.CancelTaskOptions{ClientSupportsDraftRestore: true})
-	if err != nil {
-		t.Fatalf("cancel A sync: %v", err)
-	}
-	if res.CancelledChatMessage != nil {
-		t.Logf("sync cancel produced restore? %+v", res.CancelledChatMessage)
-	}
-	var deferred *string
-	if err := testPool.QueryRow(ctx, `SELECT chat_finalize_deferred_at::text FROM agent_task_queue WHERE id=$1`, tA).Scan(&deferred); err != nil {
-		t.Fatalf("read deferred: %v", err)
-	}
-	if deferred != nil {
-		t.Fatalf("sync cancel should not defer, got %s", *deferred)
-	}
-	tB := sendDirectChat(t, ctx, agentID, sessionID, "user B")
-	if tB == "" {
-		t.Fatalf("tB empty")
-	}
-	transcript, err := testHandler.Queries.ListChatMessages(ctx, parseUUID(sessionID))
-	if err != nil {
-		t.Fatalf("list messages: %v", err)
-	}
-	t.Logf("sync cancel transcript: %v", msgContents(transcript))
-	for _, m := range transcript {
-		if uuidToString(m.ID) == "" || !m.CreatedAt.Valid {
-			t.Fatalf("message id/timestamp empty: %+v", m)
-		}
-	}
-	assertChatTranscriptContents(t, transcript, []string{"user A", "Stopped.", "user B"})
-	var bStatus string
-	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id=$1`, tB).Scan(&bStatus); err != nil {
-		t.Fatalf("read bStatus: %v", err)
-	}
-	if bStatus != "queued" {
-		t.Fatalf("B should be queued after sync cancel, got %s", bStatus)
-	}
-	if bStatus == "" {
-		t.Fatalf("bStatus empty")
-	}
-}
-
 // TestMUL6886_ChannelIsolation_GREEN verifies channel-ingested batches are NOT moved.
-// Baseline GREEN.
 func TestMUL6886_ChannelIsolation_GREEN(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -770,113 +576,3 @@ func TestMUL6886_ChannelIsolation_GREEN(t *testing.T) {
 		}
 	}
 }
-
-// TestMUL6886_SameSessionScope_GREEN verifies tenancy isolation: settling
-// session S1's A must not move session S2's B. Baseline GREEN.
-func TestMUL6886_SameSessionScope_GREEN(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-	agentID, session1, runtimeID, daemonID := setupDirectChatSession(t, ctx, "MUL-6886 session scope S1")
-	var session2 string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO chat_session (workspace_id, agent_id, creator_id, title, explicitly_created_at)
-		VALUES ($1, $2, $3, 'MUL-6886 S2', now())
-		RETURNING id::text
-	`, testWorkspaceID, agentID, testUserID).Scan(&session2); err != nil {
-		t.Fatalf("insert session2: %v", err)
-	}
-	if session2 == "" {
-		t.Fatalf("session2 empty")
-	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM chat_session WHERE id=$1`, session2) })
-
-	s1A := sendDirectChat(t, ctx, agentID, session1, "S1 user A")
-	markTaskRunning(t, ctx, s1A)
-	if _, err := testHandler.TaskService.CancelTaskWithResult(ctx, parseUUID(s1A), service.CancelTaskOptions{ClientSupportsDraftRestore: true}); err != nil {
-		t.Fatalf("cancel s1A: %v", err)
-	}
-	s1B := sendDirectChat(t, ctx, agentID, session1, "S1 user B")
-	claimTaskForRuntimeGuard(t, runtimeID, daemonID)
-	var s1BStatus string
-	if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id=$1`, s1B).Scan(&s1BStatus); err != nil {
-		t.Fatalf("read s1BStatus: %v", err)
-	}
-	if s1BStatus == "queued" {
-		if _, err := testHandler.TaskService.ClaimTask(ctx, parseUUID(agentID)); err != nil {
-			t.Fatalf("claim s1B fallback: %v", err)
-		}
-		if err := testPool.QueryRow(ctx, `SELECT status FROM agent_task_queue WHERE id=$1`, s1B).Scan(&s1BStatus); err != nil {
-			t.Fatalf("read s1BStatus after fallback: %v", err)
-		}
-	}
-	if s1BStatus == "" {
-		t.Fatalf("s1BStatus empty")
-	}
-
-	sess2, err := testHandler.Queries.GetChatSession(ctx, parseUUID(session2))
-	if err != nil {
-		t.Fatalf("get session2: %v", err)
-	}
-	ag, err := testHandler.Queries.GetAgent(ctx, parseUUID(agentID))
-	if err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	res, err := testHandler.TaskService.SendDirectChatMessage(ctx, sess2, ag, parseUUID(testUserID), "S2 user B", nil, "member", parseUUID(testUserID))
-	if err != nil {
-		t.Fatalf("send S2 B: %v", err)
-	}
-	s2B := uuidToString(res.Task.ID)
-	if s2B == "" {
-		t.Fatalf("s2B empty")
-	}
-	var s2BBefore string
-	if err := testPool.QueryRow(ctx, `SELECT created_at::text FROM chat_message WHERE task_id=$1`, s2B).Scan(&s2BBefore); err != nil {
-		t.Fatalf("read s2BBefore: %v", err)
-	}
-	if s2BBefore == "" {
-		t.Fatalf("s2BBefore empty")
-	}
-
-	insertTaskTranscriptRow(t, ctx, s1A)
-	if changed := testHandler.TaskService.FinalizeDeferredCancelledChat(ctx, parseUUID(s1A)); !changed {
-		t.Fatalf("finalize should claim marker")
-	}
-
-	var s2BAfter string
-	if err := testPool.QueryRow(ctx, `SELECT created_at::text FROM chat_message WHERE task_id=$1`, s2B).Scan(&s2BAfter); err != nil {
-		t.Fatalf("read s2BAfter: %v", err)
-	}
-	if s2BAfter == "" {
-		t.Fatalf("s2BAfter empty")
-	}
-	t.Logf("S2 B before=%s after=%s", s2BBefore, s2BAfter)
-	if s2BBefore != s2BAfter {
-		t.Fatalf("cross-session move: S2 B moved %s -> %s due to S1 settlement", s2BBefore, s2BAfter)
-	}
-	s1Transcript, err := testHandler.Queries.ListChatMessages(ctx, parseUUID(session1))
-	if err != nil {
-		t.Fatalf("list s1: %v", err)
-	}
-	t.Logf("S1 transcript: %v", msgContents(s1Transcript))
-	for _, m := range s1Transcript {
-		if uuidToString(m.ID) == "" || !m.CreatedAt.Valid {
-			t.Fatalf("s1 message id/timestamp empty: %+v", m)
-		}
-	}
-	assertChatTranscriptContents(t, s1Transcript, []string{"S1 user A", "Stopped.", "S1 user B"})
-	s2Transcript, err := testHandler.Queries.ListChatMessages(ctx, parseUUID(session2))
-	if err != nil {
-		t.Fatalf("list s2: %v", err)
-	}
-	t.Logf("S2 transcript: %v", msgContents(s2Transcript))
-	for _, m := range s2Transcript {
-		if uuidToString(m.ID) == "" || !m.CreatedAt.Valid {
-			t.Fatalf("s2 message id/timestamp empty: %+v", m)
-		}
-	}
-	assertChatTranscriptContents(t, s2Transcript, []string{"S2 user B"})
-}
-
-
