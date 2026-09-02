@@ -6127,7 +6127,7 @@ func gateResumeToReachableSession(task *Task, taskCtx *execenv.TaskContextForEnv
 	var reachable bool
 	if providerUsesPiSessionFile(provider) {
 		reachable = piSessionFilePresent(task.PriorSessionID)
-	} else if provider == "codex" && execenv.ValidCodexSessionStoreScope(task.SessionStoreScope) && len(task.SessionStoreScope) > 3 && task.SessionStoreScope[:3] == "qc_" && execenv.CodexStoreHasRollout(profile, task.AgentID, task.SessionStoreScope, task.PriorSessionID) {
+	} else if provider == "codex" && execenv.ValidCodexQuickCreateSessionStoreScope(task.SessionStoreScope) && execenv.CodexStoreHasRollout(profile, task.AgentID, task.SessionStoreScope, task.PriorSessionID) {
 		// Validated quick-create store with rollout present is reachable even
 		// across fresh workdirs (common durable path). Regular-file check
 		// ensures GC'd or corrupted rollouts still fall back.

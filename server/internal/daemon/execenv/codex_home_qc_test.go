@@ -15,6 +15,10 @@ func TestValidCodexSessionStoreScope(t *testing.T) {
 		valid bool
 	}{
 		{"valid qc", "qc_019f59d9-a6aa-7a53-b173-1eccc4b4c874", true},
+		{"qc prefix only", "qc_", false},
+		{"qc non-uuid", "qc_not-a-uuid", false},
+		{"qc uppercase uuid", "qc_019F59D9-A6AA-7A53-B173-1ECCC4B4C874", false},
+		{"qc compact uuid", "qc_019f59d9a6aa7a53b1731eccc4b4c874", false},
 		{"empty", "", false},
 		{"path separator", "qc_bad/scope", false},
 		{"punctuation", "qc_bad:scope", false},
@@ -44,17 +48,29 @@ func TestCodexSessionStoreKey_QuickCreateScope(t *testing.T) {
 	if filepath.Base(keyQC) != qcScope {
 		t.Fatalf("qc key base should be qc scope, got %q", keyQC)
 	}
-	// malformed scope falls back to issue
-	malformed := "qc_bad/scope"
-	keyFallback := codexSessionStoreKey("", TaskContextForEnv{AgentID: agentID, SessionStoreScope: malformed, IssueID: issueID})
-	if keyFallback != keyIssue {
-		t.Fatalf("malformed qc scope should fall back to issue, got %q vs %q", keyFallback, keyIssue)
-	}
 	// chat fallback
 	chatID := "019f59d9-a6aa-7a53-b173-1eccc4b4c875"
 	keyChat := codexSessionStoreKey("", TaskContextForEnv{AgentID: agentID, ChatSessionID: chatID})
 	if !strings.HasPrefix(filepath.Base(keyChat), "chat_") {
 		t.Fatalf("chat key should have chat_ prefix, got %q", keyChat)
+	}
+	// Every malformed qc scope falls back to the stable issue/chat key rather
+	// than overriding it with a potentially colliding directory name.
+	for _, malformed := range []string{
+		"qc_",
+		"qc_not-a-uuid",
+		"qc_bad/scope",
+		"qc_019F59D9-A6AA-7A53-B173-1ECCC4B4C874",
+		"qc_019f59d9a6aa7a53b1731eccc4b4c874",
+	} {
+		keyFallback := codexSessionStoreKey("", TaskContextForEnv{AgentID: agentID, SessionStoreScope: malformed, IssueID: issueID})
+		if keyFallback != keyIssue {
+			t.Fatalf("malformed qc scope %q should fall back to issue, got %q vs %q", malformed, keyFallback, keyIssue)
+		}
+		chatFallback := codexSessionStoreKey("", TaskContextForEnv{AgentID: agentID, SessionStoreScope: malformed, ChatSessionID: chatID})
+		if chatFallback != keyChat {
+			t.Fatalf("malformed qc scope %q should fall back to chat, got %q vs %q", malformed, chatFallback, keyChat)
+		}
 	}
 	// qc should override even chat when valid
 	keyQCChat := codexSessionStoreKey("", TaskContextForEnv{AgentID: agentID, SessionStoreScope: qcScope, ChatSessionID: chatID})
