@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -403,11 +404,29 @@ func codexSessionStoreNamespace(profile string) string {
 	return "p_" + hex.EncodeToString(sum[:])
 }
 
+const codexQuickCreateScopePrefix = "qc_"
+
 // ValidCodexSessionStoreScope reports whether scope is one safe path segment.
-// The daemon falls back to IssueID/chat when the wire value is malformed instead
-// of silently normalizing two distinct scopes into the same directory.
+// Quick-create scopes are additionally required to contain a canonical UUID so
+// malformed wire values fall back to IssueID/chat instead of selecting a
+// colliding store.
 func ValidCodexSessionStoreScope(scope string) bool {
-	return scope != "" && len(scope) <= 255 && sanitizePathSegment(scope) == scope
+	if scope == "" || len(scope) > 255 || sanitizePathSegment(scope) != scope {
+		return false
+	}
+	if strings.HasPrefix(scope, codexQuickCreateScopePrefix) {
+		rawID := strings.TrimPrefix(scope, codexQuickCreateScopePrefix)
+		parsed, err := uuid.Parse(rawID)
+		return err == nil && parsed.String() == rawID
+	}
+	return true
+}
+
+// ValidCodexQuickCreateSessionStoreScope reports whether scope is the exact
+// canonical qc_<UUID> form used for quick-create handoff. This is the single
+// validator shared by store-key derivation and the resume reachability gate.
+func ValidCodexQuickCreateSessionStoreScope(scope string) bool {
+	return strings.HasPrefix(scope, codexQuickCreateScopePrefix) && ValidCodexSessionStoreScope(scope)
 }
 
 // isValidQuickCreateScope reports whether scope is a validated quick-create
@@ -415,7 +434,7 @@ func ValidCodexSessionStoreScope(scope string) bool {
 // single segment; sanitization prevents traversal but distinct malformed scopes
 // may collide into the same issue directory, so the check is strict.
 func isValidQuickCreateScope(scope string) bool {
-	return ValidCodexSessionStoreScope(scope) && strings.HasPrefix(scope, "qc_")
+	return ValidCodexQuickCreateSessionStoreScope(scope)
 }
 
 // codexSessionStoreKey builds a profile-and-task key for persistent Codex
