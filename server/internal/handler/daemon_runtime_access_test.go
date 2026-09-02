@@ -303,7 +303,7 @@ func (h *Handler) finalizeClaimDeliveryForTestWithRuntime(
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, nil, fmt.Errorf("remote mcp token: %w", derr)
 	}
 	commentBackedTask := task.TriggerCommentID.Valid || len(task.CoalescedCommentIds) > 0
-	receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, db.CreateTaskTokenParams{
+	receipt, deliveryFailure, ferr := h.finalizeClaimDelivery(r.Context(), task, runtime, runtimeID, runtimeWorkspaceID, &resp, db.CreateTaskTokenParams{
 		ID:          dbid.NewV7(),
 		TokenHash:   auth.HashToken(tokenStr),
 		TaskID:      task.ID,
@@ -347,12 +347,22 @@ func TestClaimTaskByRuntime_RuntimeOwnerChangedAfterClaimNeverDelivered(t *testi
 	if task == nil || uuidToString(task.ID) != taskID {
 		t.Fatalf("claimed task = %+v, want %s", task, taskID)
 	}
+	runtimeSnapshot, err := testHandler.Queries.GetAgentRuntimeForWorkspace(ctx, db.GetAgentRuntimeForWorkspaceParams{
+		ID:          parseUUID(runtimeID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load claim-time runtime: %v", err)
+	}
+	if !runtimeSnapshot.OwnerID.Valid {
+		t.Fatal("claim-time runtime owner unexpectedly missing")
+	}
 	dbfx.Exec(t, `UPDATE agent_runtime SET owner_id = $1 WHERE id = $2`, newOwnerID, runtimeID)
 
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
 		testWorkspaceID, "delivery-gate-owner-change")
-	resp, deliveredCommentIDs, _, _, settledFailure, finalizeErr := testHandler.finalizeClaimDeliveryForTest(
-		req, task, runtimeID, testWorkspaceID,
+	resp, deliveredCommentIDs, _, _, settledFailure, finalizeErr := testHandler.finalizeClaimDeliveryForTestWithRuntime(
+		req, task, runtimeSnapshot, runtimeID, testWorkspaceID,
 	)
 	if finalizeErr != nil {
 		t.Fatalf("finalize delivery: %v", finalizeErr)
@@ -428,6 +438,14 @@ func TestFinalizeClaimDelivery_UsesCurrentRuntimeOwnerForTaskToken(t *testing.T)
 	if !runtimeSnapshot.OwnerID.Valid {
 		t.Fatal("claim-time runtime owner unexpectedly missing")
 	}
+	claimOwner, err := testHandler.Queries.GetUser(ctx, runtimeSnapshot.OwnerID)
+	if err != nil {
+		t.Fatalf("load claim-time runtime owner: %v", err)
+	}
+	const staleProfile = "stale claim-time owner profile"
+	const currentProfile = "current delivery owner profile"
+	dbfx.Exec(t, `UPDATE "user" SET profile_description = $1 WHERE id = $2`, staleProfile, runtimeSnapshot.OwnerID)
+	dbfx.Exec(t, `UPDATE "user" SET profile_description = $1 WHERE id = $2`, currentProfile, newOwnerID)
 	dbfx.Exec(t, `UPDATE agent_runtime SET visibility = 'public', owner_id = $1 WHERE id = $2`, newOwnerID, runtimeID)
 
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
@@ -449,6 +467,16 @@ func TestFinalizeClaimDelivery_UsesCurrentRuntimeOwnerForTaskToken(t *testing.T)
 	dbfx.QueryRow(t, `SELECT user_id::text FROM task_token WHERE task_id = $1`, taskID).Scan(&tokenOwnerID)
 	if tokenOwnerID != newOwnerID {
 		t.Fatalf("task token user_id = %q, want current runtime owner %q", tokenOwnerID, newOwnerID)
+	}
+	currentOwner, err := testHandler.Queries.GetUser(ctx, parseUUID(newOwnerID))
+	if err != nil {
+		t.Fatalf("load current runtime owner: %v", err)
+	}
+	if resp.RequestingUserName != currentOwner.Name || resp.RequestingUserProfileDescription != currentProfile {
+		t.Fatalf("requesting user = %q/%q, want current owner %q/%q", resp.RequestingUserName, resp.RequestingUserProfileDescription, currentOwner.Name, currentProfile)
+	}
+	if resp.RequestingUserName == claimOwner.Name || strings.Contains(resp.RequestingUserProfileDescription, staleProfile) {
+		t.Fatalf("requesting user leaked stale claim-time owner %q/%q", claimOwner.Name, staleProfile)
 	}
 }
 
@@ -548,7 +576,7 @@ func injectRuntimeOwnerFlipAfterClaim(t *testing.T, ctx context.Context, taskID,
 	if _, err := testPool.Exec(ctx, fmt.Sprintf(`
 CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $fn$
 BEGIN
-	UPDATE agent_runtime SET owner_id = '%s'::uuid WHERE id = '%s'::uuid;
+	UPDATE agent_runtime SET visibility = 'private', owner_id = '%s'::uuid WHERE id = '%s'::uuid;
 	RETURN NEW;
 END
 $fn$;
@@ -620,11 +648,24 @@ func TestClaimTasksByRuntime_OwnerChangedAfterSnapshotSettlesMismatchReturnsVali
 	mismatchTaskID := seedQueuedIssueTask(t, ctx, mismatchAgentID, runtimeID, mismatchIssueID)
 	validTaskID := seedQueuedIssueTask(t, ctx, validAgentID, runtimeID, validIssueID)
 
-	// The batch handler resolves runtime snapshots (owner = fixture user)
-	// before claiming. Flip the mismatch agent's owner after enqueue so the
-	// agent/runtime owner mismatch only exists at the delivery gate, then let
-	// the handler claim + finalize both tasks in one poll.
-	dbfx.Exec(t, `UPDATE agent SET owner_id = $1 WHERE id = $2`, newOwnerID, mismatchAgentID)
+	// The batch handler resolves runtime snapshots before claiming. Start with a
+	// public runtime so both agents are claimable, then flip its visibility and
+	// owner after the mismatch task is claimed. The valid agent already belongs
+	// to the new owner, so only the stale-snapshot task is rejected at the gate.
+	dbfx.Exec(t, `UPDATE agent_runtime SET visibility = 'public' WHERE id = $1`, runtimeID)
+	dbfx.Exec(t, `UPDATE agent SET owner_id = $1 WHERE id = $2`, newOwnerID, validAgentID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET priority = 1 WHERE id = $1`, mismatchTaskID)
+	injectRuntimeOwnerFlipAfterClaim(t, ctx, mismatchTaskID, runtimeID, newOwnerID)
+	runtimeSnapshot, err := testHandler.Queries.GetAgentRuntimeForWorkspace(ctx, db.GetAgentRuntimeForWorkspaceParams{
+		ID:          parseUUID(runtimeID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load batch claim-time runtime: %v", err)
+	}
+	if runtimeSnapshot.Visibility != "public" || !runtimeSnapshot.OwnerID.Valid {
+		t.Fatalf("claim-time runtime = %+v, want public runtime with owner", runtimeSnapshot)
+	}
 
 	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 5)
 	if w.Code != http.StatusOK {
