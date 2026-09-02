@@ -5104,9 +5104,9 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			slot := slots[i]
 			taskTarget := t.IssueID
 			if taskTarget == "" && t.ChatSessionID != "" {
-				taskTarget = "chat:" + shortID(t.ChatSessionID)
+				taskTarget = "chat:" + t.ChatSessionID
 			}
-			d.logger.Info("task received", "task", shortID(t.ID), "target", taskTarget)
+			d.logger.Info("task received", "task", t.ID, "target", taskTarget)
 			taskWG.Add(1)
 			d.activeTasks.Add(1)
 			if cache, ok := d.repoCache.(interface{ CancelMaintenance() }); ok {
@@ -5315,27 +5315,32 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// like a misconfigured host and is not retried.
 	if !tracked {
 		d.logger.Warn("claimed task targets a runtime this daemon no longer hosts; failing it back for retry",
-			"task", shortID(task.ID), "runtime_id", task.RuntimeID)
+			"task", task.ID, "runtime_id", task.RuntimeID)
 		if err := d.reportTerminalTask(ctx, terminalTaskReport{
 			kind:          terminalTaskReportFail,
 			taskID:        task.ID,
 			errorMessage:  "runtime went offline before the task started",
 			failureReason: taskfailure.ReasonRuntimeOffline.String(),
 		}); err != nil {
-			d.logger.Error("fail task callback failed", "task", shortID(task.ID), "error", err)
+			d.logger.Error("fail task callback failed", "task", task.ID, "error", err)
 		}
 		return
 	}
 	provider := rt.Provider
 
-	// Task-scoped logger with short ID for readable concurrent logs.
-	taskLog := d.logger.With("task", shortID(task.ID))
+	// Task-scoped logger. The task id goes in whole: it is the key every
+	// other surface prints (task JSON, env-root ownership manifest, server
+	// logs), so a full id is what lets a log line be joined to them. An
+	// 8-char prefix cannot — task ids are UUIDv7, whose leading 32 bits are
+	// a millisecond timestamp that only advances every ~65s, so concurrent
+	// tasks routinely share one (#7326).
+	taskLog := d.logger.With("task", task.ID)
 	agentName := "agent"
 	if task.Agent != nil {
 		agentName = task.Agent.Name
 	}
 	if task.ChatSessionID != "" {
-		taskLog.Info("picked chat task", "chat_session", shortID(task.ChatSessionID), "agent", agentName, "provider", provider)
+		taskLog.Info("picked chat task", "chat_session", task.ChatSessionID, "agent", agentName, "provider", provider)
 	} else {
 		taskLog.Info("picked task", "issue", task.IssueID, "agent", agentName, "provider", provider)
 	}
@@ -5548,6 +5553,32 @@ type worktreePreservedError struct{ err error }
 func (e *worktreePreservedError) Error() string { return e.err.Error() }
 func (e *worktreePreservedError) Unwrap() error { return e.err }
 
+// environmentSetupError marks a failure to build or re-open the task's
+// execution environment: everything execenv.Prepare / execenv.Reuse does on
+// this host before the agent process exists — the workspace directory and its
+// overlay homes, plus the per-provider local config written or validated
+// inside it. Its causes are local, and not only filesystem ones: a full
+// volume, a read-only or permission-denied workspaces root, a directory
+// another process still holds open, an I/O error on the disk underneath, or a
+// local runtime config the daemon refuses to boot past.
+//
+// It carries the wrapped error's message unchanged and exists purely so
+// taskRunFailureReason can recognise the phase structurally. Without it the
+// OS error text falls through to taskfailure.Classify, a classifier written
+// to read agent and provider output, and lands in agent_error.* — today the
+// catchall, historically provider_server_error, which pointed one bug report
+// at an LLM vendor for hours (#7913). The task never reached an agent, so no
+// reason in that namespace can be right.
+type environmentSetupError struct{ err error }
+
+func (e *environmentSetupError) Error() string { return e.err.Error() }
+func (e *environmentSetupError) Unwrap() error { return e.err }
+
+// asEnvironmentSetupFailure tags err as an execution-environment setup
+// failure. The message is untouched, so the wrapper is invisible to everything
+// except taskRunFailureReason.
+func asEnvironmentSetupFailure(err error) error { return &environmentSetupError{err: err} }
+
 func taskRunFailureReason(err error) string {
 	if errors.Is(err, errInvalidTaskIdentity) {
 		return taskfailure.ReasonInvalidTaskIdentity.String()
@@ -5571,6 +5602,18 @@ func taskRunFailureReason(err error) string {
 	// preparationErrorKind (#7112).
 	if errors.Is(err, execenv.ErrOpenclawCLITimeout) {
 		return taskfailure.ReasonRuntimeCLITimeout.String()
+	}
+	// Everything else that failed while building or re-opening the execution
+	// environment. Last of the structural branches: the four sentinels above
+	// each name a cause the daemon already recognises on its own (task
+	// identity, the prepare budget, skill downloads, the local runtime CLI)
+	// and stay the better label. What is left is the rest of preparation on
+	// this host — filesystem faults, and the per-provider local config
+	// Prepare writes or validates — whose text Classify can only read as
+	// agent output (#7913).
+	var envSetupErr *environmentSetupError
+	if errors.As(err, &envSetupErr) {
+		return taskfailure.ReasonEnvironmentPrepareFailed.String()
 	}
 	return taskfailure.Classify(err.Error()).String()
 }
@@ -5714,7 +5757,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			// client — worth doing if this hint grows, not for one parenthetical.
 			reason = fmt.Sprintf("%s (held by task %s)", reason, shortID(holder))
 		}
-		taskLog.Info("local_directory: waiting on path mutex", "holder", shortID(holder))
+		taskLog.Info("local_directory: waiting on path mutex", "holder", holder)
 		if waitErr := d.client.MarkTaskWaitingLocalDirectory(ctx, task.ID, reason); waitErr != nil {
 			// Non-fatal: even if the server-side flag fails to update,
 			// we still want to block on the lock and proceed when free.
@@ -6652,12 +6695,12 @@ func (d *Daemon) lockReusablePriorEnvRoot(ctx context.Context, task Task, localA
 		return nil, "", nil, false, context.Cause(ctx)
 	case errors.Is(err, execenv.ErrEnvRootBusy):
 		d.logger.Info("prior workdir is still in use after waiting for it; starting a fresh environment",
-			"task", shortID(task.ID), "prior_root", filepath.Base(priorRoot),
+			"task", task.ID, "prior_root", filepath.Base(priorRoot),
 			"waited", time.Since(lockStartedAt).Round(time.Millisecond), "budget", d.envRootBusyWait)
 		return nil, "", nil, false, nil
 	case err != nil:
 		d.logger.Warn("could not lock prior workdir; starting a fresh environment",
-			"task", shortID(task.ID), "error", err)
+			"task", task.ID, "error", err)
 		return nil, "", nil, false, nil
 	case claim == nil:
 		return nil, "", nil, false, nil
@@ -6665,7 +6708,7 @@ func (d *Daemon) lockReusablePriorEnvRoot(ctx context.Context, task Task, localA
 	// The lock has to have landed on the directory validation approved.
 	if !os.SameFile(validatedInfo, lockedInfo) {
 		d.logger.Info("prior workdir changed identity before it could be claimed; starting a fresh environment",
-			"task", shortID(task.ID))
+			"task", task.ID)
 		claim.Release()
 		return nil, "", nil, false, nil
 	}
@@ -6686,7 +6729,7 @@ func (d *Daemon) lockReusablePriorEnvRoot(ctx context.Context, task Task, localA
 	currentInfo, err := os.Stat(filepath.Dir(recheckedWorkDir))
 	if err != nil || !os.SameFile(lockedInfo, currentInfo) {
 		d.logger.Info("prior workdir changed identity while being claimed; starting a fresh environment",
-			"task", shortID(task.ID))
+			"task", task.ID)
 		claim.Release()
 		return nil, "", nil, false, nil
 	}
@@ -6742,7 +6785,7 @@ func (d *Daemon) lockEnvRootForReuseWaitingOutTheBusyWindow(
 			// instead of staying a guess.
 			if waited && err == nil {
 				d.logger.Info("prior workdir freed while waiting for the previous run to exit",
-					"task", shortID(task.ID), "prior_root", filepath.Base(priorRoot),
+					"task", task.ID, "prior_root", filepath.Base(priorRoot),
 					"waited", time.Since(start).Round(time.Millisecond))
 			}
 			return claim, info, err
@@ -6750,13 +6793,13 @@ func (d *Daemon) lockEnvRootForReuseWaitingOutTheBusyWindow(
 		if !waited {
 			waited = true
 			d.logger.Info("prior workdir is still held by the previous run; waiting for it",
-				"task", shortID(task.ID), "prior_root", filepath.Base(priorRoot),
+				"task", task.ID, "prior_root", filepath.Base(priorRoot),
 				"budget", d.envRootBusyWait)
 		}
 		select {
 		case <-ctx.Done():
 			d.logger.Info("stopped waiting for the prior workdir: the run was cancelled",
-				"task", shortID(task.ID), "prior_root", filepath.Base(priorRoot),
+				"task", task.ID, "prior_root", filepath.Base(priorRoot),
 				"waited", time.Since(start).Round(time.Millisecond))
 			// NOT the busy error the loop was carrying. A cancelled run is a
 			// third outcome, and collapsing it into "still busy" would send the
@@ -7452,7 +7495,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			Task:                  taskCtx,
 		})
 		if err != nil {
-			return TaskResult{}, fmt.Errorf("reuse execution environment: %w", err)
+			return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("reuse execution environment: %w", err))
 		}
 		// Reuse resolves priorWorkDir by name, so confirm what it actually
 		// opened is still the directory we hold the lock on. An fd cannot cross
@@ -7463,8 +7506,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		if env != nil && lockedPriorInfo != nil {
 			usedInfo, statErr := os.Stat(filepath.Dir(env.WorkDir))
 			if statErr != nil || !os.SameFile(lockedPriorInfo, usedInfo) {
-				taskLog.Info("reused workdir is not the directory that was claimed; starting a fresh environment",
-					"task", shortID(task.ID))
+				// No "task" field here: taskLog already carries the full id.
+				taskLog.Info("reused workdir is not the directory that was claimed; starting a fresh environment")
 				env = nil
 			}
 		}
@@ -7541,7 +7584,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 					reason = fmt.Sprintf("%s (held by task %s)", reason, shortID(holder))
 				}
 				taskLog.Info("local_directory: worktree snapshot waiting for holder",
-					"holder", shortID(holder))
+					"holder", holder)
 				if waitErr := d.client.MarkTaskWaitingLocalDirectory(waitCtx, task.ID, reason); waitErr != nil {
 					// Non-fatal: the wait still happens, the UI just won't
 					// show the explicit "waiting" badge.
@@ -7566,7 +7609,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
 			release()
 			if err != nil {
-				return TaskResult{}, fmt.Errorf("prepare execution environment: %w", err)
+				return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("prepare execution environment: %w", err))
 			}
 		} else {
 			if localAssignment != nil {
@@ -7574,7 +7617,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			}
 			env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
 			if err != nil {
-				return TaskResult{}, fmt.Errorf("prepare execution environment: %w", err)
+				return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("prepare execution environment: %w", err))
 			}
 		}
 	}
@@ -8055,7 +8098,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// refresh spinner resolves via the client's own timeout.
 	if task.RegenerateQuickActionsFor != "" {
 		taskLog.Warn("refusing quick-actions refresh task from an older server; complete the daemon upgrade by updating the server",
-			"target_task", shortID(task.RegenerateQuickActionsFor),
+			"target_task", task.RegenerateQuickActionsFor,
 		)
 		return TaskResult{Status: "completed", Comment: "", WorkDir: env.WorkDir, EnvRoot: env.RootDir}, nil
 	}
@@ -8669,7 +8712,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	var idleWatchdogThreshold atomic.Int64
 	idleWatchdogThreshold.Store(int64(idleWindow))
 	if idleWindow > 0 {
-		go d.runIdleWatchdog(agentCtx, idleWindow, d.cfg.AgentToolWatchdog, &lastActivityAt, &inFlightTools, &idleWatchdogFired, &idleWatchdogThreshold, agentCancel, session.Messages, taskLog, taskID)
+		go d.runIdleWatchdog(agentCtx, idleWindow, d.cfg.AgentToolWatchdog, &lastActivityAt, &inFlightTools, &idleWatchdogFired, &idleWatchdogThreshold, agentCancel, session.Messages, taskLog)
 	}
 
 	// drainFinished closes after the drain goroutine has flushed the last
@@ -9006,7 +9049,7 @@ func idleWatchdogTickInterval(window time.Duration) time.Duration {
 //
 // Polling rate comes from idleWatchdogTickInterval, so a run is force-stopped
 // somewhere between its budget and budget + tick, never earlier.
-func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow time.Duration, lastActivityAt *atomic.Int64, inFlightTools *atomic.Int32, fired *atomic.Bool, firedThreshold *atomic.Int64, cancel context.CancelFunc, messages <-chan agent.Message, taskLog *slog.Logger, taskID string) {
+func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow time.Duration, lastActivityAt *atomic.Int64, inFlightTools *atomic.Int32, fired *atomic.Bool, firedThreshold *atomic.Int64, cancel context.CancelFunc, messages <-chan agent.Message, taskLog *slog.Logger) {
 	ticker := time.NewTicker(idleWatchdogTickInterval(window))
 	defer ticker.Stop()
 	for {
@@ -9037,8 +9080,8 @@ func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow ti
 			if len(messages) > 0 {
 				continue
 			}
+			// No "task" field here: taskLog already carries the full id.
 			taskLog.Warn("idle watchdog firing: no agent activity, force-stopping run",
-				"task", shortID(taskID),
 				"idle_for", idleFor.Round(time.Second).String(),
 				"threshold", threshold.String(),
 				"tool_in_flight", toolInFlight,
@@ -9250,7 +9293,12 @@ func (d *Daemon) reserveStoreForDeletion(store string) (commit func(), ok bool) 
 	}, true
 }
 
-// shortID returns the first 8 characters of an ID for readable logs.
+// shortID returns the first 8 characters of an ID for a human-facing label.
+//
+// Display only, and only where the label is read rather than joined: the
+// waiting-reason string the UI renders as "Waiting for {reason}" is the one
+// caller left. Structured log fields must carry the FULL id — see the
+// task-scoped logger in handleTask for why a prefix cannot identify a task.
 func shortID(id string) string {
 	if len(id) <= 8 {
 		return id
