@@ -981,10 +981,15 @@ WHERE claimed_input.id = latest_visible.claimed_input_id
 -- non-terminal heads that are still not externally finalized: queued,
 -- dispatched, waiting_local_directory and running (all proven by
 -- TestMUL6886_ActiveStates_Table — dispatched via the original repro and
--- waiting/running via the same fixture updated in-place). completed/failed/
--- cancelled/deferred (including retry children via chat_input_task_id != id) are
--- deliberately never moved to avoid rewriting terminal history or channel
--- batches.
+-- waiting/running via the same fixture updated in-place).
+--
+-- Scope is strictly "claimed but non-terminal direct-chat follow-up".
+-- A completed/failed/cancelled successor already has a terminal transcript and
+-- is intentionally excluded to avoid rewriting finalized history: in that case
+-- the transcript is left as user A -> user B -> assistant B -> Stopped.(A)
+-- (see TestMUL6886_CompletedTerminalNegative_GREEN). This is an intended
+-- boundary, not a bug. Deferred (including retry children via
+-- chat_input_task_id != id) and channel batches are likewise never moved.
 UPDATE chat_message AS queued_input
 SET created_at = sqlc.arg('assistant_created_at')::timestamptz + interval '1 microsecond'
 WHERE queued_input.chat_session_id = $1
