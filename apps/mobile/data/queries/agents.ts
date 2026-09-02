@@ -6,4 +6,10 @@ export const agentListOptions = (wsId: string | null) =>
     queryKey: ["agents", wsId] as const,
     queryFn: ({ signal }) => api.listAgents({ signal }),
     enabled: !!wsId,
+    refetchInterval: (query) =>
+      query.state.data?.some(
+        (agent) => agent.runtime_availability !== undefined,
+      )
+        ? 30_000
+        : false,
   });
