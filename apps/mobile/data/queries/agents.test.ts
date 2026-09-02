@@ -6,7 +6,7 @@ import { agentListOptions } from "./agents";
 vi.mock("@/data/api", () => ({ api: {} }));
 
 describe("agentListOptions", () => {
-  it("polls while any agent has a projected runtime availability", () => {
+  it("polls only while any agent is online or unstable", () => {
     const options = agentListOptions("ws-1");
     const interval = options.refetchInterval;
     expect(typeof interval).toBe("function");
@@ -17,7 +17,7 @@ describe("agentListOptions", () => {
 
     expect(queryState([{ runtime_availability: "online" } as Agent])).toBe(30_000);
     expect(queryState([{ runtime_availability: "unstable" } as Agent])).toBe(30_000);
-    expect(queryState([{ runtime_availability: "offline" } as Agent])).toBe(30_000);
+    expect(queryState([{ runtime_availability: "offline" } as Agent])).toBe(false);
     expect(queryState([{ runtime_availability: undefined } as Agent])).toBe(false);
     expect(queryState([])).toBe(false);
   });
