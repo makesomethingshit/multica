@@ -62,7 +62,9 @@ interface IssueAgentActivityIndicatorProps {
  *
  *   - has ≥1 running task  → tiny avatar stack + shimmering "Working"
  *   - 0 running, ≥1 queued → half-opacity stack + muted "Queued"
- *   - nothing               → return null (no chrome, no placeholder)
+ *   - 0 active, in_progress parent with unfinished children (done < total)
+ *     → muted "Waiting on sub-issues" (+ hover detail "done/total complete")
+ *   - otherwise             → return null (no chrome, no placeholder)
  *
  * The shimmer reuses chat's `animate-chat-text-shimmer` utility (defined
  * in packages/ui/styles/base.css). Earlier iterations layered a brand
@@ -202,9 +204,9 @@ export const IssueAgentActivityIndicator = memo(function IssueAgentActivityIndic
         </HoverCardTrigger>
         <HoverCardContent align="end" className="w-64">
           <div className="space-y-1">
-            <div className="text-sm font-medium">{waitingLabel}</div>
+            <div className="text-body font-medium">{waitingLabel}</div>
             {waitingDetail ? (
-              <div className="text-xs text-muted-foreground">
+              <div className="text-caption text-muted-foreground">
                 {waitingDetail}
               </div>
             ) : null}
