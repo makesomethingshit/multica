@@ -2,12 +2,13 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/dbid"
 )
@@ -21,32 +22,36 @@ type channelIssueRouteFixture struct {
 
 func createChannelIssueRouteFixture(t *testing.T, agentID, title string) channelIssueRouteFixture {
 	t.Helper()
-	ctx := context.Background()
-	var installID string
 	appID := "web-update-" + util.UUIDToString(dbid.NewV7())
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id, status)
-		VALUES ($1, $2, 'feishu', jsonb_build_object('app_id', $3::text), $4, 'active')
-		RETURNING id`, testWorkspaceID, agentID, appID, testUserID).Scan(&installID); err != nil {
-		t.Fatalf("create channel installation: %v", err)
-	}
-	sessionID := util.UUIDToString(dbid.NewV7())
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO chat_session (id, workspace_id, agent_id, creator_id, title)
-		VALUES ($1, $2, $3, $4, '')`, sessionID, testWorkspaceID, agentID, testUserID); err != nil {
-		t.Fatalf("create chat session: %v", err)
-	}
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config, route_revision)
-		VALUES ($1, $2, 'feishu', $3, 'group', '{}'::jsonb, 1)`, sessionID, installID, "oc_test_"+sessionID[:8]); err != nil {
-		t.Fatalf("create channel binding: %v", err)
-	}
-	if _, err := testPool.Exec(ctx, `
-		INSERT INTO channel_chat_context_generation (chat_session_id, revision) VALUES ($1, 1)`, sessionID); err != nil {
-		t.Fatalf("create context generation: %v", err)
-	}
+	installID := dbfx.Insert(t, "channel_installation", testutil.Cols{
+		"workspace_id":      testWorkspaceID,
+		"agent_id":          agentID,
+		"channel_type":      "feishu",
+		"config":            testutil.Raw(fmt.Sprintf("jsonb_build_object('app_id', '%s'::text)", appID)),
+		"installer_user_id": testUserID,
+		"status":            "active",
+	})
+	sessionID := dbfx.Insert(t, "chat_session", testutil.Cols{
+		"workspace_id": testWorkspaceID,
+		"agent_id":     agentID,
+		"creator_id":   testUserID,
+		"title":        "",
+	})
+	dbfx.Insert(t, "channel_chat_session_binding", testutil.Cols{
+		"chat_session_id": sessionID,
+		"installation_id": installID,
+		"channel_type":    "feishu",
+		"channel_chat_id": "oc_test_" + sessionID[:8],
+		"chat_type":       "group",
+		"config":          testutil.Raw("'{}'::jsonb"),
+		"route_revision":  1,
+	})
+	dbfx.InsertNoID(t, "channel_chat_context_generation", testutil.Cols{
+		"chat_session_id": sessionID,
+		"revision":        1,
+	}, "chat_session_id = $1 AND revision = $2", sessionID, 1)
 
-	result, err := testHandler.IssueService.Create(ctx, service.IssueCreateParams{
+	result, err := testHandler.IssueService.Create(context.Background(), service.IssueCreateParams{
 		WorkspaceID:  util.MustParseUUID(testWorkspaceID),
 		Title:        title,
 		Status:       "todo",
@@ -64,7 +69,7 @@ func createChannelIssueRouteFixture(t *testing.T, agentID, title string) channel
 	if !result.AssignedTaskID.Valid {
 		t.Fatalf("channel issue should have an initial assigned task")
 	}
-	if _, err := testHandler.Queries.GetChannelTaskDelivery(ctx, result.AssignedTaskID); err != nil {
+	if _, err := testHandler.Queries.GetChannelTaskDelivery(context.Background(), result.AssignedTaskID); err != nil {
 		t.Fatalf("initial task delivery missing: %v", err)
 	}
 
@@ -74,30 +79,17 @@ func createChannelIssueRouteFixture(t *testing.T, agentID, title string) channel
 		sessionID:     sessionID,
 		installID:     installID,
 	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_, _ = testPool.Exec(cleanupCtx, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, fixture.issueID)
-		_, _ = testPool.Exec(cleanupCtx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, fixture.issueID)
-		_, _ = testPool.Exec(cleanupCtx, `DELETE FROM issue WHERE id = $1`, fixture.issueID)
-		_, _ = testPool.Exec(cleanupCtx, `DELETE FROM channel_chat_context_generation WHERE chat_session_id = $1`, fixture.sessionID)
-		_, _ = testPool.Exec(cleanupCtx, `DELETE FROM channel_chat_session_binding WHERE chat_session_id = $1`, fixture.sessionID)
-		_, _ = testPool.Exec(cleanupCtx, `DELETE FROM chat_session WHERE id = $1`, fixture.sessionID)
-		_, _ = testPool.Exec(cleanupCtx, `DELETE FROM channel_installation WHERE id = $1`, fixture.installID)
-	})
+	dbfx.Cleanup(t, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, fixture.issueID)
+	dbfx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, fixture.issueID)
+	dbfx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, fixture.issueID)
 	return fixture
 }
 
 func completeInitialChannelIssueTask(t *testing.T, fixture channelIssueRouteFixture) {
 	t.Helper()
-	if _, err := testPool.Exec(context.Background(), `
-		UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, fixture.initialTaskID); err != nil {
-		t.Fatalf("complete initial channel task: %v", err)
-	}
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, fixture.initialTaskID)
 	var deliveryCount int
-	if err := testPool.QueryRow(context.Background(), `
-		SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, fixture.initialTaskID).Scan(&deliveryCount); err != nil {
-		t.Fatalf("count initial channel delivery: %v", err)
-	}
+	dbfx.QueryRow(t, `SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, fixture.initialTaskID).Scan(&deliveryCount)
 	if deliveryCount != 1 {
 		t.Fatalf("initial channel delivery count = %d, want 1", deliveryCount)
 	}
@@ -106,25 +98,17 @@ func completeInitialChannelIssueTask(t *testing.T, fixture channelIssueRouteFixt
 func assertNoNewChannelDelivery(t *testing.T, fixture channelIssueRouteFixture, agentID string) {
 	t.Helper()
 	var taskID string
-	if err := testPool.QueryRow(context.Background(), `
+	dbfx.QueryRow(t, `
 		SELECT id FROM agent_task_queue
 		WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched', 'running')
-		ORDER BY created_at DESC LIMIT 1`, fixture.issueID, agentID).Scan(&taskID); err != nil {
-		t.Fatalf("load follow-up task for %s: %v", agentID, err)
-	}
+		ORDER BY created_at DESC LIMIT 1`, fixture.issueID, agentID).Scan(&taskID)
 	var deliveryCount int
-	if err := testPool.QueryRow(context.Background(), `
-		SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, taskID).Scan(&deliveryCount); err != nil {
-		t.Fatalf("count follow-up delivery: %v", err)
-	}
+	dbfx.QueryRow(t, `SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, taskID).Scan(&deliveryCount)
 	if deliveryCount != 0 {
 		t.Fatalf("follow-up task %s has %d channel deliveries, want 0", taskID, deliveryCount)
 	}
 	var initialDeliveryCount int
-	if err := testPool.QueryRow(context.Background(), `
-		SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, fixture.initialTaskID).Scan(&initialDeliveryCount); err != nil {
-		t.Fatalf("count preserved initial delivery: %v", err)
-	}
+	dbfx.QueryRow(t, `SELECT count(*) FROM channel_task_delivery WHERE task_id = $1`, fixture.initialTaskID).Scan(&initialDeliveryCount)
 	if initialDeliveryCount != 1 {
 		t.Fatalf("initial channel delivery after web update = %d, want 1", initialDeliveryCount)
 	}
@@ -141,15 +125,11 @@ func TestChannelIssueDelivery_WebUpdatePathsDoNotSnapshot(t *testing.T) {
 		fixture := createChannelIssueRouteFixture(t, initialAgentID, "channel web update")
 		completeInitialChannelIssueTask(t, fixture)
 
-		w := httptest.NewRecorder()
 		req := withURLParam(newRequest("PUT", "/api/issues/"+fixture.issueID, map[string]any{
 			"assignee_type": "agent",
 			"assignee_id":   newAgentID,
 		}), "id", fixture.issueID)
-		testHandler.UpdateIssue(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
-		}
+		testutil.Call(t, testHandler.UpdateIssue, req).Want(http.StatusOK)
 		assertNoNewChannelDelivery(t, fixture, newAgentID)
 	})
 
@@ -158,7 +138,6 @@ func TestChannelIssueDelivery_WebUpdatePathsDoNotSnapshot(t *testing.T) {
 		fixture := createChannelIssueRouteFixture(t, initialAgentID, "channel batch update")
 		completeInitialChannelIssueTask(t, fixture)
 
-		w := httptest.NewRecorder()
 		req := newRequest("POST", "/api/issues/batch-update", map[string]any{
 			"issue_ids": []string{fixture.issueID},
 			"updates": map[string]any{
@@ -166,37 +145,28 @@ func TestChannelIssueDelivery_WebUpdatePathsDoNotSnapshot(t *testing.T) {
 				"assignee_id":   newAgentID,
 			},
 		})
-		testHandler.BatchUpdateIssues(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("BatchUpdateIssues: expected 200, got %d: %s", w.Code, w.Body.String())
-		}
+		testutil.Call(t, testHandler.BatchUpdateIssues, req).Want(http.StatusOK)
 		assertNoNewChannelDelivery(t, fixture, newAgentID)
 	})
 
 	t.Run("comment", func(t *testing.T) {
 		var hasRecoverySettledAt bool
-		if err := testPool.QueryRow(context.Background(), `
+		dbfx.QueryRow(t, `
 			SELECT EXISTS (
 				SELECT 1 FROM information_schema.columns
 				WHERE table_schema = 'public'
 				  AND table_name = 'delegated_failure_recovery'
-				  AND column_name = 'recovery_settled_at')`).Scan(&hasRecoverySettledAt); err != nil {
-			t.Fatalf("check comment trigger schema: %v", err)
-		}
+				  AND column_name = 'recovery_settled_at')`).Scan(&hasRecoverySettledAt)
 		if !hasRecoverySettledAt {
 			t.Skip("comment trigger reconciliation migration is not applied")
 		}
 		fixture := createChannelIssueRouteFixture(t, initialAgentID, "channel comment trigger")
 		completeInitialChannelIssueTask(t, fixture)
 
-		w := httptest.NewRecorder()
 		req := withURLParam(newRequest("POST", "/api/issues/"+fixture.issueID+"/comments", map[string]any{
 			"content": "[@Agent](mention://agent/" + initialAgentID + ") follow-up",
 		}), "id", fixture.issueID)
-		testHandler.CreateComment(w, req)
-		if w.Code != http.StatusCreated && w.Code != http.StatusOK {
-			t.Fatalf("CreateComment: expected 200/201, got %d: %s", w.Code, w.Body.String())
-		}
+		testutil.Call(t, testHandler.CreateComment, req).WantOneOf(http.StatusCreated, http.StatusOK)
 		assertNoNewChannelDelivery(t, fixture, initialAgentID)
 	})
 }

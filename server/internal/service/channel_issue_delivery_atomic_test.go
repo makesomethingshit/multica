@@ -2,11 +2,13 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
@@ -21,40 +23,36 @@ func TestChannelIssueDelivery_AtomicSnapshot_Success(t *testing.T) {
 	userUUID := util.MustParseUUID(userID)
 	agentUUID := util.MustParseUUID(agentID)
 
-	// Create a feishu channel installation for this agent/workspace.
-	var chatSessionID pgtype.UUID
-	{
-		// Use a unique app_id per test.
-		appID := "test-app-" + workspaceID[:8]
-		var instID string
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id, status)
-			VALUES ($1, $2, 'feishu', jsonb_build_object('app_id', $3::text), $4, 'active')
-			RETURNING id`, workspaceID, agentID, appID, userID).Scan(&instID); err != nil {
-			t.Fatalf("create channel installation: %v", err)
-		}
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM channel_installation WHERE id = $1`, instID) })
-
-		var sessionID string
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO chat_session (id, workspace_id, agent_id, creator_id, title)
-			VALUES ($1, $2, $3, $4, '')
-			RETURNING id`, dbid.NewV7(), workspaceID, agentID, userID).Scan(&sessionID); err != nil {
-			t.Fatalf("create chat session: %v", err)
-		}
-		chatSessionID = util.MustParseUUID(sessionID)
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM chat_session WHERE id = $1`, sessionID) })
-
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config, route_revision)
-			VALUES ($1, $2, 'feishu', 'oc_test_chat', 'group', '{}'::jsonb, 1)`, sessionID, instID); err != nil {
-			t.Fatalf("create channel binding: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO channel_chat_context_generation (chat_session_id, revision) VALUES ($1, 1)`, sessionID); err != nil {
-			t.Fatalf("create context generation: %v", err)
-		}
-	}
+	fx := testutil.New(pool, workspaceID, userID)
+	appID := "test-app-" + workspaceID[:8]
+	instID := fx.Insert(t, "channel_installation", testutil.Cols{
+		"workspace_id":      workspaceID,
+		"agent_id":          agentID,
+		"channel_type":      "feishu",
+		"config":            testutil.Raw(fmt.Sprintf("jsonb_build_object('app_id', '%s'::text)", appID)),
+		"installer_user_id": userID,
+		"status":            "active",
+	})
+	sessionID := fx.Insert(t, "chat_session", testutil.Cols{
+		"workspace_id": workspaceID,
+		"agent_id":     agentID,
+		"creator_id":   userID,
+		"title":        "",
+	})
+	chatSessionID := util.MustParseUUID(sessionID)
+	fx.Insert(t, "channel_chat_session_binding", testutil.Cols{
+		"chat_session_id": sessionID,
+		"installation_id": instID,
+		"channel_type":    "feishu",
+		"channel_chat_id": "oc_test_chat",
+		"chat_type":       "group",
+		"config":          testutil.Raw("'{}'::jsonb"),
+		"route_revision":  1,
+	})
+	fx.InsertNoID(t, "channel_chat_context_generation", testutil.Cols{
+		"chat_session_id": sessionID,
+		"revision":        1,
+	}, "chat_session_id = $1 AND revision = $2", sessionID, 1)
 
 	bus := events.New()
 	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
@@ -102,36 +100,36 @@ func TestChannelIssueDelivery_AtomicSnapshot_DeferredSuccess(t *testing.T) {
 	userUUID := util.MustParseUUID(userID)
 	agentUUID := util.MustParseUUID(agentID)
 
-	var chatSessionID pgtype.UUID
-	{
-		appID := "test-app-" + workspaceID[:8]
-		var instID string
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id, status)
-			VALUES ($1, $2, 'feishu', jsonb_build_object('app_id', $3::text), $4, 'active')
-			RETURNING id`, workspaceID, agentID, appID, userID).Scan(&instID); err != nil {
-			t.Fatalf("create channel installation: %v", err)
-		}
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM channel_installation WHERE id = $1`, instID) })
-		var sessionID string
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO chat_session (id, workspace_id, agent_id, creator_id, title)
-			VALUES ($1, $2, $3, $4, '')
-			RETURNING id`, dbid.NewV7(), workspaceID, agentID, userID).Scan(&sessionID); err != nil {
-			t.Fatalf("create chat session: %v", err)
-		}
-		chatSessionID = util.MustParseUUID(sessionID)
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM chat_session WHERE id = $1`, sessionID) })
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config, route_revision)
-			VALUES ($1, $2, 'feishu', 'oc_test_chat', 'group', '{}'::jsonb, 1)`, sessionID, instID); err != nil {
-			t.Fatalf("create channel binding: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO channel_chat_context_generation (chat_session_id, revision) VALUES ($1, 1)`, sessionID); err != nil {
-			t.Fatalf("create context generation: %v", err)
-		}
-	}
+	fx := testutil.New(pool, workspaceID, userID)
+	appID := "test-app-" + workspaceID[:8]
+	instID := fx.Insert(t, "channel_installation", testutil.Cols{
+		"workspace_id":      workspaceID,
+		"agent_id":          agentID,
+		"channel_type":      "feishu",
+		"config":            testutil.Raw(fmt.Sprintf("jsonb_build_object('app_id', '%s'::text)", appID)),
+		"installer_user_id": userID,
+		"status":            "active",
+	})
+	sessionID := fx.Insert(t, "chat_session", testutil.Cols{
+		"workspace_id": workspaceID,
+		"agent_id":     agentID,
+		"creator_id":   userID,
+		"title":        "",
+	})
+	chatSessionID := util.MustParseUUID(sessionID)
+	fx.Insert(t, "channel_chat_session_binding", testutil.Cols{
+		"chat_session_id": sessionID,
+		"installation_id": instID,
+		"channel_type":    "feishu",
+		"channel_chat_id": "oc_test_chat",
+		"chat_type":       "group",
+		"config":          testutil.Raw("'{}'::jsonb"),
+		"route_revision":  1,
+	})
+	fx.InsertNoID(t, "channel_chat_context_generation", testutil.Cols{
+		"chat_session_id": sessionID,
+		"revision":        1,
+	}, "chat_session_id = $1 AND revision = $2", sessionID, 1)
 
 	bus := events.New()
 	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
@@ -343,35 +341,36 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 	userUUID := util.MustParseUUID(userID)
 	agentUUID := util.MustParseUUID(agentID)
 
-	var chatSessionID pgtype.UUID
-	{
-		appID := "test-app-" + workspaceID[:8]
-		var instID string
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id, status)
-			VALUES ($1, $2, 'feishu', jsonb_build_object('app_id', $3::text), $4, 'active')
-			RETURNING id`, workspaceID, agentID, appID, userID).Scan(&instID); err != nil {
-			t.Fatalf("create channel installation: %v", err)
-		}
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM channel_installation WHERE id = $1`, instID) })
-		var sessionID string
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO chat_session (id, workspace_id, agent_id, creator_id, title)
-			VALUES ($1, $2, $3, $4, '')
-			RETURNING id`, dbid.NewV7(), workspaceID, agentID, userID).Scan(&sessionID); err != nil {
-			t.Fatalf("create chat session: %v", err)
-		}
-		chatSessionID = util.MustParseUUID(sessionID)
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM chat_session WHERE id = $1`, sessionID) })
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config, route_revision)
-			VALUES ($1, $2, 'feishu', 'oc_test_chat', 'group', '{}'::jsonb, 1)`, sessionID, instID); err != nil {
-			t.Fatalf("create channel binding: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `INSERT INTO channel_chat_context_generation (chat_session_id, revision) VALUES ($1, 1)`, sessionID); err != nil {
-			t.Fatalf("create context generation: %v", err)
-		}
-	}
+	fx := testutil.New(pool, workspaceID, userID)
+	appID := "test-app-" + workspaceID[:8]
+	instID := fx.Insert(t, "channel_installation", testutil.Cols{
+		"workspace_id":      workspaceID,
+		"agent_id":          agentID,
+		"channel_type":      "feishu",
+		"config":            testutil.Raw(fmt.Sprintf("jsonb_build_object('app_id', '%s'::text)", appID)),
+		"installer_user_id": userID,
+		"status":            "active",
+	})
+	sessionID := fx.Insert(t, "chat_session", testutil.Cols{
+		"workspace_id": workspaceID,
+		"agent_id":     agentID,
+		"creator_id":   userID,
+		"title":        "",
+	})
+	chatSessionID := util.MustParseUUID(sessionID)
+	fx.Insert(t, "channel_chat_session_binding", testutil.Cols{
+		"chat_session_id": sessionID,
+		"installation_id": instID,
+		"channel_type":    "feishu",
+		"channel_chat_id": "oc_test_chat",
+		"chat_type":       "group",
+		"config":          testutil.Raw("'{}'::jsonb"),
+		"route_revision":  1,
+	})
+	fx.InsertNoID(t, "channel_chat_context_generation", testutil.Cols{
+		"chat_session_id": sessionID,
+		"revision":        1,
+	}, "chat_session_id = $1 AND revision = $2", sessionID, 1)
 
 	bus := events.New()
 	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
@@ -437,13 +436,9 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 	}
 
 	// Comment-triggered task should not inherit delivery.
-	var commentID string
-	if err := pool.QueryRow(ctx, `
-		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content)
-		VALUES ($1, $2, 'member', $3, 'follow-up')
-		RETURNING id`, util.UUIDToString(issue.ID), workspaceID, userID).Scan(&commentID); err != nil {
-		t.Fatalf("create comment: %v", err)
-	}
+	commentID := fx.Comment(t, util.UUIDToString(issue.ID), "follow-up", testutil.Cols{
+		"author_id": userID,
+	})
 	commentUUID := util.MustParseUUID(commentID)
 	commentTask, err := taskService.EnqueueTaskForIssue(ctx, issue, commentUUID)
 	if err != nil {
@@ -478,35 +473,36 @@ func TestChannelIssueDelivery_BindingDeletedOrdinaryEnqueueStillSucceeds(t *test
 	userUUID := util.MustParseUUID(userID)
 	agentUUID := util.MustParseUUID(agentID)
 
-	var chatSessionID pgtype.UUID
-	var instID string
-	{
-		appID := "test-app-" + workspaceID[:8]
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id, status)
-			VALUES ($1, $2, 'feishu', jsonb_build_object('app_id', $3::text), $4, 'active')
-			RETURNING id`, workspaceID, agentID, appID, userID).Scan(&instID); err != nil {
-			t.Fatalf("create channel installation: %v", err)
-		}
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM channel_installation WHERE id = $1`, instID) })
-		var sessionID string
-		if err := pool.QueryRow(ctx, `
-			INSERT INTO chat_session (id, workspace_id, agent_id, creator_id, title)
-			VALUES ($1, $2, $3, $4, '')
-			RETURNING id`, dbid.NewV7(), workspaceID, agentID, userID).Scan(&sessionID); err != nil {
-			t.Fatalf("create chat session: %v", err)
-		}
-		chatSessionID = util.MustParseUUID(sessionID)
-		t.Cleanup(func() { pool.Exec(context.Background(), `DELETE FROM chat_session WHERE id = $1`, sessionID) })
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO channel_chat_session_binding (chat_session_id, installation_id, channel_type, channel_chat_id, chat_type, config, route_revision)
-			VALUES ($1, $2, 'feishu', 'oc_test_chat', 'group', '{}'::jsonb, 1)`, sessionID, instID); err != nil {
-			t.Fatalf("create channel binding: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `INSERT INTO channel_chat_context_generation (chat_session_id, revision) VALUES ($1, 1)`, sessionID); err != nil {
-			t.Fatalf("create context generation: %v", err)
-		}
-	}
+	fx := testutil.New(pool, workspaceID, userID)
+	appID := "test-app-" + workspaceID[:8]
+	instID := fx.Insert(t, "channel_installation", testutil.Cols{
+		"workspace_id":      workspaceID,
+		"agent_id":          agentID,
+		"channel_type":      "feishu",
+		"config":            testutil.Raw(fmt.Sprintf("jsonb_build_object('app_id', '%s'::text)", appID)),
+		"installer_user_id": userID,
+		"status":            "active",
+	})
+	sessionID := fx.Insert(t, "chat_session", testutil.Cols{
+		"workspace_id": workspaceID,
+		"agent_id":     agentID,
+		"creator_id":   userID,
+		"title":        "",
+	})
+	chatSessionID := util.MustParseUUID(sessionID)
+	fx.Insert(t, "channel_chat_session_binding", testutil.Cols{
+		"chat_session_id": sessionID,
+		"installation_id": instID,
+		"channel_type":    "feishu",
+		"channel_chat_id": "oc_test_chat",
+		"chat_type":       "group",
+		"config":          testutil.Raw("'{}'::jsonb"),
+		"route_revision":  1,
+	})
+	fx.InsertNoID(t, "channel_chat_context_generation", testutil.Cols{
+		"chat_session_id": sessionID,
+		"revision":        1,
+	}, "chat_session_id = $1 AND revision = $2", sessionID, 1)
 
 	bus := events.New()
 	taskService := &TaskService{Queries: q, TxStarter: pool, Bus: bus}
@@ -557,13 +553,9 @@ func TestChannelIssueDelivery_BindingDeletedOrdinaryEnqueueStillSucceeds(t *test
 	if err != nil {
 		t.Fatalf("load ordinary issue: %v", err)
 	}
-	var commentID string
-	if err := pool.QueryRow(ctx, `
-		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content)
-		VALUES ($1, $2, 'member', $3, 'after delete')
-		RETURNING id`, util.UUIDToString(ordinaryIssue.ID), workspaceID, userID).Scan(&commentID); err != nil {
-		t.Fatalf("create comment after delete: %v", err)
-	}
+	commentID := fx.Comment(t, util.UUIDToString(ordinaryIssue.ID), "after delete", testutil.Cols{
+		"author_id": userID,
+	})
 	commentUUID := util.MustParseUUID(commentID)
 	followUpTask, err := taskService.EnqueueTaskForIssue(ctx, ordinaryIssue, commentUUID)
 	if err != nil {
