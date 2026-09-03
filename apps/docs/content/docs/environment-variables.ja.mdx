@@ -33,6 +33,9 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `DATABASE_URL` | ローカルの `multica` データベース | PostgreSQL 接続文字列 |
 | `DATABASE_MAX_CONNS` | `25` | API プロセスあたりの最大データベース接続数 |
 | `DATABASE_MIN_CONNS` | `5` | API プロセスが保持する最小接続数 |
+| `DATABASE_REPLICA_URL` | 空 | オプションの PostgreSQL 読み取り専用レプリカ接続文字列。新しい接続では読み取り専用状態が検証され、各機能はコードで結果整合性読み取りを明示的に選択する必要があります |
+| `DATABASE_REPLICA_MAX_CONNS` | `10` | API プロセスあたりの最大レプリカ接続数 |
+| `DATABASE_REPLICA_MIN_CONNS` | `0` | API プロセスが保持する最小レプリカ接続数 |
 | `MULTICA_DATABASE_STARTUP_TIMEOUT` | `3m` | コンテナ起動時に migration と API が共有する、一時的なデータベース障害への再試行時間。`0` にすると各フェーズで 1 回だけ試行します |
 | `MULTICA_DATABASE_CONNECT_TIMEOUT` | `5s` | 起動時の接続試行ごとのフォールバックタイムアウト。pgx ネイティブの `connect_timeout`、`PGCONNECT_TIMEOUT`、service 設定が優先されます |
 | `PORT` | `8080` | API のリッスンポート |
@@ -44,6 +47,8 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `MULTICA_RUNTIME_RECONNECT_GRACE` | `3h` | オフラインのランタイムが処理中の作業を失敗させずに再接続できる猶予時間。`150s` 未満は `150s` に補正されます |
 
 Kubernetes で shutdown hold を設定する場合、`terminationGracePeriodSeconds` は hold と実際のシャットダウンにかかる時間の合計より大きくしてください。
+
+primary とレプリカの接続上限は独立しています。全 API プロセスの合計が PostgreSQL クラスターの接続上限に収まるように設定してください。レプリカ接続はデフォルトで 5 分後に再作成され、昇格後に読み取り専用状態を再検証します。接続失敗時はインフラストラクチャが透過的に primary へフォールバックし、短時間のパッシブサーキットを開きます。バックグラウンドのデータベースプローブは追加されません。アプリケーションはレプリカデータの最大経過時間を保証しないため、データベース層でレプリケーション遅延を監視し、整合性が必要な読み取りは primary に残してください。
 
 ## 公開アドレスとブラウザアクセス
 
@@ -238,6 +243,8 @@ API key と base URL の両方が空の場合、このレイヤーは無効に�
 | `MULTICA_WORKSPACES_ROOT` | `~/multica_workspaces` | 作業作業ディレクトリのルート |
 | `MULTICA_AGENT_TEMP_BASE` | `/tmp`（Linux/macOS） | Linux/macOS 専用。作業ごとのプライベート一時ディレクトリの親ディレクトリ。既存かつ書き込み可能な絶対パスである必要があり、無効な値の場合は `/tmp` にフォールバックせず作業の開始に失敗します。短いパスを選んでください。子ツールがその配下に AF_UNIX ソケットを作成する場合があり、`sun_path` の上限は Linux で 108 バイト、macOS で 104 バイトです |
 | `MULTICA_KEEP_ENV_AFTER_TASK` | `false` | デバッグ用に作業ディレクトリを保持 |
+
+デーモンがエージェント作業に注入する内部コンテキストについては、[作業ランタイム環境](/daemon-runtimes#作業ランタイム環境)を参照してください。
 
 各 AI コーディングツールは `MULTICA_<PROVIDER>_PATH` でコマンドパスを上書きでき、モデル上書き対応ツールでは `MULTICA_<PROVIDER>_MODEL` も利用できます。QwenPaw と MiniMax Code にはモデル変数がなく、MiniMax Code のパス変数は `MULTICA_MCODE_PATH` です。詳しくは [AI コーディングツール比較](/providers#モデルの取得元) を参照してください。DeepSeek Harness は `MULTICA_DSH_PATH` と `MULTICA_DSH_MODEL` に対応しています（値は dsh のモデルカタログにあるモデル ID、例: `deepseek-official/deepseek-chat`）。ZeroClaw は `MULTICA_ZEROCLAW_PATH` に対応しますが、モデル変数はありません。モデルは ZeroClaw のエージェント設定で管理します。マシン全体のデフォルト引数 `MULTICA_<PROVIDER>_ARGS` は、現在 Claude Code、Codex、CodeBuddy、Qwen Code、QwenPaw の 5 ツールに対応しています。対応する変数は `MULTICA_CLAUDE_ARGS`、`MULTICA_CODEX_ARGS`、`MULTICA_CODEBUDDY_ARGS`、`MULTICA_QWEN_ARGS`、`MULTICA_QWENPAW_ARGS` です。例:
 

@@ -68,7 +68,6 @@
   "revision": {
     "conflict": "タスクまたはコメントが変更されました。最新版に更新したので、比較してからもう一度保存してください。",
     "compare_title": "タイトルが同時に変更されました。両方の内容を比較してください。",
-    "compare_description": "説明が同時に変更されました。両方の内容を比較してください。",
     "compare_comment": "コメントが同時に変更されました。両方の内容を比較してください。",
     "server_version": "サーバー上の最新版",
     "local_version": "ローカル版",
@@ -590,7 +589,6 @@
     "trigger_autopilot": "オートパイロット実行",
     "trigger_comment": "コメントトリガー",
     "trigger_initial": "初回実行",
-    "trigger_handoff_prefix": "引き継ぎ：",
     "included_comments_other": "{{count}} 件のコメントを含む",
     "status_queued": "待機中",
     "status_dispatched": "開始中",
