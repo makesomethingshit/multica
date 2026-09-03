@@ -75,6 +75,12 @@ selfhost_project_name := $(if $(COMPOSE_PROJECT_NAME),,$(if $(wildcard $(WORKTRE
 SELFHOST_ENV = $(if $(selfhost_project_name),COMPOSE_PROJECT_NAME=$(selfhost_project_name),)
 SELFHOST_COMPOSE = $(if $(selfhost_project_name),$(SELFHOST_ENV) ,)$(COMPOSE)
 
+# Recursion goes through an indirect variable on purpose: recipe lines that
+# literally reference $(MAKE) run for real even under `make -n`, which would
+# turn the documented dry-run inspection into a live stack start. Going
+# through SELFHOST_REMAKE keeps -n dry: it only prints the re-exec line.
+SELFHOST_REMAKE := $(MAKE)
+
 define REQUIRE_ENV
 	@if [ ! -f "$(ENV_FILE)" ]; then \
 		echo "Missing env file: $(ENV_FILE)"; \
@@ -147,7 +153,7 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 			exit 1; \
 		fi; \
 		echo "==> Re-running make so this invocation runs on the new .env"; \
-		$(MAKE) --no-print-directory ENV_FILE=.env $@; \
+		$(SELFHOST_REMAKE) --no-print-directory ENV_FILE=.env $@; \
 		exit $$?; \
 	else \
 		echo "==> Pulling official Multica images..."; \
@@ -188,7 +194,7 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 			exit 1; \
 		fi; \
 		echo "==> Re-running make so this invocation runs on the new .env"; \
-		$(MAKE) --no-print-directory ENV_FILE=.env $@; \
+		$(SELFHOST_REMAKE) --no-print-directory ENV_FILE=.env $@; \
 		exit $$?; \
 	else \
 		echo "==> Building Multica from the current checkout..." && \
