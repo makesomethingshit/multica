@@ -48,8 +48,8 @@ func TestClaimTaskByRuntime_OwnerlessAgentOnPrivateRuntimeFailsExplicitly(t *tes
 	if !strings.Contains(errorMessage, "agent has no owner") {
 		t.Fatalf("task error = %q, want actionable missing-owner error", errorMessage)
 	}
-	if failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
-		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonInvalidTaskIdentity)
+	if failureReason != taskfailure.ReasonRuntimeAccessDenied.String() {
+		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonRuntimeAccessDenied)
 	}
 }
 
@@ -75,8 +75,12 @@ func TestClaimTaskByRuntime_SettlesPrivateOwnerMismatch(t *testing.T) {
 
 	var status, failureReason string
 	dbfx.QueryRow(t, `SELECT status, failure_reason FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status, &failureReason)
-	if status != "failed" || failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
-		t.Fatalf("task state = %q/%q, want failed/%s", status, failureReason, taskfailure.ReasonInvalidTaskIdentity)
+	// Regression A (PUCK-132): a queued issue task whose agent lost access to
+	// its private runtime settles as runtime_access_denied — matching the
+	// admission-time dispatch reason — not invalid_task_identity, so clients
+	// reach the dedicated recovery copy.
+	if status != "failed" || failureReason != taskfailure.ReasonRuntimeAccessDenied.String() {
+		t.Fatalf("task state = %q/%q, want failed/%s", status, failureReason, taskfailure.ReasonRuntimeAccessDenied)
 	}
 }
 
@@ -104,8 +108,11 @@ func TestClaimTaskByRuntime_SettlesPrivateOwnerMismatchChatFailure(t *testing.T)
 	var status, failureReason, assistantContent string
 	dbfx.QueryRow(t, `SELECT status, failure_reason FROM agent_task_queue WHERE id = $1`, taskID).Scan(&status, &failureReason)
 	dbfx.QueryRow(t, `SELECT content FROM chat_message WHERE task_id = $1 AND role = 'assistant'`, taskID).Scan(&assistantContent)
-	if status != "failed" || failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
-		t.Fatalf("task state = %q/%q, want failed/%s", status, failureReason, taskfailure.ReasonInvalidTaskIdentity)
+	// Regression B (PUCK-132): queued chat task settlement carries
+	// runtime_access_denied AND still produces the assistant failure message
+	// through the existing FailTask path.
+	if status != "failed" || failureReason != taskfailure.ReasonRuntimeAccessDenied.String() {
+		t.Fatalf("task state = %q/%q, want failed/%s", status, failureReason, taskfailure.ReasonRuntimeAccessDenied)
 	}
 	if !strings.Contains(assistantContent, "agent and runtime have different owners") {
 		t.Fatalf("assistant failure = %q, want owner-mismatch message", assistantContent)
@@ -141,8 +148,8 @@ func TestClaimTasksByRuntime_SettlesMismatchAndReturnsValidTask(t *testing.T) {
 	var mismatchStatus, mismatchReason, validStatus string
 	dbfx.QueryRow(t, `SELECT status, failure_reason FROM agent_task_queue WHERE id = $1`, mismatchTaskID).Scan(&mismatchStatus, &mismatchReason)
 	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, validTaskID).Scan(&validStatus)
-	if mismatchStatus != "failed" || mismatchReason != taskfailure.ReasonInvalidTaskIdentity.String() {
-		t.Fatalf("mismatch task state = %q/%q, want failed/%s", mismatchStatus, mismatchReason, taskfailure.ReasonInvalidTaskIdentity)
+	if mismatchStatus != "failed" || mismatchReason != taskfailure.ReasonRuntimeAccessDenied.String() {
+		t.Fatalf("mismatch task state = %q/%q, want failed/%s", mismatchStatus, mismatchReason, taskfailure.ReasonRuntimeAccessDenied)
 	}
 	if validStatus != "dispatched" {
 		t.Fatalf("valid task status = %q, want dispatched", validStatus)
@@ -200,8 +207,8 @@ func TestBuildClaimedTaskResponseRejectsAgentOwnerChangedAfterClaim(t *testing.T
 	if strings.Contains(errorMessage, "agent has no owner") {
 		t.Fatalf("task error = %q, must not describe a non-null owner as missing", errorMessage)
 	}
-	if failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
-		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonInvalidTaskIdentity)
+	if failureReason != taskfailure.ReasonRuntimeAccessDenied.String() {
+		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonRuntimeAccessDenied)
 	}
 }
 
@@ -252,6 +259,9 @@ func TestBuildClaimedTaskResponseRejectsAgentReboundAfterClaim(t *testing.T) {
 	if !strings.Contains(errorMessage, "moved to another runtime") {
 		t.Fatalf("task error = %q, want actionable rebind error", errorMessage)
 	}
+	// Regression C (PUCK-132): a genuine identity violation — the agent
+	// rebound to another runtime — must keep invalid_task_identity and must
+	// never be conflated with the runtime_access_denied ownership reason.
 	if failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
 		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonInvalidTaskIdentity)
 	}
@@ -394,8 +404,8 @@ func TestClaimTaskByRuntime_RuntimeOwnerChangedAfterClaimNeverDelivered(t *testi
 	if !strings.Contains(errorMessage, "agent and runtime have different owners") {
 		t.Fatalf("task error = %q, want actionable owner-mismatch error", errorMessage)
 	}
-	if failureReason != taskfailure.ReasonInvalidTaskIdentity.String() {
-		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonInvalidTaskIdentity)
+	if failureReason != taskfailure.ReasonRuntimeAccessDenied.String() {
+		t.Fatalf("failure_reason = %q, want %q", failureReason, taskfailure.ReasonRuntimeAccessDenied)
 	}
 
 	// And the full HTTP claim surface stays an empty successful poll.
@@ -682,8 +692,8 @@ func TestClaimTasksByRuntime_OwnerChangedAfterSnapshotSettlesMismatchReturnsVali
 	var mismatchStatus, mismatchReason, validStatus string
 	dbfx.QueryRow(t, `SELECT status, failure_reason FROM agent_task_queue WHERE id = $1`, mismatchTaskID).Scan(&mismatchStatus, &mismatchReason)
 	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, validTaskID).Scan(&validStatus)
-	if mismatchStatus != "failed" || mismatchReason != taskfailure.ReasonInvalidTaskIdentity.String() {
-		t.Fatalf("mismatch task state = %q/%q, want failed/%s", mismatchStatus, mismatchReason, taskfailure.ReasonInvalidTaskIdentity)
+	if mismatchStatus != "failed" || mismatchReason != taskfailure.ReasonRuntimeAccessDenied.String() {
+		t.Fatalf("mismatch task state = %q/%q, want failed/%s", mismatchStatus, mismatchReason, taskfailure.ReasonRuntimeAccessDenied)
 	}
 	if validStatus != "dispatched" {
 		t.Fatalf("valid task status = %q, want dispatched", validStatus)
