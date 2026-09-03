@@ -1905,7 +1905,7 @@ func (h *Handler) finalizeClaimDelivery(
 		failure := h.failClaimedTaskBeforeLaunch(
 			ctx, task,
 			userMessage,
-			taskfailure.ReasonInvalidTaskIdentity,
+			taskfailure.ReasonRuntimeAccessDenied,
 			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
 		)
 		return nil, failure, nil
@@ -2233,7 +2233,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
 			r.Context(), task,
 			userMessage,
-			taskfailure.ReasonInvalidTaskIdentity,
+			taskfailure.ReasonRuntimeAccessDenied,
 			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
 		)
 	}
