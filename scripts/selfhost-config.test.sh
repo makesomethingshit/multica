@@ -729,9 +729,18 @@ rm -f "$recipe_dir/.env.worktree"
 #      the next invocation.
 # ---------------------------------------------------------------------------
 
-# What POSTGRES_PASSWORD the `up` invocation's environment carried.
+# What POSTGRES_PASSWORD the `up` invocation's environment carried. The
+# selfhost recipes must start the stack exactly once per invocation: when the
+# first-run re-exec let the parent fall through to its own pull/up lines, the
+# stub saw two ups and the parent's old env source masked the fix.
 recorded_uppgpass() {
-  grep '^uppgpass=' "$record" | tail -n 1 | cut -d= -f2-
+  local count
+  count=$(grep -c '^uppgpass=' "$record" || true)
+  if [ "$count" != 1 ]; then
+    echo "[recorded_uppgpass] expected exactly one 'up' invocation per run, saw $count" >&2
+    exit 1
+  fi
+  grep '^uppgpass=' "$record" | cut -d= -f2-
 }
 
 require_same_uppgpass() {

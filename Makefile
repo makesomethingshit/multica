@@ -149,18 +149,19 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		echo "==> Re-running make so this invocation runs on the new .env"; \
 		$(MAKE) --no-print-directory ENV_FILE=.env $@; \
 		exit $$?; \
+	else \
+		echo "==> Pulling official Multica images..."; \
+		if ! $(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml pull; then \
+			echo ""; \
+			echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
+			echo "If this is before the first GHCR release, build from the current checkout:"; \
+			echo "  make selfhost-build"; \
+			exit 1; \
+		fi; \
+		echo "==> Starting Multica via Docker Compose..." && \
+		$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml up -d && \
+		$(SELFHOST_ENV) bash scripts/selfhost-wait.sh official; \
 	fi
-	@echo "==> Pulling official Multica images..."
-	@if ! $(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml pull; then \
-		echo ""; \
-		echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
-		echo "If this is before the first GHCR release, build from the current checkout:"; \
-		echo "  make selfhost-build"; \
-		exit 1; \
-	fi
-	@echo "==> Starting Multica via Docker Compose..."
-	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml up -d
-	@$(SELFHOST_ENV) bash scripts/selfhost-wait.sh official
 
 selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack
 	$(REQUIRE_COMPOSE)
@@ -189,10 +190,11 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		echo "==> Re-running make so this invocation runs on the new .env"; \
 		$(MAKE) --no-print-directory ENV_FILE=.env $@; \
 		exit $$?; \
+	else \
+		echo "==> Building Multica from the current checkout..." && \
+		$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build && \
+		$(SELFHOST_ENV) bash scripts/selfhost-wait.sh build; \
 	fi
-	@echo "==> Building Multica from the current checkout..."
-	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
-	@$(SELFHOST_ENV) bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack
 	$(REQUIRE_COMPOSE)
