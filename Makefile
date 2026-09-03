@@ -4,8 +4,21 @@ MAIN_ENV_FILE ?= .env
 WORKTREE_ENV_FILE ?= .env.worktree
 ENV_FILE ?= $(if $(wildcard $(MAIN_ENV_FILE)),$(MAIN_ENV_FILE),$(if $(wildcard $(WORKTREE_ENV_FILE)),$(WORKTREE_ENV_FILE),$(MAIN_ENV_FILE)))
 
+# Lines in an included env file are parsed as makefile assignments and would
+# shadow a value the caller exported into the environment. Capture the
+# environment's own COMPOSE_PROJECT_NAME first so an explicit
+# COMPOSE_PROJECT_NAME=... from the command line or environment keeps
+# precedence over the env file's value.
+ENV_COMPOSE_PROJECT_NAME := $(COMPOSE_PROJECT_NAME)
+
 ifneq ($(wildcard $(ENV_FILE)),)
 include $(ENV_FILE)
+endif
+
+# Restore the caller's explicit value after the include (see above). An
+# explicitly empty value drops out, like the port alias chain.
+ifneq ($(strip $(ENV_COMPOSE_PROJECT_NAME)),)
+COMPOSE_PROJECT_NAME = $(ENV_COMPOSE_PROJECT_NAME)
 endif
 
 POSTGRES_DB ?= multica
@@ -40,8 +53,9 @@ COMPOSE := docker compose
 # Postgres contract on localhost:5432 stays intact.
 #
 # Precedence for the self-host targets:
-#   1. an explicit COMPOSE_PROJECT_NAME (environment, command line, or env file;
-#      an explicitly empty value drops out, like the port alias chain)
+#   1. an explicit COMPOSE_PROJECT_NAME (command line or environment, which
+#      beat the env file; an explicitly empty value drops out, like the port
+#      alias chain)
 #   2. a worktree-specific name when .env.worktree exists (the worktree opt-in):
 #      multica_<slug>_<offset>, the same slug/offset scheme as
 #      scripts/init-worktree-env.sh, so it is deterministic per checkout and
@@ -128,6 +142,13 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
 		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
+		if [ ! -f .env ]; then \
+			echo "==> Failed to create .env" >&2; \
+			exit 1; \
+		fi; \
+		echo "==> Re-running make so this invocation runs on the new .env"; \
+		$(MAKE) --no-print-directory $@; \
+		exit $$?; \
 	fi
 	@echo "==> Pulling official Multica images..."
 	@if ! $(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml pull; then \
@@ -161,6 +182,13 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
 		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
+		if [ ! -f .env ]; then \
+			echo "==> Failed to create .env" >&2; \
+			exit 1; \
+		fi; \
+		echo "==> Re-running make so this invocation runs on the new .env"; \
+		$(MAKE) --no-print-directory $@; \
+		exit $$?; \
 	fi
 	@echo "==> Building Multica from the current checkout..."
 	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build

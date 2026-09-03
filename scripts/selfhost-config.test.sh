@@ -219,6 +219,10 @@ done
 case "$sub" in
 version) echo "2.30.0" ;;
 up)
+  # Record a credential-bearing variable from this invocation's environment,
+  # so tests can pin that the first self-host run and its re-runs resolve
+  # the same env source (PUCK-133 round-3 blocker 2).
+  printf 'uppgpass=%s\n' "${POSTGRES_PASSWORD-}" >>"$STUB_PUBLISHED_RECORD"
   "$REAL_DOCKER" compose "${files[@]}" config --format json 2>/dev/null | node -e '
 let raw = "";
 process.stdin.on("data", (chunk) => (raw += chunk));
@@ -273,19 +277,23 @@ real_docker="$(command -v docker)"
 # Remaining args are passed through to make (environment assignments must be
 # given as VAR=value before the target via `env`, make variables after it).
 run_recipe() {
-  local target=$1 env_mutation=$2 shell_env=$3 make_args=$4
+  # The fifth arg opts out of the .env seeding below, for cases that must
+  # exercise the real first-run path where no .env exists yet.
+  local target=$1 env_mutation=$2 shell_env=$3 make_args=$4 skip_env_seed=${5:-}
 
-  cp "$recipe_dir/.env.example" "$recipe_dir/.env"
-  # The Makefile includes .env and bare-`export`s every variable to the
-  # recipe environment, which clobbers this script's JWT_SECRET with the
-  # empty value .env.example ships; docker-compose.selfhost.yml now refuses
-  # to interpolate an empty JWT_SECRET. Seed the throwaway value into the
-  # recipe .env so make, the stub, and Compose all see a usable secret.
-  sed "s/^JWT_SECRET=.*/JWT_SECRET=$JWT_SECRET/" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
-  mv "$recipe_dir/.env.tmp" "$recipe_dir/.env"
-  if [ -n "$env_mutation" ]; then
-    sed "$env_mutation" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
+  if [ -z "$skip_env_seed" ]; then
+    cp "$recipe_dir/.env.example" "$recipe_dir/.env"
+    # The Makefile includes .env and bare-`export`s every variable to the
+    # recipe environment, which clobbers this script's JWT_SECRET with the
+    # empty value .env.example ships; docker-compose.selfhost.yml now refuses
+    # to interpolate an empty JWT_SECRET. Seed the throwaway value into the
+    # recipe .env so make, the stub, and Compose all see a usable secret.
+    sed "s/^JWT_SECRET=.*/JWT_SECRET=$JWT_SECRET/" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
     mv "$recipe_dir/.env.tmp" "$recipe_dir/.env"
+    if [ -n "$env_mutation" ]; then
+      sed "$env_mutation" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
+      mv "$recipe_dir/.env.tmp" "$recipe_dir/.env"
+    fi
   fi
   : >"$record"
   : >"$curl_log"
@@ -708,5 +716,57 @@ require_project 'explicit COMPOSE_PROJECT_NAME beats the worktree auto name' my-
 require_wait_sees_same_project 'explicit override wait project in worktree mode'
 
 rm -f "$recipe_dir/.env.worktree"
+
+# ---------------------------------------------------------------------------
+# PUCK-133 round-3 maintainer blockers:
+#   1. An explicit COMPOSE_PROJECT_NAME from the environment must beat a
+#      COMPOSE_PROJECT_NAME assignment inside .env (the include would
+#      otherwise re-assign it as a makefile variable and shadow the caller).
+#   2. The first `make selfhost` in a worktree (only .env.worktree present)
+#      must run on the same env source as its re-runs: the recipe creates
+#      .env mid-invocation, and the stack must not start on the exported
+#      worktree values, then switch to the generated .env's credentials on
+#      the next invocation.
+# ---------------------------------------------------------------------------
+
+# What POSTGRES_PASSWORD the `up` invocation's environment carried.
+recorded_uppgpass() {
+  grep '^uppgpass=' "$record" | tail -n 1 | cut -d= -f2-
+}
+
+require_same_uppgpass() {
+  local label=$1 first=$2 second
+  second=$(recorded_uppgpass)
+
+  if [ -z "$first" ] || [ -z "$second" ]; then
+    echo "[$label] the stack credential environment must not be empty"
+    echo "  first run:  ${first:-<none>}"
+    echo "  second run: ${second:-<none>}"
+    exit 1
+  fi
+  if [ "$first" != "$second" ]; then
+    echo "[$label] the first run and its re-run resolved different credentials"
+    echo "  first run:  $first"
+    echo "  second run: $second"
+    exit 1
+  fi
+}
+
+# 2. First-run lifecycle: with only .env.worktree present, run selfhost twice.
+# The first invocation creates .env; both runs must resolve the same
+# credentials, so the same volume never sees two different passwords.
+rm -f "$recipe_dir/.env"
+printf 'JWT_SECRET=worktree-jwt-secret\nPOSTGRES_PASSWORD=worktree-pass\nPOSTGRES_DB=worktree_db\nPOSTGRES_PORT=5432\n' >"$recipe_dir/.env.worktree"
+run_recipe selfhost '' '' '' fresh >/dev/null
+first_run_pass="$(recorded_uppgpass)"
+run_recipe selfhost '' '' '' fresh >/dev/null
+require_same_uppgpass 'first self-host run and its re-run resolve the same credentials' "$first_run_pass"
+rm -f "$recipe_dir/.env.worktree"
+
+# 1. An explicit COMPOSE_PROJECT_NAME in the environment beats the .env value.
+run_recipe selfhost \
+  's/^JWT_SECRET=.*/&\nCOMPOSE_PROJECT_NAME=file-stack/' \
+  'COMPOSE_PROJECT_NAME=my-stack' '' >/dev/null
+require_project 'env file must not shadow an explicit environment override' my-stack
 
 echo "self-host env derivation ok"
