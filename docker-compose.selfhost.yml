@@ -30,7 +30,12 @@
 # read it back with `docker compose port`, so the health check and the printed
 # URL always match what was actually published.
 
-name: multica
+# The project name stays exactly `multica` when COMPOSE_PROJECT_NAME is unset,
+# so existing installations keep their current containers and named volumes
+# (multica_pgdata and friends). Set COMPOSE_PROJECT_NAME to isolate a second
+# stack (e.g. a second checkout) from this one; the make selfhost targets apply
+# a worktree-specific name automatically.
+name: ${COMPOSE_PROJECT_NAME:-multica}
 
 services:
   postgres:
@@ -63,6 +68,9 @@ services:
       - backend_uploads:/app/data/uploads
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-multica}:${POSTGRES_PASSWORD:-multica}@postgres:5432/${POSTGRES_DB:-multica}?sslmode=disable
+      DATABASE_REPLICA_URL: ${DATABASE_REPLICA_URL:-}
+      DATABASE_REPLICA_MAX_CONNS: ${DATABASE_REPLICA_MAX_CONNS:-}
+      DATABASE_REPLICA_MIN_CONNS: ${DATABASE_REPLICA_MIN_CONNS:-}
       PORT: "8080"
       METRICS_ADDR: ${METRICS_ADDR:-}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a strong random value — generate one with 'openssl rand -hex 32'}

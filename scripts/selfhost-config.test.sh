@@ -42,6 +42,7 @@ trap 'rm -f "$tmp_env"; rm -rf "$tmp_dir"' EXIT
 sed 's/^FRONTEND_PORT=.*/FRONTEND_PORT=3100/' .env.example >"$tmp_env"
 printf '\nBACKEND_PORT=9100\nSMTP_FROM_EMAIL=multica@example.com\n' >>"$tmp_env"
 printf 'MULTICA_LLM_API_KEY=llm-key-from-env\nMULTICA_LLM_BASE_URL=http://gateway.example/v1\nMULTICA_LLM_DEFAULT_MODEL=model-from-env\nMULTICA_LLM_MAX_RETRIES=3\n' >>"$tmp_env"
+printf 'DATABASE_REPLICA_URL=postgres://reader:secret@replica.example.com:5432/multica?sslmode=require\nDATABASE_REPLICA_MAX_CONNS=12\nDATABASE_REPLICA_MIN_CONNS=1\n' >>"$tmp_env"
 
 config="$(
   docker compose \
@@ -58,6 +59,9 @@ require_config "$config" 'MULTICA_APP_URL: http://localhost:3100'
 require_config "$config" 'SMTP_FROM_EMAIL: multica@example.com'
 require_config "$config" 'MULTICA_DATABASE_STARTUP_TIMEOUT: 3m'
 require_config "$config" 'MULTICA_DATABASE_CONNECT_TIMEOUT: 5s'
+require_config "$config" 'DATABASE_REPLICA_URL: postgres://reader:secret@replica.example.com:5432/multica?sslmode=require'
+require_config "$config" 'DATABASE_REPLICA_MAX_CONNS: "12"'
+require_config "$config" 'DATABASE_REPLICA_MIN_CONNS: "1"'
 
 # The backend environment is an explicit allowlist, so a variable documented in
 # .env.example but missing here silently never reaches the container: the
@@ -215,11 +219,16 @@ done
 case "$sub" in
 version) echo "2.30.0" ;;
 up)
+  # Record a credential-bearing variable from this invocation's environment,
+  # so tests can pin that the first self-host run and its re-runs resolve
+  # the same env source (PUCK-133 round-3 blocker 2).
+  printf 'uppgpass=%s\n' "${POSTGRES_PASSWORD-}" >>"$STUB_PUBLISHED_RECORD"
   "$REAL_DOCKER" compose "${files[@]}" config --format json 2>/dev/null | node -e '
 let raw = "";
 process.stdin.on("data", (chunk) => (raw += chunk));
 process.stdin.on("end", () => {
   const config = JSON.parse(raw);
+  console.log("project=" + config.name);
   for (const service of ["backend", "frontend"]) {
     console.log(service + "=" + config.services[service].ports[0].published);
   }
@@ -227,6 +236,9 @@ process.stdin.on("end", () => {
 ' >>"$STUB_PUBLISHED_RECORD"
   ;;
 port)
+  # Record the project environment this lookup received, so the test can pin
+  # that the wait script probes the same project `up` started (#7967).
+  printf 'portenv=%s\n' "${COMPOSE_PROJECT_NAME-}" >>"$STUB_PUBLISHED_RECORD"
   service=${args[subidx + 1]}
   published=$(grep "^${service}=" "$STUB_PUBLISHED_RECORD" 2>/dev/null | tail -n 1 | cut -d= -f2)
   if [ -z "$published" ]; then exit 1; fi
@@ -265,19 +277,23 @@ real_docker="$(command -v docker)"
 # Remaining args are passed through to make (environment assignments must be
 # given as VAR=value before the target via `env`, make variables after it).
 run_recipe() {
-  local target=$1 env_mutation=$2 shell_env=$3 make_args=$4
+  # The fifth arg opts out of the .env seeding below, for cases that must
+  # exercise the real first-run path where no .env exists yet.
+  local target=$1 env_mutation=$2 shell_env=$3 make_args=$4 skip_env_seed=${5:-}
 
-  cp "$recipe_dir/.env.example" "$recipe_dir/.env"
-  # The Makefile includes .env and bare-`export`s every variable to the
-  # recipe environment, which clobbers this script's JWT_SECRET with the
-  # empty value .env.example ships; docker-compose.selfhost.yml now refuses
-  # to interpolate an empty JWT_SECRET. Seed the throwaway value into the
-  # recipe .env so make, the stub, and Compose all see a usable secret.
-  sed "s/^JWT_SECRET=.*/JWT_SECRET=$JWT_SECRET/" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
-  mv "$recipe_dir/.env.tmp" "$recipe_dir/.env"
-  if [ -n "$env_mutation" ]; then
-    sed "$env_mutation" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
+  if [ -z "$skip_env_seed" ]; then
+    cp "$recipe_dir/.env.example" "$recipe_dir/.env"
+    # The Makefile includes .env and bare-`export`s every variable to the
+    # recipe environment, which clobbers this script's JWT_SECRET with the
+    # empty value .env.example ships; docker-compose.selfhost.yml now refuses
+    # to interpolate an empty JWT_SECRET. Seed the throwaway value into the
+    # recipe .env so make, the stub, and Compose all see a usable secret.
+    sed "s/^JWT_SECRET=.*/JWT_SECRET=$JWT_SECRET/" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
     mv "$recipe_dir/.env.tmp" "$recipe_dir/.env"
+    if [ -n "$env_mutation" ]; then
+      sed "$env_mutation" "$recipe_dir/.env" >"$recipe_dir/.env.tmp"
+      mv "$recipe_dir/.env.tmp" "$recipe_dir/.env"
+    fi
   fi
   : >"$record"
   : >"$curl_log"
@@ -520,5 +536,246 @@ for shadowed_alias in BACKEND_PORT API_PORT SERVER_PORT; do
     "${shadowed_alias}=9600" '' >/dev/null
   require_consistent "env-file ${shadowed_alias} over the same shell variable" 9700
 done
+
+# ---------------------------------------------------------------------------
+# Compose project name isolation (regression for #7967)
+#
+# Both compose files used to hard-code `name: multica`, so self-host stacks
+# started from different checkouts resolved to one Compose project and shared
+# container and named-volume identities (multica-postgres-1, multica_pgdata,
+# ...). The name is now ${COMPOSE_PROJECT_NAME:-multica}, and the make selfhost
+# targets apply a worktree-specific project name (multica_<slug>_<offset>, the
+# same scheme as scripts/init-worktree-env.sh) when .env.worktree exists.
+#
+# Invariants:
+#   A. Default compatibility — with COMPOSE_PROJECT_NAME unset, the project and
+#      its pgdata volume still resolve to exactly multica, so existing
+#      installations keep their resources.
+#   B. Explicit override — COMPOSE_PROJECT_NAME wins end to end.
+#   C. Isolation — two distinct project names resolve to different named
+#      pgdata volumes, so they can never collide on one resource, and the
+#      wait script must see the same project as the stack it waits for: it
+#      reads the published port back with `docker compose port`, so probing
+#      another project (and health-checking it) would defeat the isolation.
+#   D. Development non-regression — worktree env generation keeps the shared
+#      Postgres model (POSTGRES_PORT=5432, unique POSTGRES_DB, no
+#      COMPOSE_PROJECT_NAME) and db-up/db-down are never namespaced.
+#   E. Existing behavior — every earlier assertion in this script already
+#      exercises the unchanged self-host configuration and must keep passing.
+# ---------------------------------------------------------------------------
+
+require_line() {
+  local config=$1
+  local pattern=$2
+
+  if ! grep -Eq "$pattern" <<<"$config"; then
+    echo "Missing expected docker compose config line:"
+    echo "  $pattern"
+    exit 1
+  fi
+}
+
+recorded_project() {
+  grep '^project=' "$record" | tail -n 1 | cut -d= -f2-
+}
+
+require_project() {
+  local label=$1
+  local expected=$2
+  local observed
+  observed=$(recorded_project)
+
+  if [ "$observed" != "$expected" ]; then
+    echo "[$label] Compose project name mismatch"
+    echo "  expected: $expected"
+    echo "  observed: ${observed:-<none>}"
+    exit 1
+  fi
+}
+
+# What project the wait script's `docker compose port` call saw. The stub
+# records the raw environment; an unset variable resolves to compose's own
+# default (multica), exactly like the up-path interpolation does.
+recorded_port_project() {
+  grep '^portenv=' "$record" | tail -n 1 | cut -d= -f2-
+}
+
+require_wait_sees_same_project() {
+  local label=$1
+  local up_project port_env port_project
+  up_project=$(recorded_project)
+  port_env=$(recorded_port_project)
+  port_project=${port_env:-multica}
+
+  if [ "$up_project" != "$port_project" ]; then
+    echo "[$label] the wait script probed a different Compose project than the one up started"
+    echo "  up resolved project:    $up_project"
+    echo "  wait port-call project: ${port_env:-<unset COMPOSE_PROJECT_NAME>}"
+    exit 1
+  fi
+}
+
+# A. Default compatibility, straight from the compose files.
+default_config="$(
+  env -u COMPOSE_PROJECT_NAME docker compose --env-file "$tmp_env" -f docker-compose.selfhost.yml config
+)"
+require_line "$default_config" '^name: multica$'
+require_line "$default_config" '^[[:space:]]+name: multica_pgdata$'
+
+dev_default_config="$(env -u COMPOSE_PROJECT_NAME docker compose -f docker-compose.yml config)"
+require_line "$dev_default_config" '^name: multica$'
+
+# B. An explicit override wins.
+override_config="$(
+  env COMPOSE_PROJECT_NAME=multica-test-a docker compose --env-file "$tmp_env" -f docker-compose.selfhost.yml config
+)"
+require_line "$override_config" '^name: multica-test-a$'
+
+# C. Isolation: a second stack must not reuse the default pgdata volume.
+require_line "$override_config" '^[[:space:]]+name: multica-test-a_pgdata$'
+if grep -Eq '^[[:space:]]+name: multica_pgdata$' <<<"$override_config"; then
+  echo "COMPOSE_PROJECT_NAME=multica-test-a must not resolve to the default multica_pgdata volume"
+  exit 1
+fi
+
+# A via the make path: with no .env.worktree, `make selfhost` stays on the
+# default project so existing installs are untouched.
+run_recipe selfhost '' '' '' >/dev/null
+require_project 'default self-host project name' multica
+require_wait_sees_same_project 'default wait project'
+
+# B via the make path, from the environment and from the command line.
+run_recipe selfhost '' 'COMPOSE_PROJECT_NAME=multica-test-a' '' >/dev/null
+require_project 'explicit COMPOSE_PROJECT_NAME from the environment' multica-test-a
+require_wait_sees_same_project 'explicit env override wait project'
+run_recipe selfhost '' '' 'COMPOSE_PROJECT_NAME=multica-test-b' >/dev/null
+require_project 'explicit COMPOSE_PROJECT_NAME from the command line' multica-test-b
+require_wait_sees_same_project 'explicit command-line override wait project'
+
+# D. Worktree env generation keeps the shared-Postgres development model:
+# port 5432, a unique per-worktree database from the existing scheme, and no
+# forced Compose project name.
+require_env "$(cat "$worktree_env")" 'POSTGRES_PORT=5432'
+init_offset="$(printf '%s' "$ROOT_DIR" | cksum | awk '{print $1 % 1000}')"
+require_env "$(cat "$worktree_env")" "POSTGRES_DB=multica_selfhost_config_test_${init_offset}"
+if grep -q '^COMPOSE_PROJECT_NAME=' "$worktree_env"; then
+  echo ".env.worktree must not force a Compose project name; ordinary dev targets stay on the shared project"
+  exit 1
+fi
+second_worktree_env="$tmp_dir/.env.worktree.other"
+WORKTREE_NAME=selfhost-config-test-other bash scripts/init-worktree-env.sh "$second_worktree_env" >/dev/null
+if [ "$(sed -n 's/^POSTGRES_DB=//p' "$worktree_env")" = "$(sed -n 's/^POSTGRES_DB=//p' "$second_worktree_env")" ]; then
+  echo "two worktrees must not share a database name"
+  exit 1
+fi
+
+# D. db-up/db-down are never namespaced — even in worktree mode, so the shared
+# Postgres container on localhost:5432 stays exactly where it is.
+printf 'POSTGRES_DB=worktree_db\nPORT=18080\n' >"$recipe_dir/.env.worktree"
+for target in db-up db-down; do
+  dry_run="$(cd "$recipe_dir" && make --no-print-directory -s -n "$target")"
+  if grep -q 'COMPOSE_PROJECT_NAME=' <<<"$dry_run"; then
+    echo "make $target must not set COMPOSE_PROJECT_NAME; shared Postgres would get namespaced:"
+    echo "$dry_run"
+    exit 1
+  fi
+done
+
+# Worktree mode: with .env.worktree present, the self-host targets resolve a
+# deterministic per-checkout project name reusing the init-worktree-env scheme.
+run_recipe selfhost '' '' '' >/dev/null
+worktree_project="$(recorded_project)"
+case "$worktree_project" in
+multica) echo "a worktree self-host stack must not fall back to the default project name" ; exit 1 ;;
+multica_*) : ;;
+*) echo "unexpected worktree self-host project name: $worktree_project" ; exit 1 ;;
+esac
+run_recipe selfhost '' '' '' >/dev/null
+require_project 'worktree self-host project name is deterministic' "$worktree_project"
+# The offset must come from the path as make itself sees it (CURDIR), not the
+# POSIX spelling this script holds, so the probe asks make directly.
+curdir_probe="$tmp_dir/print-curdir.mk"
+printf '%s\n' \
+  '.PHONY: print-curdir' \
+  'print-curdir:' \
+  '	@printf "%s\n" "$(CURDIR)"' \
+  >"$curdir_probe"
+recipe_curdir="$(cd "$recipe_dir" && make --no-print-directory -s -f "$curdir_probe" print-curdir)"
+expected_slug="$(printf '%s' 'recipe' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
+expected_offset="$(printf '%s' "$recipe_curdir" | cksum | awk '{print $1 % 1000}')"
+require_project \
+  'worktree self-host name reuses the init-worktree-env scheme' \
+  "multica_${expected_slug}_${expected_offset}"
+# The regression this pins: the wait script's `docker compose port` lookup
+# must carry the same project as the `up` that precedes it.
+require_wait_sees_same_project 'worktree wait project propagation'
+
+# ...and the explicit override still beats the worktree auto name.
+run_recipe selfhost '' 'COMPOSE_PROJECT_NAME=my-stack' '' >/dev/null
+require_project 'explicit COMPOSE_PROJECT_NAME beats the worktree auto name' my-stack
+require_wait_sees_same_project 'explicit override wait project in worktree mode'
+
+rm -f "$recipe_dir/.env.worktree"
+
+# ---------------------------------------------------------------------------
+# PUCK-133 round-3 maintainer blockers:
+#   1. An explicit COMPOSE_PROJECT_NAME from the environment must beat a
+#      COMPOSE_PROJECT_NAME assignment inside .env (the include would
+#      otherwise re-assign it as a makefile variable and shadow the caller).
+#   2. The first `make selfhost` in a worktree (only .env.worktree present)
+#      must run on the same env source as its re-runs: the recipe creates
+#      .env mid-invocation, and the stack must not start on the exported
+#      worktree values, then switch to the generated .env's credentials on
+#      the next invocation.
+# ---------------------------------------------------------------------------
+
+# What POSTGRES_PASSWORD the `up` invocation's environment carried. The
+# selfhost recipes must start the stack exactly once per invocation: when the
+# first-run re-exec let the parent fall through to its own pull/up lines, the
+# stub saw two ups and the parent's old env source masked the fix.
+recorded_uppgpass() {
+  local count
+  count=$(grep -c '^uppgpass=' "$record" || true)
+  if [ "$count" != 1 ]; then
+    echo "[recorded_uppgpass] expected exactly one 'up' invocation per run, saw $count" >&2
+    exit 1
+  fi
+  grep '^uppgpass=' "$record" | cut -d= -f2-
+}
+
+require_same_uppgpass() {
+  local label=$1 first=$2 second
+  second=$(recorded_uppgpass)
+
+  if [ -z "$first" ] || [ -z "$second" ]; then
+    echo "[$label] the stack credential environment must not be empty"
+    echo "  first run:  ${first:-<none>}"
+    echo "  second run: ${second:-<none>}"
+    exit 1
+  fi
+  if [ "$first" != "$second" ]; then
+    echo "[$label] the first run and its re-run resolved different credentials"
+    echo "  first run:  $first"
+    echo "  second run: $second"
+    exit 1
+  fi
+}
+
+# 2. First-run lifecycle: with only .env.worktree present, run selfhost twice.
+# The first invocation creates .env; both runs must resolve the same
+# credentials, so the same volume never sees two different passwords.
+rm -f "$recipe_dir/.env"
+printf 'JWT_SECRET=worktree-jwt-secret\nPOSTGRES_PASSWORD=worktree-pass\nPOSTGRES_DB=worktree_db\nPOSTGRES_PORT=5432\n' >"$recipe_dir/.env.worktree"
+run_recipe selfhost '' '' '' fresh >/dev/null
+first_run_pass="$(recorded_uppgpass)"
+run_recipe selfhost '' '' '' fresh >/dev/null
+require_same_uppgpass 'first self-host run and its re-run resolve the same credentials' "$first_run_pass"
+rm -f "$recipe_dir/.env.worktree"
+
+# 1. An explicit COMPOSE_PROJECT_NAME in the environment beats the .env value.
+run_recipe selfhost \
+  's/^JWT_SECRET=.*/&\nCOMPOSE_PROJECT_NAME=file-stack/' \
+  'COMPOSE_PROJECT_NAME=my-stack' '' >/dev/null
+require_project 'env file must not shadow an explicit environment override' my-stack
 
 echo "self-host env derivation ok"

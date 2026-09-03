@@ -4,8 +4,21 @@ MAIN_ENV_FILE ?= .env
 WORKTREE_ENV_FILE ?= .env.worktree
 ENV_FILE ?= $(if $(wildcard $(MAIN_ENV_FILE)),$(MAIN_ENV_FILE),$(if $(wildcard $(WORKTREE_ENV_FILE)),$(WORKTREE_ENV_FILE),$(MAIN_ENV_FILE)))
 
+# Lines in an included env file are parsed as makefile assignments and would
+# shadow a value the caller exported into the environment. Capture the
+# environment's own COMPOSE_PROJECT_NAME first so an explicit
+# COMPOSE_PROJECT_NAME=... from the command line or environment keeps
+# precedence over the env file's value.
+ENV_COMPOSE_PROJECT_NAME := $(COMPOSE_PROJECT_NAME)
+
 ifneq ($(wildcard $(ENV_FILE)),)
 include $(ENV_FILE)
+endif
+
+# Restore the caller's explicit value after the include (see above). An
+# explicitly empty value drops out, like the port alias chain.
+ifneq ($(strip $(ENV_COMPOSE_PROJECT_NAME)),)
+COMPOSE_PROJECT_NAME = $(ENV_COMPOSE_PROJECT_NAME)
 endif
 
 POSTGRES_DB ?= multica
@@ -31,6 +44,42 @@ export
 MULTICA_ARGS ?= $(ARGS)
 
 COMPOSE := docker compose
+
+# Self-host Compose project isolation (#7967): a self-host stack started from a
+# worktree must not share containers or named volumes with another checkout's
+# stack. Only the selfhost/selfhost-build/selfhost-stop targets below may apply
+# a worktree-specific project name; ordinary dev targets (db-up, db-down,
+# setup-worktree, start-worktree, up, down) must never see one, so the shared
+# Postgres contract on localhost:5432 stays intact.
+#
+# Precedence for the self-host targets:
+#   1. an explicit COMPOSE_PROJECT_NAME (command line or environment, which
+#      beat the env file; an explicitly empty value drops out, like the port
+#      alias chain)
+#   2. a worktree-specific name when .env.worktree exists (the worktree opt-in):
+#      multica_<slug>_<offset>, the same slug/offset scheme as
+#      scripts/init-worktree-env.sh, so it is deterministic per checkout and
+#      resistant to same-named worktree directories
+#   3. Compose's own default: multica, keeping existing multica_pgdata installs
+# When the variable is left empty nothing is exported, so Compose resolves the
+# `name:` field of the compose file instead.
+selfhost_worktree_name = $(if $(WORKTREE_NAME),$(WORKTREE_NAME),$(notdir $(CURDIR)))
+selfhost_worktree_slug = $(shell printf '%s' "$(1)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$$//')
+selfhost_worktree_offset = $(shell printf '%s' "$(1)" | cksum | awk '{print $$1 % 1000}')
+selfhost_project_name := $(if $(COMPOSE_PROJECT_NAME),,$(if $(wildcard $(WORKTREE_ENV_FILE)),multica_$(if $(call selfhost_worktree_slug,$(selfhost_worktree_name)),$(call selfhost_worktree_slug,$(selfhost_worktree_name)),multica)_$(call selfhost_worktree_offset,$(CURDIR))))
+# The same export prefix, reused by every self-host recipe line that must see
+# the resolved project: $(SELFHOST_COMPOSE) for compose invocations and
+# $(SELFHOST_ENV) for scripts the recipes drive — scripts/selfhost-wait.sh
+# reads the published port back with `docker compose port`, which must target
+# the project `up` started, not the compose default.
+SELFHOST_ENV = $(if $(selfhost_project_name),COMPOSE_PROJECT_NAME=$(selfhost_project_name),)
+SELFHOST_COMPOSE = $(if $(selfhost_project_name),$(SELFHOST_ENV) ,)$(COMPOSE)
+
+# Recursion goes through an indirect variable on purpose: recipe lines that
+# literally reference $(MAKE) run for real even under `make -n`, which would
+# turn the documented dry-run inspection into a live stack start. Going
+# through SELFHOST_REMAKE keeps -n dry: it only prints the re-exec line.
+SELFHOST_REMAKE := $(MAKE)
 
 define REQUIRE_ENV
 	@if [ ! -f "$(ENV_FILE)" ]; then \
@@ -99,18 +148,26 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
 		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
+		if [ ! -f .env ]; then \
+			echo "==> Failed to create .env" >&2; \
+			exit 1; \
+		fi; \
+		echo "==> Re-running make so this invocation runs on the new .env"; \
+		$(SELFHOST_REMAKE) --no-print-directory ENV_FILE=.env $@; \
+		exit $$?; \
+	else \
+		echo "==> Pulling official Multica images..."; \
+		if ! $(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml pull; then \
+			echo ""; \
+			echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
+			echo "If this is before the first GHCR release, build from the current checkout:"; \
+			echo "  make selfhost-build"; \
+			exit 1; \
+		fi; \
+		echo "==> Starting Multica via Docker Compose..." && \
+		$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml up -d && \
+		$(SELFHOST_ENV) bash scripts/selfhost-wait.sh official; \
 	fi
-	@echo "==> Pulling official Multica images..."
-	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
-		echo ""; \
-		echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
-		echo "If this is before the first GHCR release, build from the current checkout:"; \
-		echo "  make selfhost-build"; \
-		exit 1; \
-	fi
-	@echo "==> Starting Multica via Docker Compose..."
-	$(COMPOSE) -f docker-compose.selfhost.yml up -d
-	@bash scripts/selfhost-wait.sh official
 
 selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack
 	$(REQUIRE_COMPOSE)
@@ -132,15 +189,23 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
 		fi; \
 		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
+		if [ ! -f .env ]; then \
+			echo "==> Failed to create .env" >&2; \
+			exit 1; \
+		fi; \
+		echo "==> Re-running make so this invocation runs on the new .env"; \
+		$(SELFHOST_REMAKE) --no-print-directory ENV_FILE=.env $@; \
+		exit $$?; \
+	else \
+		echo "==> Building Multica from the current checkout..." && \
+		$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build && \
+		$(SELFHOST_ENV) bash scripts/selfhost-wait.sh build; \
 	fi
-	@echo "==> Building Multica from the current checkout..."
-	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
-	@bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack
 	$(REQUIRE_COMPOSE)
 	@echo "==> Stopping Multica services..."
-	$(COMPOSE) -f docker-compose.selfhost.yml down
+	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml down
 	@echo "✓ All services stopped."
 
 # ---------- Environments ----------
