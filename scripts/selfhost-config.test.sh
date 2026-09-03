@@ -232,6 +232,9 @@ process.stdin.on("end", () => {
 ' >>"$STUB_PUBLISHED_RECORD"
   ;;
 port)
+  # Record the project environment this lookup received, so the test can pin
+  # that the wait script probes the same project `up` started (#7967).
+  printf 'portenv=%s\n' "${COMPOSE_PROJECT_NAME-}" >>"$STUB_PUBLISHED_RECORD"
   service=${args[subidx + 1]}
   published=$(grep "^${service}=" "$STUB_PUBLISHED_RECORD" 2>/dev/null | tail -n 1 | cut -d= -f2)
   if [ -z "$published" ]; then exit 1; fi
@@ -542,7 +545,10 @@ done
 #      installations keep their resources.
 #   B. Explicit override — COMPOSE_PROJECT_NAME wins end to end.
 #   C. Isolation — two distinct project names resolve to different named
-#      pgdata volumes, so they can never collide on one resource.
+#      pgdata volumes, so they can never collide on one resource, and the
+#      wait script must see the same project as the stack it waits for: it
+#      reads the published port back with `docker compose port`, so probing
+#      another project (and health-checking it) would defeat the isolation.
 #   D. Development non-regression — worktree env generation keeps the shared
 #      Postgres model (POSTGRES_PORT=5432, unique POSTGRES_DB, no
 #      COMPOSE_PROJECT_NAME) and db-up/db-down are never namespaced.
@@ -579,6 +585,28 @@ require_project() {
   fi
 }
 
+# What project the wait script's `docker compose port` call saw. The stub
+# records the raw environment; an unset variable resolves to compose's own
+# default (multica), exactly like the up-path interpolation does.
+recorded_port_project() {
+  grep '^portenv=' "$record" | tail -n 1 | cut -d= -f2-
+}
+
+require_wait_sees_same_project() {
+  local label=$1
+  local up_project port_env port_project
+  up_project=$(recorded_project)
+  port_env=$(recorded_port_project)
+  port_project=${port_env:-multica}
+
+  if [ "$up_project" != "$port_project" ]; then
+    echo "[$label] the wait script probed a different Compose project than the one up started"
+    echo "  up resolved project:    $up_project"
+    echo "  wait port-call project: ${port_env:-<unset COMPOSE_PROJECT_NAME>}"
+    exit 1
+  fi
+}
+
 # A. Default compatibility, straight from the compose files.
 default_config="$(
   env -u COMPOSE_PROJECT_NAME docker compose --env-file "$tmp_env" -f docker-compose.selfhost.yml config
@@ -606,12 +634,15 @@ fi
 # default project so existing installs are untouched.
 run_recipe selfhost '' '' '' >/dev/null
 require_project 'default self-host project name' multica
+require_wait_sees_same_project 'default wait project'
 
 # B via the make path, from the environment and from the command line.
 run_recipe selfhost '' 'COMPOSE_PROJECT_NAME=multica-test-a' '' >/dev/null
 require_project 'explicit COMPOSE_PROJECT_NAME from the environment' multica-test-a
+require_wait_sees_same_project 'explicit env override wait project'
 run_recipe selfhost '' '' 'COMPOSE_PROJECT_NAME=multica-test-b' >/dev/null
 require_project 'explicit COMPOSE_PROJECT_NAME from the command line' multica-test-b
+require_wait_sees_same_project 'explicit command-line override wait project'
 
 # D. Worktree env generation keeps the shared-Postgres development model:
 # port 5432, a unique per-worktree database from the existing scheme, and no
@@ -667,10 +698,14 @@ expected_offset="$(printf '%s' "$recipe_curdir" | cksum | awk '{print $1 % 1000}
 require_project \
   'worktree self-host name reuses the init-worktree-env scheme' \
   "multica_${expected_slug}_${expected_offset}"
+# The regression this pins: the wait script's `docker compose port` lookup
+# must carry the same project as the `up` that precedes it.
+require_wait_sees_same_project 'worktree wait project propagation'
 
 # ...and the explicit override still beats the worktree auto name.
 run_recipe selfhost '' 'COMPOSE_PROJECT_NAME=my-stack' '' >/dev/null
 require_project 'explicit COMPOSE_PROJECT_NAME beats the worktree auto name' my-stack
+require_wait_sees_same_project 'explicit override wait project in worktree mode'
 
 rm -f "$recipe_dir/.env.worktree"
 

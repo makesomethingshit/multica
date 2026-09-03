@@ -53,7 +53,13 @@ selfhost_worktree_name = $(if $(WORKTREE_NAME),$(WORKTREE_NAME),$(notdir $(CURDI
 selfhost_worktree_slug = $(shell printf '%s' "$(1)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$$//')
 selfhost_worktree_offset = $(shell printf '%s' "$(1)" | cksum | awk '{print $$1 % 1000}')
 selfhost_project_name := $(if $(COMPOSE_PROJECT_NAME),,$(if $(wildcard $(WORKTREE_ENV_FILE)),multica_$(if $(call selfhost_worktree_slug,$(selfhost_worktree_name)),$(call selfhost_worktree_slug,$(selfhost_worktree_name)),multica)_$(call selfhost_worktree_offset,$(CURDIR))))
-SELFHOST_COMPOSE = $(if $(selfhost_project_name),COMPOSE_PROJECT_NAME=$(selfhost_project_name) ,)$(COMPOSE)
+# The same export prefix, reused by every self-host recipe line that must see
+# the resolved project: $(SELFHOST_COMPOSE) for compose invocations and
+# $(SELFHOST_ENV) for scripts the recipes drive — scripts/selfhost-wait.sh
+# reads the published port back with `docker compose port`, which must target
+# the project `up` started, not the compose default.
+SELFHOST_ENV = $(if $(selfhost_project_name),COMPOSE_PROJECT_NAME=$(selfhost_project_name),)
+SELFHOST_COMPOSE = $(if $(selfhost_project_name),$(SELFHOST_ENV) ,)$(COMPOSE)
 
 define REQUIRE_ENV
 	@if [ ! -f "$(ENV_FILE)" ]; then \
@@ -133,7 +139,7 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 	fi
 	@echo "==> Starting Multica via Docker Compose..."
 	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml up -d
-	@bash scripts/selfhost-wait.sh official
+	@$(SELFHOST_ENV) bash scripts/selfhost-wait.sh official
 
 selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack
 	$(REQUIRE_COMPOSE)
@@ -158,7 +164,7 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 	fi
 	@echo "==> Building Multica from the current checkout..."
 	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
-	@bash scripts/selfhost-wait.sh build
+	@$(SELFHOST_ENV) bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack
 	$(REQUIRE_COMPOSE)
