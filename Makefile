@@ -147,7 +147,7 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 			exit 1; \
 		fi; \
 		echo "==> Re-running make so this invocation runs on the new .env"; \
-		$(MAKE) --no-print-directory $@; \
+		$(MAKE) --no-print-directory ENV_FILE=.env $@; \
 		exit $$?; \
 	fi
 	@echo "==> Pulling official Multica images..."
@@ -187,7 +187,7 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 			exit 1; \
 		fi; \
 		echo "==> Re-running make so this invocation runs on the new .env"; \
-		$(MAKE) --no-print-directory $@; \
+		$(MAKE) --no-print-directory ENV_FILE=.env $@; \
 		exit $$?; \
 	fi
 	@echo "==> Building Multica from the current checkout..."
