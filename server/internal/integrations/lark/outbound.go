@@ -281,12 +281,12 @@ func (p *Patcher) SetTypingIndicatorManager(m *TypingIndicatorManager) {
 //
 // We deliberately do NOT subscribe to EventTaskQueued / EventTaskRunning
 // (no thinking-card lifecycle anymore — adds noise without value).
-// EventTaskCompleted is subscribed ONLY for issue tasks created via
-// /issue (IssueID.Valid && !ChatSessionID.Valid). Chat tasks already
-// emit EventChatDone first with the real reply; reacting to
-// EventTaskCompleted for them would duplicate the bubble or resurrect
-// the "Done." overwrite regression. The issue-only guard in
-// handleIssueCompleted enforces that exclusivity.
+// EventTaskCompleted is handled only for issue tasks created via /issue
+// (IssueID.Valid && !ChatSessionID.Valid). The subscription stays
+// unconditional; processEvent drops chat completions before any DB work
+// because chat tasks already emit EventChatDone first with the real
+// reply, and reacting to EventTaskCompleted for them would duplicate the
+// bubble or resurrect the "Done." overwrite regression.
 func (p *Patcher) Register(bus *events.Bus) {
 	bus.Subscribe(protocol.EventTaskCompleted, p.handleEvent)
 	bus.Subscribe(protocol.EventTaskFailed, p.handleEvent)

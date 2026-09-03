@@ -38,9 +38,13 @@ type fakePatcherQueries struct {
 	issueErr            error
 	workspace           db.Workspace
 	workspaceErr        error
+	getAgentTaskCalls   int
 }
 
 func (f *fakePatcherQueries) GetAgentTask(ctx context.Context, id pgtype.UUID) (db.AgentTaskQueue, error) {
+	f.mu.Lock()
+	f.getAgentTaskCalls++
+	f.mu.Unlock()
 	return f.task, f.taskErr
 }
 func (f *fakePatcherQueries) TaskHasChannelIngestedMessages(ctx context.Context, taskID pgtype.UUID) (bool, error) {
@@ -516,9 +520,9 @@ func TestPatcherSwallowsInstallationLoadErrors(t *testing.T) {
 // before TaskCompleted (without content) for every chat task. The
 // Patcher must NOT react to TaskCompleted — doing so would either
 // re-send the same text reply (duplicate bubble) or send the "Done."
-// fallback (the original bug Bohan reported). The fix is to leave
-// EventTaskCompleted unsubscribed; this test asserts exactly one
-// outbound text message from the sequence.
+// fallback (the original bug Bohan reported). processEvent drops chat
+// completions before any DB work; this test asserts exactly one outbound
+// text message from the sequence and zero GetAgentTask calls.
 func TestPatcherIgnoresEventTaskCompletedForChatTasks(t *testing.T) {
 	p, q, api := newTestPatcher(t)
 	taskID := uuidFromString(t, "ee666666-ee66-ee66-ee66-eeeeeeeeeeee")
@@ -535,6 +539,10 @@ func TestPatcherIgnoresEventTaskCompletedForChatTasks(t *testing.T) {
 			Content:       "Hello! I'm cc, a coding agent…",
 		},
 	})
+
+	// ChatDone legitimately loads the task; snapshot the counter here so
+	// Step 2 can be pinned to a zero delta.
+	queriesAfterChatDone := q.getAgentTaskCalls
 
 	// Step 2: TaskCompleted fires immediately after with no content.
 	// The Patcher MUST NOT send a second message — neither a
@@ -561,6 +569,10 @@ func TestPatcherIgnoresEventTaskCompletedForChatTasks(t *testing.T) {
 	if len(api.sent) != 0 || len(api.patched) != 0 {
 		t.Errorf("no card outbound expected on the success path; got sent=%d patched=%d",
 			len(api.sent), len(api.patched))
+	}
+	if q.getAgentTaskCalls != queriesAfterChatDone {
+		t.Errorf("chat TaskCompleted must add no GetAgentTask calls after ChatDone; got %d → %d",
+			queriesAfterChatDone, q.getAgentTaskCalls)
 	}
 }
 
@@ -971,6 +983,9 @@ func TestPatcherIssueCompleted_SendsToOriginatingGroup(t *testing.T) {
 	if got.ReplyTarget.IsSet() {
 		t.Errorf("group non-thread completion must be chat-level; got %+v", got.ReplyTarget)
 	}
+	if q.getAgentTaskCalls != 1 {
+		t.Errorf("issue completion must load the task exactly once; GetAgentTask called %d times", q.getAgentTaskCalls)
+	}
 }
 
 func TestPatcherIssueCompleted_ThreadedGroup(t *testing.T) {
@@ -1035,6 +1050,9 @@ func TestPatcherIssueCompleted_DropsChatTask(t *testing.T) {
 	defer api.mu.Unlock()
 	if len(api.textSent) != 0 || len(api.sent) != 0 {
 		t.Fatalf("chat task TaskCompleted must be dropped to avoid double-send; got text=%d card=%d", len(api.textSent), len(api.sent))
+	}
+	if q.getAgentTaskCalls != 0 {
+		t.Errorf("chat TaskCompleted must return before any DB query; GetAgentTask called %d times", q.getAgentTaskCalls)
 	}
 }
 
