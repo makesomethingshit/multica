@@ -32,6 +32,29 @@ MULTICA_ARGS ?= $(ARGS)
 
 COMPOSE := docker compose
 
+# Self-host Compose project isolation (#7967): a self-host stack started from a
+# worktree must not share containers or named volumes with another checkout's
+# stack. Only the selfhost/selfhost-build/selfhost-stop targets below may apply
+# a worktree-specific project name; ordinary dev targets (db-up, db-down,
+# setup-worktree, start-worktree, up, down) must never see one, so the shared
+# Postgres contract on localhost:5432 stays intact.
+#
+# Precedence for the self-host targets:
+#   1. an explicit COMPOSE_PROJECT_NAME (environment, command line, or env file;
+#      an explicitly empty value drops out, like the port alias chain)
+#   2. a worktree-specific name when .env.worktree exists (the worktree opt-in):
+#      multica_<slug>_<offset>, the same slug/offset scheme as
+#      scripts/init-worktree-env.sh, so it is deterministic per checkout and
+#      resistant to same-named worktree directories
+#   3. Compose's own default: multica, keeping existing multica_pgdata installs
+# When the variable is left empty nothing is exported, so Compose resolves the
+# `name:` field of the compose file instead.
+selfhost_worktree_name = $(if $(WORKTREE_NAME),$(WORKTREE_NAME),$(notdir $(CURDIR)))
+selfhost_worktree_slug = $(shell printf '%s' "$(1)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$$//')
+selfhost_worktree_offset = $(shell printf '%s' "$(1)" | cksum | awk '{print $$1 % 1000}')
+selfhost_project_name := $(if $(COMPOSE_PROJECT_NAME),,$(if $(wildcard $(WORKTREE_ENV_FILE)),multica_$(if $(call selfhost_worktree_slug,$(selfhost_worktree_name)),$(call selfhost_worktree_slug,$(selfhost_worktree_name)),multica)_$(call selfhost_worktree_offset,$(CURDIR))))
+SELFHOST_COMPOSE = $(if $(selfhost_project_name),COMPOSE_PROJECT_NAME=$(selfhost_project_name) ,)$(COMPOSE)
+
 define REQUIRE_ENV
 	@if [ ! -f "$(ENV_FILE)" ]; then \
 		echo "Missing env file: $(ENV_FILE)"; \
@@ -101,7 +124,7 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
 	fi
 	@echo "==> Pulling official Multica images..."
-	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
+	@if ! $(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml pull; then \
 		echo ""; \
 		echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
 		echo "If this is before the first GHCR release, build from the current checkout:"; \
@@ -109,7 +132,7 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		exit 1; \
 	fi
 	@echo "==> Starting Multica via Docker Compose..."
-	$(COMPOSE) -f docker-compose.selfhost.yml up -d
+	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml up -d
 	@bash scripts/selfhost-wait.sh official
 
 selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack
@@ -134,13 +157,13 @@ selfhost-build: ## Build backend/web from the current checkout and start the sel
 		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
 	fi
 	@echo "==> Building Multica from the current checkout..."
-	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
+	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
 	@bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack
 	$(REQUIRE_COMPOSE)
 	@echo "==> Stopping Multica services..."
-	$(COMPOSE) -f docker-compose.selfhost.yml down
+	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml down
 	@echo "✓ All services stopped."
 
 # ---------- Environments ----------

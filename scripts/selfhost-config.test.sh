@@ -224,6 +224,7 @@ let raw = "";
 process.stdin.on("data", (chunk) => (raw += chunk));
 process.stdin.on("end", () => {
   const config = JSON.parse(raw);
+  console.log("project=" + config.name);
   for (const service of ["backend", "frontend"]) {
     console.log(service + "=" + config.services[service].ports[0].published);
   }
@@ -524,5 +525,153 @@ for shadowed_alias in BACKEND_PORT API_PORT SERVER_PORT; do
     "${shadowed_alias}=9600" '' >/dev/null
   require_consistent "env-file ${shadowed_alias} over the same shell variable" 9700
 done
+
+# ---------------------------------------------------------------------------
+# Compose project name isolation (regression for #7967)
+#
+# Both compose files used to hard-code `name: multica`, so self-host stacks
+# started from different checkouts resolved to one Compose project and shared
+# container and named-volume identities (multica-postgres-1, multica_pgdata,
+# ...). The name is now ${COMPOSE_PROJECT_NAME:-multica}, and the make selfhost
+# targets apply a worktree-specific project name (multica_<slug>_<offset>, the
+# same scheme as scripts/init-worktree-env.sh) when .env.worktree exists.
+#
+# Invariants:
+#   A. Default compatibility — with COMPOSE_PROJECT_NAME unset, the project and
+#      its pgdata volume still resolve to exactly multica, so existing
+#      installations keep their resources.
+#   B. Explicit override — COMPOSE_PROJECT_NAME wins end to end.
+#   C. Isolation — two distinct project names resolve to different named
+#      pgdata volumes, so they can never collide on one resource.
+#   D. Development non-regression — worktree env generation keeps the shared
+#      Postgres model (POSTGRES_PORT=5432, unique POSTGRES_DB, no
+#      COMPOSE_PROJECT_NAME) and db-up/db-down are never namespaced.
+#   E. Existing behavior — every earlier assertion in this script already
+#      exercises the unchanged self-host configuration and must keep passing.
+# ---------------------------------------------------------------------------
+
+require_line() {
+  local config=$1
+  local pattern=$2
+
+  if ! grep -Eq "$pattern" <<<"$config"; then
+    echo "Missing expected docker compose config line:"
+    echo "  $pattern"
+    exit 1
+  fi
+}
+
+recorded_project() {
+  grep '^project=' "$record" | tail -n 1 | cut -d= -f2-
+}
+
+require_project() {
+  local label=$1
+  local expected=$2
+  local observed
+  observed=$(recorded_project)
+
+  if [ "$observed" != "$expected" ]; then
+    echo "[$label] Compose project name mismatch"
+    echo "  expected: $expected"
+    echo "  observed: ${observed:-<none>}"
+    exit 1
+  fi
+}
+
+# A. Default compatibility, straight from the compose files.
+default_config="$(
+  env -u COMPOSE_PROJECT_NAME docker compose --env-file "$tmp_env" -f docker-compose.selfhost.yml config
+)"
+require_line "$default_config" '^name: multica$'
+require_line "$default_config" '^[[:space:]]+name: multica_pgdata$'
+
+dev_default_config="$(env -u COMPOSE_PROJECT_NAME docker compose -f docker-compose.yml config)"
+require_line "$dev_default_config" '^name: multica$'
+
+# B. An explicit override wins.
+override_config="$(
+  env COMPOSE_PROJECT_NAME=multica-test-a docker compose --env-file "$tmp_env" -f docker-compose.selfhost.yml config
+)"
+require_line "$override_config" '^name: multica-test-a$'
+
+# C. Isolation: a second stack must not reuse the default pgdata volume.
+require_line "$override_config" '^[[:space:]]+name: multica-test-a_pgdata$'
+if grep -Eq '^[[:space:]]+name: multica_pgdata$' <<<"$override_config"; then
+  echo "COMPOSE_PROJECT_NAME=multica-test-a must not resolve to the default multica_pgdata volume"
+  exit 1
+fi
+
+# A via the make path: with no .env.worktree, `make selfhost` stays on the
+# default project so existing installs are untouched.
+run_recipe selfhost '' '' '' >/dev/null
+require_project 'default self-host project name' multica
+
+# B via the make path, from the environment and from the command line.
+run_recipe selfhost '' 'COMPOSE_PROJECT_NAME=multica-test-a' '' >/dev/null
+require_project 'explicit COMPOSE_PROJECT_NAME from the environment' multica-test-a
+run_recipe selfhost '' '' 'COMPOSE_PROJECT_NAME=multica-test-b' >/dev/null
+require_project 'explicit COMPOSE_PROJECT_NAME from the command line' multica-test-b
+
+# D. Worktree env generation keeps the shared-Postgres development model:
+# port 5432, a unique per-worktree database from the existing scheme, and no
+# forced Compose project name.
+require_env "$(cat "$worktree_env")" 'POSTGRES_PORT=5432'
+init_offset="$(printf '%s' "$ROOT_DIR" | cksum | awk '{print $1 % 1000}')"
+require_env "$(cat "$worktree_env")" "POSTGRES_DB=multica_selfhost_config_test_${init_offset}"
+if grep -q '^COMPOSE_PROJECT_NAME=' "$worktree_env"; then
+  echo ".env.worktree must not force a Compose project name; ordinary dev targets stay on the shared project"
+  exit 1
+fi
+second_worktree_env="$tmp_dir/.env.worktree.other"
+WORKTREE_NAME=selfhost-config-test-other bash scripts/init-worktree-env.sh "$second_worktree_env" >/dev/null
+if [ "$(sed -n 's/^POSTGRES_DB=//p' "$worktree_env")" = "$(sed -n 's/^POSTGRES_DB=//p' "$second_worktree_env")" ]; then
+  echo "two worktrees must not share a database name"
+  exit 1
+fi
+
+# D. db-up/db-down are never namespaced — even in worktree mode, so the shared
+# Postgres container on localhost:5432 stays exactly where it is.
+printf 'POSTGRES_DB=worktree_db\nPORT=18080\n' >"$recipe_dir/.env.worktree"
+for target in db-up db-down; do
+  dry_run="$(cd "$recipe_dir" && make --no-print-directory -s -n "$target")"
+  if grep -q 'COMPOSE_PROJECT_NAME=' <<<"$dry_run"; then
+    echo "make $target must not set COMPOSE_PROJECT_NAME; shared Postgres would get namespaced:"
+    echo "$dry_run"
+    exit 1
+  fi
+done
+
+# Worktree mode: with .env.worktree present, the self-host targets resolve a
+# deterministic per-checkout project name reusing the init-worktree-env scheme.
+run_recipe selfhost '' '' '' >/dev/null
+worktree_project="$(recorded_project)"
+case "$worktree_project" in
+multica) echo "a worktree self-host stack must not fall back to the default project name" ; exit 1 ;;
+multica_*) : ;;
+*) echo "unexpected worktree self-host project name: $worktree_project" ; exit 1 ;;
+esac
+run_recipe selfhost '' '' '' >/dev/null
+require_project 'worktree self-host project name is deterministic' "$worktree_project"
+# The offset must come from the path as make itself sees it (CURDIR), not the
+# POSIX spelling this script holds, so the probe asks make directly.
+curdir_probe="$tmp_dir/print-curdir.mk"
+printf '%s\n' \
+  '.PHONY: print-curdir' \
+  'print-curdir:' \
+  '	@printf "%s\n" "$(CURDIR)"' \
+  >"$curdir_probe"
+recipe_curdir="$(cd "$recipe_dir" && make --no-print-directory -s -f "$curdir_probe" print-curdir)"
+expected_slug="$(printf '%s' 'recipe' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')"
+expected_offset="$(printf '%s' "$recipe_curdir" | cksum | awk '{print $1 % 1000}')"
+require_project \
+  'worktree self-host name reuses the init-worktree-env scheme' \
+  "multica_${expected_slug}_${expected_offset}"
+
+# ...and the explicit override still beats the worktree auto name.
+run_recipe selfhost '' 'COMPOSE_PROJECT_NAME=my-stack' '' >/dev/null
+require_project 'explicit COMPOSE_PROJECT_NAME beats the worktree auto name' my-stack
+
+rm -f "$recipe_dir/.env.worktree"
 
 echo "self-host env derivation ok"
