@@ -401,12 +401,11 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 	if _, err := q.GetChannelTaskDelivery(ctx, firstTaskID); err != nil {
 		t.Fatalf("initial channel issue task should have delivery: %v", err)
 	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, result.Issue.ID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, result.Issue.ID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM issue WHERE id = $1`, result.Issue.ID)
-	})
+	// Registered in reverse so LIFO teardown deletes delivery, then tasks,
+	// then the issue.
+	fx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, result.Issue.ID)
+	fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, result.Issue.ID)
+	fx.Cleanup(t, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, result.Issue.ID)
 	// Finish the first task so subsequent enqueues are not blocked by duplicate
 	// pending, but keep its delivery row to prove the route snapshot belongs to
 	// that task only.
@@ -431,9 +430,7 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 	if _, err := q.GetChannelTaskDelivery(ctx, webTask.ID); err == nil {
 		t.Fatalf("ordinary follow-up task should not have delivery, but found one for %v", webTask.ID)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(webTask.ID)); err != nil {
-		t.Fatalf("cleanup ordinary follow-up task: %v", err)
-	}
+	fx.Exec(t, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(webTask.ID))
 
 	// Comment-triggered task should not inherit delivery.
 	commentID := fx.Comment(t, util.UUIDToString(issue.ID), "follow-up", testutil.Cols{
@@ -447,8 +444,8 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 		if _, err := q.GetChannelTaskDelivery(ctx, commentTask.ID); err == nil {
 			t.Fatalf("comment-triggered task should not inherit delivery, but found one for %v", commentTask.ID)
 		}
-		pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(commentTask.ID))
-		pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(commentTask.ID))
+		fx.Exec(t, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(commentTask.ID))
+		fx.Exec(t, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(commentTask.ID))
 	}
 
 	// Public rerun path should not inherit delivery.
@@ -459,8 +456,8 @@ func TestChannelIssueDelivery_SubsequentTasksDoNotInheritDelivery(t *testing.T) 
 		if _, err := q.GetChannelTaskDelivery(ctx, rerunTask.ID); err == nil {
 			t.Fatalf("rerun task should not inherit delivery, but found one for %v", rerunTask.ID)
 		}
-		pool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(rerunTask.ID))
-		pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(rerunTask.ID))
+		fx.Exec(t, `DELETE FROM agent_task_queue WHERE id = $1`, util.UUIDToString(rerunTask.ID))
+		fx.Exec(t, `DELETE FROM channel_task_delivery WHERE task_id = $1`, util.UUIDToString(rerunTask.ID))
 	}
 }
 
@@ -527,12 +524,11 @@ func TestChannelIssueDelivery_BindingDeletedOrdinaryEnqueueStillSucceeds(t *test
 	if _, err := q.GetChannelTaskDelivery(ctx, firstResult.AssignedTaskID); err != nil {
 		t.Fatalf("first channel issue should have delivery: %v", err)
 	}
-	t.Cleanup(func() {
-		cleanupCtx := context.Background()
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, firstResult.Issue.ID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, firstResult.Issue.ID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM issue WHERE id = $1`, firstResult.Issue.ID)
-	})
+	// Registered in reverse so LIFO teardown deletes delivery, then tasks,
+	// then the issue.
+	fx.Cleanup(t, `DELETE FROM issue WHERE id = $1`, firstResult.Issue.ID)
+	fx.Cleanup(t, `DELETE FROM agent_task_queue WHERE issue_id = $1`, firstResult.Issue.ID)
+	fx.Cleanup(t, `DELETE FROM channel_task_delivery WHERE task_id IN (SELECT id FROM agent_task_queue WHERE issue_id = $1)`, firstResult.Issue.ID)
 
 	// Delete the originating binding.
 	if _, err := pool.Exec(ctx, `DELETE FROM channel_chat_session_binding WHERE chat_session_id = $1`, util.UUIDToString(chatSessionID)); err != nil {
