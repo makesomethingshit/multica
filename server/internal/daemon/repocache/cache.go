@@ -1110,6 +1110,13 @@ func createIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, check
 		}
 	}
 
+	// Enforce the resolved-base-commit invariant before the detached checkout:
+	// the fresh clone's object store must contain the commit that was resolved
+	// from the shared cache before the clone started (multica-ai/multica#8011).
+	if err := ensureBaseCommitInCheckoutContext(ctx, barePath, checkoutPath, baseRef, baseCommit); err != nil {
+		return "", err
+	}
+
 	if out, err := runGitCombinedOutputContext(ctx, "-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
 		return "", fmt.Errorf("git checkout --detach: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -1129,6 +1136,41 @@ func createIsolatedCheckoutContext(ctx context.Context, barePath, repoURL, check
 	}
 	cleanup = false
 	return actualBranch, nil
+}
+
+// ensureBaseCommitInCheckoutContext verifies that a fresh isolated checkout's object
+// store contains the commit resolved from the shared bare cache before the
+// clone started, and performs a bounded local recovery when it does not.
+//
+// The healthy path is a single `rev-parse --verify`: a `git clone --local`
+// from a full cache hard-links the whole object store, so the commit is there
+// and nothing else happens. When the cache is shallow, Git ignores --local
+// and clones over the pack protocol instead; such a clone transfers only the
+// objects reachable from the heads it fetches (refs/heads/*), so a freshly
+// fetched tip that arrived through the remote-tracking refspec
+// (refs/remotes/origin/*) can be missing even though it resolved in the
+// cache a moment earlier (multica-ai/multica#8011).
+//
+// Recovery fetches exactly baseRef from the local bare cache — never the
+// network origin, never a wider refspec, no cache mutation — into FETCH_HEAD
+// only. Object transfer alone is sufficient because the caller checks out
+// baseCommit by SHA. If the local cache cannot serve the commit either, fail
+// loudly instead of falling back: a shallow cache's stale refs/heads/* head
+// must never be checked out in place of the resolved base commit.
+func ensureBaseCommitInCheckoutContext(ctx context.Context, barePath, checkoutPath, baseRef, baseCommit string) error {
+	if gitRefExistsContext(ctx, checkoutPath, baseCommit+"^{commit}") {
+		return nil
+	}
+	out, err := runGitCombinedOutputContext(ctx, "-C", checkoutPath, "fetch", "--no-tags", barePath, baseRef)
+	if err != nil {
+		return fmt.Errorf("isolated checkout is missing resolved base commit %s (shallow cache at %s): recovery fetch of %s failed: %s: %w",
+			baseCommit, barePath, baseRef, strings.TrimSpace(string(out)), err)
+	}
+	if !gitRefExistsContext(ctx, checkoutPath, baseCommit+"^{commit}") {
+		return fmt.Errorf("isolated checkout is still missing resolved base commit %s after recovery fetch of %s from cache %s; refusing to check out a stale commit instead",
+			baseCommit, baseRef, barePath)
+	}
+	return nil
 }
 
 func resolveCommit(repoPath, ref string) (string, error) {
