@@ -3170,6 +3170,50 @@ func TestClaimTask_AutoRetryOffersParentWorkdirForFreshSession(t *testing.T) {
 	}
 }
 
+func TestClaimTask_ChatAutoRetryOffersParentWorkdirForFreshSession(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	agentID, runtimeID, daemonID := createRuntimeGuardAgent(t, ctx)
+	sessionID := dbfx.ChatSession(t, agentID, testutil.Cols{
+		"title":      "chat auto-retry workdir reuse fixture",
+		"session_id": "chat-pointer-session",
+		"work_dir":   "/tmp/chat-pointer-workdir",
+		"runtime_id": runtimeID,
+	})
+	dbfx.Insert(t, "chat_message", testutil.Cols{
+		"chat_session_id": sessionID,
+		"role":            "user",
+		"content":         "retry this chat turn",
+	})
+	parentID := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":      runtimeID,
+		"chat_session_id": sessionID,
+		"status":          "failed",
+		"failure_reason":  "codex_semantic_inactivity",
+		"session_id":      "poison-chat-session",
+		"work_dir":        "/tmp/auto-retry-chat-parent-workdir",
+	})
+	child, err := db.New(testPool).CreateRetryTask(ctx, db.CreateRetryTaskParams{ID: parseUUID(parentID)})
+	if err != nil {
+		t.Fatalf("CreateRetryTask: %v", err)
+	}
+	if uuidToString(child.ChatSessionID) != sessionID || child.WorkDir.String != "/tmp/auto-retry-chat-parent-workdir" || child.SessionID.Valid || !child.ForceFreshSession {
+		t.Fatalf("fixture child violates the chat GH #7998 row contract: chat_session=%q workdir=%q session=%v force_fresh=%v",
+			uuidToString(child.ChatSessionID), child.WorkDir.String, child.SessionID, child.ForceFreshSession)
+	}
+
+	task := claimTaskForRuntimeGuard(t, runtimeID, daemonID)
+	if task.PriorWorkDir != "/tmp/auto-retry-chat-parent-workdir" {
+		t.Fatalf("PriorWorkDir = %q, want /tmp/auto-retry-chat-parent-workdir (inherited workdir must reach the daemon claim)", task.PriorWorkDir)
+	}
+	if task.PriorSessionID != "" {
+		t.Fatalf("PriorSessionID = %q, want empty (poisoned session is never resumed)", task.PriorSessionID)
+	}
+}
+
 func TestClaimTask_ChatPriorSessionRuntimeGuard(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

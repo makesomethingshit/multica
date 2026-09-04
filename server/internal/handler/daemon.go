@@ -2730,6 +2730,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			}
 		}
 		projectCtx.applyTo(&resp)
+		// Auto-retry children keep their filesystem even when the provider
+		// session must start fresh (codex_semantic_inactivity).
+		if task.RetryOfTaskID.Valid && task.ForceFreshSession && task.WorkDir.Valid {
+			resp.PriorWorkDir = task.WorkDir.String
+		}
 		if !task.ForceFreshSession && !task.ChannelContextRevision.Valid {
 			// Resume chat sessions only when the stored pointer was produced
 			// by the same runtime as the claiming task. When the chat_session
