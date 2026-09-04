@@ -50,6 +50,8 @@ export function agentListOptions(wsId: string) {
     queryKey: workspaceKeys.agents(wsId),
     queryFn: () =>
       api.listAgents({ workspace_id: wsId, include_archived: true }),
+    // Projected unstable can age offline without an event; polling online also
+    // covers a missed demotion. Offline recovery is event/reconnect-driven.
     refetchInterval: (query) =>
       query.state.data?.some(
         (agent) =>

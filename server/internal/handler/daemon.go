@@ -1307,7 +1307,7 @@ func (h *Handler) recordHeartbeatState(
 		}
 		return nil
 	}
-	if err := h.HeartbeatScheduler.Schedule(ctx, runtimeUUID); err != nil {
+	if err := h.HeartbeatScheduler.Schedule(ctx, runtimeUUID, state.WorkspaceID); err != nil {
 		return err
 	}
 	if markDBWriteScheduled != nil {

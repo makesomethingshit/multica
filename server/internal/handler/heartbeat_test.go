@@ -71,7 +71,7 @@ type recordingHeartbeatScheduler struct {
 	err error
 }
 
-func (s *recordingHeartbeatScheduler) Schedule(_ context.Context, id pgtype.UUID) error {
+func (s *recordingHeartbeatScheduler) Schedule(_ context.Context, id, _ pgtype.UUID) error {
 	s.ids = append(s.ids, id)
 	return s.err
 }
@@ -366,26 +366,23 @@ func TestRecordHeartbeat_RecoveryPublishesOnce(t *testing.T) {
 	}
 }
 
-// TestNotifyRuntimeRecovered_RespectsCancellation pins the shutdown contract:
-// the workspace lookup must not escape the bounded drain/request context.
-func TestNotifyRuntimeRecovered_RespectsCancellation(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("database not available")
-	}
-	runtimeID := createRuntimeLocalSkillTestRuntime(t, testUserID)
-	h := *testHandler
-	h.Bus = events.New()
+// TestNotifyRuntimeRecovered_PublishesKnownWorkspaceWithoutLookup pins the
+// no-query contract: a handler with no Queries can still publish the refresh.
+func TestNotifyRuntimeRecovered_PublishesKnownWorkspaceWithoutLookup(t *testing.T) {
+	const workspaceID = "11111111-1111-1111-1111-111111111111"
+	h := Handler{Bus: events.New()}
 	var refreshes []events.Event
 	h.Bus.Subscribe(protocol.EventDaemonRegister, func(event events.Event) {
 		refreshes = append(refreshes, event)
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	h.NotifyRuntimeRecovered(ctx, runtimeID)
+	h.NotifyRuntimeRecovered(context.Background(), workspaceID)
 
-	if len(refreshes) != 0 {
-		t.Fatalf("cancelled recovery lookup published %d refreshes, want 0", len(refreshes))
+	if len(refreshes) != 1 {
+		t.Fatalf("recovery refreshes = %d, want 1", len(refreshes))
+	}
+	if refreshes[0].WorkspaceID != workspaceID {
+		t.Fatalf("refresh workspace_id = %q, want %q", refreshes[0].WorkspaceID, workspaceID)
 	}
 }
 

@@ -32,13 +32,14 @@ import (
 type HeartbeatScheduler interface {
 	// Schedule is called from the heartbeat hot path after the per-row flush
 	// window check has decided a DB write is warranted. Runtime ownership and
-	// status live in the connection lease, so only the ID enters this layer.
+	// status live in the connection lease. The workspace ID accompanies the
+	// runtime ID so a rare passthrough recovery can publish without another read.
 	//
 	// When a Schedule/flush path itself flips an offline row back online
 	// (sweeper-race fallback, batch-receipt reconciliation), it reports the
 	// recovery through RecoveryNotifier so the workspace-scoped daemon:register
 	// refresh fires exactly once per actual offline → online transition.
-	Schedule(ctx context.Context, runtimeID pgtype.UUID) error
+	Schedule(ctx context.Context, runtimeID, workspaceID pgtype.UUID) error
 }
 
 // PassthroughHeartbeatScheduler is the synchronous scheduler used as the
@@ -54,7 +55,7 @@ func NewPassthroughHeartbeatScheduler(queries *db.Queries) *PassthroughHeartbeat
 	return &PassthroughHeartbeatScheduler{queries: queries}
 }
 
-func (p *PassthroughHeartbeatScheduler) Schedule(ctx context.Context, runtimeID pgtype.UUID) error {
+func (p *PassthroughHeartbeatScheduler) Schedule(ctx context.Context, runtimeID, workspaceID pgtype.UUID) error {
 	rows, err := p.queries.TouchAgentRuntimeLastSeen(ctx, runtimeID)
 	if err != nil {
 		return err
@@ -72,16 +73,16 @@ func (p *PassthroughHeartbeatScheduler) Schedule(ctx context.Context, runtimeID 
 		return err
 	}
 	if flipped > 0 {
-		p.notifyRuntimeRecovered(ctx, runtimeID)
+		p.notifyRuntimeRecovered(ctx, workspaceID)
 		return nil
 	}
 	_, err = p.queries.MarkAgentRuntimeOnline(ctx, runtimeID)
 	return err
 }
 
-func (p *PassthroughHeartbeatScheduler) notifyRuntimeRecovered(ctx context.Context, id pgtype.UUID) {
-	if p.RecoveryNotifier != nil {
-		p.RecoveryNotifier.NotifyRuntimeRecovered(ctx, uuidToString(id))
+func (p *PassthroughHeartbeatScheduler) notifyRuntimeRecovered(ctx context.Context, workspaceID pgtype.UUID) {
+	if p.RecoveryNotifier != nil && workspaceID.Valid {
+		p.RecoveryNotifier.NotifyRuntimeRecovered(ctx, uuidToString(workspaceID))
 	}
 }
 
@@ -144,7 +145,7 @@ func NewBatchedHeartbeatScheduler(queries *db.Queries, tickInterval time.Duratio
 	}
 }
 
-func (b *BatchedHeartbeatScheduler) Schedule(_ context.Context, runtimeID pgtype.UUID) error {
+func (b *BatchedHeartbeatScheduler) Schedule(_ context.Context, runtimeID, _ pgtype.UUID) error {
 	b.mu.Lock()
 	b.pending[runtimeID] = struct{}{}
 	b.mu.Unlock()
@@ -279,7 +280,7 @@ func (b *BatchedHeartbeatScheduler) flushOnce(ctx context.Context) {
 			continue
 		}
 		recovered++
-		b.notifyRuntimeRecovered(ctx, state.ID)
+		b.notifyRuntimeRecovered(ctx, state.WorkspaceID)
 	}
 
 	for _, id := range omitted {
@@ -316,8 +317,8 @@ func (b *BatchedHeartbeatScheduler) notifyRuntimeGone(id pgtype.UUID) {
 	}
 }
 
-func (b *BatchedHeartbeatScheduler) notifyRuntimeRecovered(ctx context.Context, id pgtype.UUID) {
-	if b.RecoveryNotifier != nil {
-		b.RecoveryNotifier.NotifyRuntimeRecovered(ctx, uuidToString(id))
+func (b *BatchedHeartbeatScheduler) notifyRuntimeRecovered(ctx context.Context, workspaceID pgtype.UUID) {
+	if b.RecoveryNotifier != nil && workspaceID.Valid {
+		b.RecoveryNotifier.NotifyRuntimeRecovered(ctx, uuidToString(workspaceID))
 	}
 }

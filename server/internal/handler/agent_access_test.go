@@ -45,6 +45,32 @@ func TestDeriveAgentRuntimeAvailability(t *testing.T) {
 	}
 }
 
+func TestLoadAgentRuntimeAvailability_PrivilegedViewerSkipsRuntimeQuery(t *testing.T) {
+	h := &Handler{}
+	agents := []db.Agent{{
+		RuntimeID: util.MustParseUUID("11111111-1111-1111-1111-111111111111"),
+	}}
+
+	for _, role := range []string{"owner", "admin"} {
+		t.Run(role, func(t *testing.T) {
+			got, err := h.loadAgentRuntimeAvailability(
+				context.Background(),
+				agents,
+				"22222222-2222-2222-2222-222222222222",
+				"33333333-3333-3333-3333-333333333333",
+				role,
+				time.Now(),
+			)
+			if err != nil {
+				t.Fatalf("loadAgentRuntimeAvailability: %v", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("availability = %v, want empty for %s", got, role)
+			}
+		})
+	}
+}
+
 // TestMemberAllowedToViewAgent_Pure exercises the pure predicate that drives
 // the private-agent VIEW gate. For a private agent it must allow:
 //   - workspace owner / admin (regardless of agent ownership)

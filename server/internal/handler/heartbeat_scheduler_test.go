@@ -35,7 +35,7 @@ func TestBatchedHeartbeatScheduler_CoalescesAndFlushes(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		go func() {
 			defer wg.Done()
-			if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+			if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 				t.Errorf("Schedule: %v", err)
 			}
 		}()
@@ -80,7 +80,7 @@ func TestBatchedHeartbeatScheduler_ExplicitDeregisterReceiptStaysOffline(t *test
 	recoveries := &recordingRecoveryNotifier{}
 	sched := NewBatchedHeartbeatScheduler(testHandler.Queries, 0, nil)
 	sched.RecoveryNotifier = recoveries
-	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
 	reason := []byte(`{"code":"provider_removed"}`)
@@ -112,8 +112,8 @@ func TestBatchedHeartbeatScheduler_ExplicitDeregisterReceiptStaysOffline(t *test
 		t.Fatalf("preserved offline runtime remained pending: %d", got)
 	}
 	// A preserved explicit deregistration is not a recovery: no refresh event.
-	if len(recoveries.runtimeIDs) != 0 {
-		t.Fatalf("preserved offline runtime published recovery events: %v", recoveries.runtimeIDs)
+	if len(recoveries.workspaceIDs) != 0 {
+		t.Fatalf("preserved offline runtime published recovery events: %v", recoveries.workspaceIDs)
 	}
 }
 
@@ -137,7 +137,7 @@ func TestBatchedHeartbeatScheduler_StopDrains(t *testing.T) {
 	defer cancel()
 	go sched.Run(ctx)
 
-	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
 	if got := sched.PendingCount(); got != 1 {
@@ -185,7 +185,7 @@ func TestBatchedHeartbeatScheduler_StopFlushesLateSchedule(t *testing.T) {
 
 	// Now Schedule a late heartbeat. Run is gone; only Stop's defensive
 	// flush can persist this.
-	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
 	if got := sched.PendingCount(); got != 1 {
@@ -203,9 +203,9 @@ func TestBatchedHeartbeatScheduler_StopFlushesLateSchedule(t *testing.T) {
 	}
 }
 
-// TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContext verifies that
-// the recovery notification stays inside Stop's ten-second drain budget.
-func TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContext(t *testing.T) {
+// TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContextAndKnownWorkspace
+// verifies that the Stop drain keeps its deadline and avoids another lookup.
+func TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContextAndKnownWorkspace(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -217,7 +217,7 @@ func TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContext(t *testing.T) 
 	sched := NewBatchedHeartbeatScheduler(testHandler.Queries, time.Hour, nil)
 	sched.RecoveryNotifier = recoveries
 	go sched.Run(context.Background())
-	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
 	rows, err := testHandler.Queries.MarkRuntimesOfflineByIDs(context.Background(), db.MarkRuntimesOfflineByIDsParams{
@@ -233,8 +233,8 @@ func TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContext(t *testing.T) 
 
 	sched.Stop()
 
-	if len(recoveries.contexts) != 1 {
-		t.Fatalf("recovery contexts = %d, want 1", len(recoveries.contexts))
+	if len(recoveries.workspaceIDs) != 1 || recoveries.workspaceIDs[0] != testWorkspaceID {
+		t.Fatalf("recovery workspaces = %v, want [%s]", recoveries.workspaceIDs, testWorkspaceID)
 	}
 	deadline, ok := recoveries.contexts[0].Deadline()
 	if !ok {
@@ -263,14 +263,14 @@ func TestBatchedHeartbeatScheduler_FlushIgnoresEmpty(t *testing.T) {
 // sweeper flips a row offline between Schedule and FlushNow, receipt
 // reconciliation restores it without a new heartbeat lookup.
 // recordingRecoveryNotifier captures RuntimeRecoveryNotifier calls so tests
-// can assert a lifecycle refresh fires exactly once per actual recovery.
+// can assert a lifecycle refresh fires for the already-known workspace.
 type recordingRecoveryNotifier struct {
-	runtimeIDs []string
-	contexts   []context.Context
+	workspaceIDs []string
+	contexts     []context.Context
 }
 
-func (r *recordingRecoveryNotifier) NotifyRuntimeRecovered(ctx context.Context, runtimeID string) {
-	r.runtimeIDs = append(r.runtimeIDs, runtimeID)
+func (r *recordingRecoveryNotifier) NotifyRuntimeRecovered(ctx context.Context, workspaceID string) {
+	r.workspaceIDs = append(r.workspaceIDs, workspaceID)
 	r.contexts = append(r.contexts, ctx)
 }
 
@@ -285,7 +285,7 @@ func TestBatchedHeartbeatScheduler_RaceToOfflineSelfHeals(t *testing.T) {
 	recoveries := &recordingRecoveryNotifier{}
 	sched := NewBatchedHeartbeatScheduler(testHandler.Queries, 0, nil)
 	sched.RecoveryNotifier = recoveries
-	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
 
@@ -313,8 +313,8 @@ func TestBatchedHeartbeatScheduler_RaceToOfflineSelfHeals(t *testing.T) {
 	}
 	// The reconciled flip is a real offline → online recovery: one lifecycle
 	// refresh, no more.
-	if len(recoveries.runtimeIDs) != 1 || recoveries.runtimeIDs[0] != runtimeID {
-		t.Fatalf("recovery notifications = %v, want [%s]", recoveries.runtimeIDs, runtimeID)
+	if len(recoveries.workspaceIDs) != 1 || recoveries.workspaceIDs[0] != testWorkspaceID {
+		t.Fatalf("recovery workspaces = %v, want [%s]", recoveries.workspaceIDs, testWorkspaceID)
 	}
 	if got := recoveries.contexts[0].Value(recoveryContextKey{}); got != "batch" {
 		t.Fatalf("recovery context value = %v, want batch", got)
@@ -329,7 +329,7 @@ func TestBatchedHeartbeatScheduler_DeletedReceiptInvalidatesRuntime(t *testing.T
 	rt := loadRuntime(t, runtimeID)
 	notifier := &recordingRuntimeGoneNotifier{}
 	sched := NewBatchedHeartbeatScheduler(testHandler.Queries, 0, notifier)
-	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
 	if _, err := testPool.Exec(context.Background(), `DELETE FROM agent_runtime WHERE id = $1`, runtimeID); err != nil {
@@ -363,12 +363,12 @@ func TestPassthroughHeartbeatScheduler_TouchAndRaceRecovery(t *testing.T) {
 	sched := NewPassthroughHeartbeatScheduler(testHandler.Queries)
 	sched.RecoveryNotifier = recoveries
 
-	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+	if err := sched.Schedule(context.Background(), rt.ID, rt.WorkspaceID); err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
 	// Ordinary online bump: no recovery refresh.
-	if len(recoveries.runtimeIDs) != 0 {
-		t.Fatalf("online heartbeat published recovery events: %v", recoveries.runtimeIDs)
+	if len(recoveries.workspaceIDs) != 0 {
+		t.Fatalf("online heartbeat published recovery events: %v", recoveries.workspaceIDs)
 	}
 	_, lastSeen, _ := readRuntimeRow(t, runtimeID)
 	if !lastSeen.After(stale.Add(time.Minute)) {
@@ -379,7 +379,7 @@ func TestPassthroughHeartbeatScheduler_TouchAndRaceRecovery(t *testing.T) {
 	rt2 := loadRuntime(t, runtimeID)
 	setRuntimeStatus(t, runtimeID, "offline")
 	scheduleCtx := context.WithValue(context.Background(), recoveryContextKey{}, "passthrough")
-	if err := sched.Schedule(scheduleCtx, rt2.ID); err != nil {
+	if err := sched.Schedule(scheduleCtx, rt2.ID, rt2.WorkspaceID); err != nil {
 		t.Fatalf("Schedule under race: %v", err)
 	}
 	status, _, _ := readRuntimeRow(t, runtimeID)
@@ -387,8 +387,8 @@ func TestPassthroughHeartbeatScheduler_TouchAndRaceRecovery(t *testing.T) {
 		t.Fatalf("expected race recovery via MarkAgentRuntimeOnline, got %q", status)
 	}
 	// The race flip is a real recovery: exactly one lifecycle refresh.
-	if len(recoveries.runtimeIDs) != 1 || recoveries.runtimeIDs[0] != runtimeID {
-		t.Fatalf("recovery notifications = %v, want [%s]", recoveries.runtimeIDs, runtimeID)
+	if len(recoveries.workspaceIDs) != 1 || recoveries.workspaceIDs[0] != testWorkspaceID {
+		t.Fatalf("recovery workspaces = %v, want [%s]", recoveries.workspaceIDs, testWorkspaceID)
 	}
 	if got := recoveries.contexts[0].Value(recoveryContextKey{}); got != "passthrough" {
 		t.Fatalf("recovery context value = %v, want passthrough", got)

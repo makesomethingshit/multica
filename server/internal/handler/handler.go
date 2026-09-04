@@ -182,11 +182,10 @@ type RuntimeGoneNotifier interface {
 
 // RuntimeRecoveryNotifier republishes the daemon:register lifecycle refresh
 // after a heartbeat actually flipped an offline runtime row back online
-// (sweeper-race fallback, batch-receipt reconciliation). It mirrors
-// RuntimeGoneNotifier so ID-only scheduler paths can emit the workspace-scoped
-// refresh without holding a full runtime row.
+// (sweeper-race fallback, batch-receipt reconciliation). Recovery paths already
+// know the workspace, so publishing never needs a follow-up database lookup.
 type RuntimeRecoveryNotifier interface {
-	NotifyRuntimeRecovered(ctx context.Context, runtimeID string)
+	NotifyRuntimeRecovered(ctx context.Context, workspaceID string)
 }
 
 type Handler struct {
@@ -758,24 +757,14 @@ func (h *Handler) NotifyRuntimeGone(runtimeID string) {
 	h.DaemonRuntimeGone.NotifyRuntimeGone(runtimeID)
 }
 
-// NotifyRuntimeRecovered republishes the daemon:register lifecycle event for
-// a runtime a heartbeat just restored from offline. Only the workspace-scoped
-// refresh is published (action "heartbeat_recovery"); no runtime details are
-// attached. It is exported so the heartbeat schedulers can report recoveries
-// from ID-only paths.
-func (h *Handler) NotifyRuntimeRecovered(ctx context.Context, runtimeID string) {
-	if h == nil || runtimeID == "" {
+// NotifyRuntimeRecovered republishes the workspace-scoped daemon:register
+// lifecycle event after a heartbeat restored a runtime from offline. Runtime
+// details are intentionally omitted from the payload.
+func (h *Handler) NotifyRuntimeRecovered(_ context.Context, workspaceID string) {
+	if h == nil || workspaceID == "" {
 		return
 	}
-	runtimeUUID, err := util.ParseUUID(runtimeID)
-	if err != nil {
-		return
-	}
-	rows, err := h.Queries.GetAgentRuntimeHeartbeatLeases(ctx, []pgtype.UUID{runtimeUUID})
-	if err != nil || len(rows) == 0 {
-		return
-	}
-	h.PublishRuntimeRefresh(uuidToString(rows[0].WorkspaceID), "system", "", "heartbeat_recovery")
+	h.PublishRuntimeRefresh(workspaceID, "system", "", "heartbeat_recovery")
 }
 
 // publishTask is publish() plus a TaskID hint so the realtime layer can route

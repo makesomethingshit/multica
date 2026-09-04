@@ -973,6 +973,12 @@ func computeTaskKind(t db.AgentTaskQueue) string {
 // copied onto an agent response. The existing runtime-list visibility contract
 // is mirrored so the bucket is only copied when the full row is hidden.
 func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.Agent, workspaceID, viewerID, viewerRole string, now time.Time) (map[string]string, error) {
+	// Owner/admin runtime lists already contain every row, so their normal
+	// client-side derivation is authoritative and no projection query is needed.
+	if roleAllowed(viewerRole, "owner", "admin") {
+		return map[string]string{}, nil
+	}
+
 	runtimeIDs := make([]pgtype.UUID, 0, len(agents))
 	for _, agent := range agents {
 		// Archived presence always resolves to "archived", so its runtime state
@@ -999,8 +1005,7 @@ func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.
 		// ListAgentRuntimes exposes every row to workspace owner/admin and only
 		// owner/public rows to regular members. Keep the coarse bridge for the
 		// rows that the viewer's runtime list cannot carry.
-		if roleAllowed(viewerRole, "owner", "admin") ||
-			runtime.Visibility == "public" ||
+		if runtime.Visibility == "public" ||
 			(runtime.OwnerID.Valid && uuidToString(runtime.OwnerID) == viewerID) {
 			continue
 		}
@@ -1011,18 +1016,7 @@ func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.
 
 func deriveAgentRuntimeAvailability(runtime db.AgentRuntime, now time.Time) string {
 	status := pgtype.Text{String: runtime.Status, Valid: runtime.Status != ""}
-	switch deriveSquadMemberStatus(false, status, runtime.LastSeenAt, false, now) {
-	case "idle":
-		return "online"
-	case "unstable":
-		return "unstable"
-	default:
-		return "offline"
-	}
-}
-
-func applyAgentRuntimeAvailability(resp *AgentResponse, availability string) {
-	resp.RuntimeAvailability = availability
+	return deriveRuntimeAvailability(status, runtime.LastSeenAt, now)
 }
 
 func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
@@ -1104,7 +1098,7 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		// Keep the archived guard here as well as in the loader so an active sibling
 		// cannot leak its projection onto an archived response.
 		if availability, ok := runtimeAvailabilityByID[resp.RuntimeID]; ok && !a.ArchivedAt.Valid {
-			applyAgentRuntimeAvailability(&resp, availability)
+			resp.RuntimeAvailability = availability
 		}
 		applyInvocationTargetsToResponse(&resp, targets)
 		if skills, ok := skillMap[resp.ID]; ok {
@@ -1166,7 +1160,7 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if availability, ok := runtimeAvailability[resp.RuntimeID]; ok {
-		applyAgentRuntimeAvailability(&resp, availability)
+		resp.RuntimeAvailability = availability
 	}
 	if !h.enrichAgentResponseWithTargetsHTTP(w, r, &resp, agent.ID) {
 		return

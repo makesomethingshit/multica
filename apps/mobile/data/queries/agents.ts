@@ -6,6 +6,8 @@ export const agentListOptions = (wsId: string | null) =>
     queryKey: ["agents", wsId] as const,
     queryFn: ({ signal }) => api.listAgents({ signal }),
     enabled: !!wsId,
+    // Mirrors Web/Desktop: projected unstable ages offline without an event,
+    // while offline recovery is covered by lifecycle events and reconnect.
     refetchInterval: (query) =>
       query.state.data?.some(
         (agent) =>
