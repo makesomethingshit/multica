@@ -186,7 +186,7 @@ type RuntimeGoneNotifier interface {
 // RuntimeGoneNotifier so ID-only scheduler paths can emit the workspace-scoped
 // refresh without holding a full runtime row.
 type RuntimeRecoveryNotifier interface {
-	NotifyRuntimeRecovered(runtimeID string)
+	NotifyRuntimeRecovered(ctx context.Context, runtimeID string)
 }
 
 type Handler struct {
@@ -763,7 +763,7 @@ func (h *Handler) NotifyRuntimeGone(runtimeID string) {
 // refresh is published (action "heartbeat_recovery"); no runtime details are
 // attached. It is exported so the heartbeat schedulers can report recoveries
 // from ID-only paths.
-func (h *Handler) NotifyRuntimeRecovered(runtimeID string) {
+func (h *Handler) NotifyRuntimeRecovered(ctx context.Context, runtimeID string) {
 	if h == nil || runtimeID == "" {
 		return
 	}
@@ -771,7 +771,7 @@ func (h *Handler) NotifyRuntimeRecovered(runtimeID string) {
 	if err != nil {
 		return
 	}
-	rows, err := h.Queries.GetAgentRuntimeHeartbeatLeases(context.Background(), []pgtype.UUID{runtimeUUID})
+	rows, err := h.Queries.GetAgentRuntimeHeartbeatLeases(ctx, []pgtype.UUID{runtimeUUID})
 	if err != nil || len(rows) == 0 {
 		return
 	}

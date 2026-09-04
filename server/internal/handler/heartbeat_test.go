@@ -366,6 +366,29 @@ func TestRecordHeartbeat_RecoveryPublishesOnce(t *testing.T) {
 	}
 }
 
+// TestNotifyRuntimeRecovered_RespectsCancellation pins the shutdown contract:
+// the workspace lookup must not escape the bounded drain/request context.
+func TestNotifyRuntimeRecovered_RespectsCancellation(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := createRuntimeLocalSkillTestRuntime(t, testUserID)
+	h := *testHandler
+	h.Bus = events.New()
+	var refreshes []events.Event
+	h.Bus.Subscribe(protocol.EventDaemonRegister, func(event events.Event) {
+		refreshes = append(refreshes, event)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.NotifyRuntimeRecovered(ctx, runtimeID)
+
+	if len(refreshes) != 0 {
+		t.Fatalf("cancelled recovery lookup published %d refreshes, want 0", len(refreshes))
+	}
+}
+
 // TestRecordHeartbeat_TouchErrorFallsBackToDB confirms graceful degradation:
 // if Redis Touch errors, the heartbeat still writes the DB so the sweeper's
 // DB-only fallback path observes a fresh last_seen_at.

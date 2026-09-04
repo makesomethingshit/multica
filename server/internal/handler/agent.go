@@ -65,8 +65,8 @@ type AgentResponse struct {
 	// timestamp, device, owner, configuration, or credential fields; clients
 	// use it only when the full runtime row is unavailable.
 	RuntimeAvailability string `json:"runtime_availability,omitempty"`
-	Name              string  `json:"name"`
-	Description       string  `json:"description"`
+	Name                string `json:"name"`
+	Description         string `json:"description"`
 	// Instructions is what this agent's owner wrote. For a system agent it
 	// holds only the workspace's own notes — the product half lives in
 	// SystemInstructions and is never stored on the row.
@@ -975,7 +975,9 @@ func computeTaskKind(t db.AgentTaskQueue) string {
 func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.Agent, workspaceID, viewerID, viewerRole string, now time.Time) (map[string]string, error) {
 	runtimeIDs := make([]pgtype.UUID, 0, len(agents))
 	for _, agent := range agents {
-		if agent.RuntimeID.Valid {
+		// Archived presence always resolves to "archived", so its runtime state
+		// is neither user-visible nor a reason for clients to keep polling.
+		if !agent.ArchivedAt.Valid && agent.RuntimeID.Valid {
 			runtimeIDs = append(runtimeIDs, agent.RuntimeID)
 		}
 	}
@@ -1098,7 +1100,10 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		resp := h.agentToResponse(a)
-		if availability, ok := runtimeAvailabilityByID[resp.RuntimeID]; ok {
+		// The map is keyed by runtime, and active + archived agents may share one.
+		// Keep the archived guard here as well as in the loader so an active sibling
+		// cannot leak its projection onto an archived response.
+		if availability, ok := runtimeAvailabilityByID[resp.RuntimeID]; ok && !a.ArchivedAt.Valid {
 			applyAgentRuntimeAvailability(&resp, availability)
 		}
 		applyInvocationTargetsToResponse(&resp, targets)

@@ -52,7 +52,9 @@ export function agentListOptions(wsId: string) {
       api.listAgents({ workspace_id: wsId, include_archived: true }),
     refetchInterval: (query) =>
       query.state.data?.some(
-        (agent) => agent.runtime_availability !== undefined,
+        (agent) =>
+          !agent.archived_at &&
+          agent.runtime_availability !== undefined,
       )
         ? 30_000
         : false,

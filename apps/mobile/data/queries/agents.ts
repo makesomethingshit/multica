@@ -8,7 +8,9 @@ export const agentListOptions = (wsId: string | null) =>
     enabled: !!wsId,
     refetchInterval: (query) =>
       query.state.data?.some(
-        (agent) => agent.runtime_availability !== undefined,
+        (agent) =>
+          !agent.archived_at &&
+          agent.runtime_availability !== undefined,
       )
         ? 30_000
         : false,

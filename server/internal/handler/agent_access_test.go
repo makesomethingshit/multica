@@ -299,6 +299,46 @@ func TestListAgents_SharedAgentCarriesPrivateRuntimeAvailability(t *testing.T) {
 	if detail.RuntimeAvailability != "online" {
 		t.Fatalf("GetAgent runtime_availability = %q, want online", detail.RuntimeAvailability)
 	}
+
+	// Archived agents short-circuit presence to "archived" and must not keep
+	// every client polling for a projection it will never consume. Keep an
+	// active sibling on the same runtime so this also catches accidentally
+	// applying a runtime-keyed projection to the archived response.
+	siblingID := dbfx.Agent(t, "active-shared-private-runtime-agent", runtimeID, testutil.Cols{
+		"visibility":      "workspace",
+		"permission_mode": "public_to",
+		"owner_id":        runtimeOwnerID,
+	})
+	dbfx.Insert(t, "agent_invocation_target", testutil.Cols{
+		"agent_id":    siblingID,
+		"target_type": "workspace",
+		"target_id":   testWorkspaceID,
+	})
+	dbfx.Exec(t, `UPDATE agent SET archived_at = now() WHERE id = $1`, agentID)
+
+	archivedList := testutil.Call(t, testHandler.ListAgents,
+		newRequestAs(memberID, "GET", "/api/agents?include_archived=true", nil)).Want(http.StatusOK)
+	var archivedWire []map[string]json.RawMessage
+	archivedList.JSON(&archivedWire)
+	foundArchived := false
+	foundActiveSibling := false
+	for _, item := range archivedWire {
+		switch string(item["id"]) {
+		case strconv.Quote(agentID):
+			foundArchived = true
+			if _, ok := item["runtime_availability"]; ok {
+				t.Fatal("archived agent should not carry runtime_availability")
+			}
+		case strconv.Quote(siblingID):
+			foundActiveSibling = true
+			if string(item["runtime_availability"]) != strconv.Quote("online") {
+				t.Fatalf("active sibling runtime_availability = %s, want online", item["runtime_availability"])
+			}
+		}
+	}
+	if !foundArchived || !foundActiveSibling {
+		t.Fatalf("include_archived list missing agents: archived=%t active_sibling=%t", foundArchived, foundActiveSibling)
+	}
 }
 
 func listContainsAgent(t *testing.T, body []byte, agentID string) bool {

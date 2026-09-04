@@ -72,15 +72,16 @@ func (p *PassthroughHeartbeatScheduler) Schedule(ctx context.Context, runtimeID 
 		return err
 	}
 	if flipped > 0 {
-		p.notifyRuntimeRecovered(runtimeID)
+		p.notifyRuntimeRecovered(ctx, runtimeID)
+		return nil
 	}
 	_, err = p.queries.MarkAgentRuntimeOnline(ctx, runtimeID)
 	return err
 }
 
-func (p *PassthroughHeartbeatScheduler) notifyRuntimeRecovered(id pgtype.UUID) {
+func (p *PassthroughHeartbeatScheduler) notifyRuntimeRecovered(ctx context.Context, id pgtype.UUID) {
 	if p.RecoveryNotifier != nil {
-		p.RecoveryNotifier.NotifyRuntimeRecovered(uuidToString(id))
+		p.RecoveryNotifier.NotifyRuntimeRecovered(ctx, uuidToString(id))
 	}
 }
 
@@ -278,7 +279,7 @@ func (b *BatchedHeartbeatScheduler) flushOnce(ctx context.Context) {
 			continue
 		}
 		recovered++
-		b.notifyRuntimeRecovered(state.ID)
+		b.notifyRuntimeRecovered(ctx, state.ID)
 	}
 
 	for _, id := range omitted {
@@ -315,8 +316,8 @@ func (b *BatchedHeartbeatScheduler) notifyRuntimeGone(id pgtype.UUID) {
 	}
 }
 
-func (b *BatchedHeartbeatScheduler) notifyRuntimeRecovered(id pgtype.UUID) {
+func (b *BatchedHeartbeatScheduler) notifyRuntimeRecovered(ctx context.Context, id pgtype.UUID) {
 	if b.RecoveryNotifier != nil {
-		b.RecoveryNotifier.NotifyRuntimeRecovered(uuidToString(id))
+		b.RecoveryNotifier.NotifyRuntimeRecovered(ctx, uuidToString(id))
 	}
 }

@@ -203,6 +203,48 @@ func TestBatchedHeartbeatScheduler_StopFlushesLateSchedule(t *testing.T) {
 	}
 }
 
+// TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContext verifies that
+// the recovery notification stays inside Stop's ten-second drain budget.
+func TestBatchedHeartbeatScheduler_StopRecoveryUsesBoundedContext(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	runtimeID := createRuntimeLocalSkillTestRuntime(t, testUserID)
+	setRuntimeLastSeenAt(t, runtimeID, time.Now().Add(-2*heartbeatReceiptRecoveryThreshold))
+	rt := loadRuntime(t, runtimeID)
+
+	recoveries := &recordingRecoveryNotifier{}
+	sched := NewBatchedHeartbeatScheduler(testHandler.Queries, time.Hour, nil)
+	sched.RecoveryNotifier = recoveries
+	go sched.Run(context.Background())
+	if err := sched.Schedule(context.Background(), rt.ID); err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+	rows, err := testHandler.Queries.MarkRuntimesOfflineByIDs(context.Background(), db.MarkRuntimesOfflineByIDsParams{
+		Ids:          []pgtype.UUID{rt.ID},
+		StaleSeconds: service.RuntimeClaimFreshnessSeconds,
+	})
+	if err != nil {
+		t.Fatalf("MarkRuntimesOfflineByIDs: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("sweeper rows = %d, want 1", len(rows))
+	}
+
+	sched.Stop()
+
+	if len(recoveries.contexts) != 1 {
+		t.Fatalf("recovery contexts = %d, want 1", len(recoveries.contexts))
+	}
+	deadline, ok := recoveries.contexts[0].Deadline()
+	if !ok {
+		t.Fatal("Stop recovery context has no deadline")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > 10*time.Second {
+		t.Fatalf("Stop recovery deadline remaining = %s, want within (0s, 10s]", remaining)
+	}
+}
+
 // TestBatchedHeartbeatScheduler_FlushIgnoresEmpty exercises the empty-pending
 // fast path: a tick with nothing queued must not issue a DB call.
 func TestBatchedHeartbeatScheduler_FlushIgnoresEmpty(t *testing.T) {
@@ -224,10 +266,12 @@ func TestBatchedHeartbeatScheduler_FlushIgnoresEmpty(t *testing.T) {
 // can assert a lifecycle refresh fires exactly once per actual recovery.
 type recordingRecoveryNotifier struct {
 	runtimeIDs []string
+	contexts   []context.Context
 }
 
-func (r *recordingRecoveryNotifier) NotifyRuntimeRecovered(runtimeID string) {
+func (r *recordingRecoveryNotifier) NotifyRuntimeRecovered(ctx context.Context, runtimeID string) {
 	r.runtimeIDs = append(r.runtimeIDs, runtimeID)
+	r.contexts = append(r.contexts, ctx)
 }
 
 func TestBatchedHeartbeatScheduler_RaceToOfflineSelfHeals(t *testing.T) {
@@ -258,7 +302,8 @@ func TestBatchedHeartbeatScheduler_RaceToOfflineSelfHeals(t *testing.T) {
 		t.Fatalf("sweeper rows = %d, want 1", len(rows))
 	}
 
-	sched.FlushNow(context.Background())
+	flushCtx := context.WithValue(context.Background(), recoveryContextKey{}, "batch")
+	sched.FlushNow(flushCtx)
 
 	// The bulk UPDATE omits the offline row, and receipt reconciliation flips
 	// it back online without waiting for another heartbeat.
@@ -270,6 +315,9 @@ func TestBatchedHeartbeatScheduler_RaceToOfflineSelfHeals(t *testing.T) {
 	// refresh, no more.
 	if len(recoveries.runtimeIDs) != 1 || recoveries.runtimeIDs[0] != runtimeID {
 		t.Fatalf("recovery notifications = %v, want [%s]", recoveries.runtimeIDs, runtimeID)
+	}
+	if got := recoveries.contexts[0].Value(recoveryContextKey{}); got != "batch" {
+		t.Fatalf("recovery context value = %v, want batch", got)
 	}
 }
 
@@ -330,7 +378,8 @@ func TestPassthroughHeartbeatScheduler_TouchAndRaceRecovery(t *testing.T) {
 	// Race: snapshot still says online but DB is now offline.
 	rt2 := loadRuntime(t, runtimeID)
 	setRuntimeStatus(t, runtimeID, "offline")
-	if err := sched.Schedule(context.Background(), rt2.ID); err != nil {
+	scheduleCtx := context.WithValue(context.Background(), recoveryContextKey{}, "passthrough")
+	if err := sched.Schedule(scheduleCtx, rt2.ID); err != nil {
 		t.Fatalf("Schedule under race: %v", err)
 	}
 	status, _, _ := readRuntimeRow(t, runtimeID)
@@ -341,7 +390,12 @@ func TestPassthroughHeartbeatScheduler_TouchAndRaceRecovery(t *testing.T) {
 	if len(recoveries.runtimeIDs) != 1 || recoveries.runtimeIDs[0] != runtimeID {
 		t.Fatalf("recovery notifications = %v, want [%s]", recoveries.runtimeIDs, runtimeID)
 	}
+	if got := recoveries.contexts[0].Value(recoveryContextKey{}); got != "passthrough" {
+		t.Fatalf("recovery context value = %v, want passthrough", got)
+	}
 }
+
+type recoveryContextKey struct{}
 
 // silenceUnusedPgUUID ensures the package compiles even if no other test
 // happens to reference pgtype after future edits trim imports.

@@ -54,6 +54,14 @@ describe("agentListOptions", () => {
     expect(
       queryState([{ runtime_availability: undefined } as Agent]),
     ).toBe(false);
+    expect(
+      queryState([
+        {
+          archived_at: "2026-09-04T00:00:00Z",
+          runtime_availability: "online",
+        } as Agent,
+      ]),
+    ).toBe(false);
     expect(queryState([])).toBe(false);
   });
 });
