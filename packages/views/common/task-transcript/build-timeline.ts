@@ -11,7 +11,9 @@ export interface TimelineItem {
   output?: string;
   created_at?: string;
   /** Provider-reported tool-call duration in ms, when the runtime measured
-   *  it. Absent/0 = unknown; consumers fall back to created_at differences. */
+   *  it. Absent = unknown — consumers fall back to created_at differences.
+   *  An explicit 0 on the wire is deliberate (the daemon omits the field
+   *  when it doesn't know) and wins like any other number. */
   duration_ms?: number;
 }
 
