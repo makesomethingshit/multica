@@ -556,13 +556,30 @@ func (b *opencodeBackend) handleToolUseEvent(event opencodeEvent, ch chan<- Mess
 		if state.Status == "error" && state.Error != "" {
 			outputStr = state.Error
 		}
+		var durationMs int64
+		if state.Time != nil {
+			durationMs = opencodeDurationMs(state.Time.Start, state.Time.End)
+		}
 		trySend(ch, Message{
-			Type:   MessageToolResult,
-			Tool:   event.Part.Tool,
-			CallID: event.Part.CallID,
-			Output: outputStr,
+			Type:       MessageToolResult,
+			Tool:       event.Part.Tool,
+			CallID:     event.Part.CallID,
+			Output:     outputStr,
+			DurationMs: durationMs,
 		})
 	}
+}
+
+// opencodeDurationMs converts OpenCode's reported tool timing (epoch
+// milliseconds for part.state.time.start/end) into a duration. Zero means
+// unknown: any malformed window — missing, non-positive, or end before start
+// — falls back to 0 rather than producing a nonsense duration or failing the
+// run. end >= start with both positive cannot under/overflow int64.
+func opencodeDurationMs(start, end int64) int64 {
+	if start <= 0 || end <= 0 || end < start {
+		return 0
+	}
+	return end - start
 }
 
 // handleErrorEvent processes "error" events from opencode. OpenCode can exit
@@ -721,12 +738,21 @@ type opencodeCacheTokens struct {
 	Write int64 `json:"write"`
 }
 
+// opencodeToolTime carries the wall-clock window OpenCode reports for a tool
+// execution: epoch milliseconds for when the call started and ended. Present
+// on terminal states (completed / error) in OpenCode's stream.
+type opencodeToolTime struct {
+	Start int64 `json:"start,omitempty"`
+	End   int64 `json:"end,omitempty"`
+}
+
 // opencodeToolState represents the state of a tool invocation.
 type opencodeToolState struct {
-	Status string          `json:"status,omitempty"`
-	Input  json.RawMessage `json:"input,omitempty"`
-	Output any             `json:"output,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	Status string            `json:"status,omitempty"`
+	Input  json.RawMessage   `json:"input,omitempty"`
+	Output any               `json:"output,omitempty"`
+	Error  string            `json:"error,omitempty"`
+	Time   *opencodeToolTime `json:"time,omitempty"`
 }
 
 // opencodeError represents an error event from opencode.

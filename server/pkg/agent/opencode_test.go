@@ -220,6 +220,76 @@ func TestOpencodeHandleToolUseEventNilState(t *testing.T) {
 	}
 }
 
+// ── Tool duration tests (multica-ai/multica#8025) ──
+
+// toolResultFrom parses a real `opencode run --format json` tool_use line and
+// returns the paired tool_result message the backend emits for it.
+func toolResultFrom(t *testing.T, line string) Message {
+	t.Helper()
+	b := &opencodeBackend{}
+	ch := make(chan Message, 10)
+	var event opencodeEvent
+	if err := json.Unmarshal([]byte(line), &event); err != nil {
+		t.Fatalf("unmarshal event: %v", err)
+	}
+	b.handleToolUseEvent(event, ch)
+	for {
+		msg, ok := <-ch
+		if !ok {
+			t.Fatal("no tool_result message emitted")
+		}
+		if msg.Type == MessageToolResult {
+			return msg
+		}
+	}
+}
+
+func TestOpencodeToolDurationCompleted(t *testing.T) {
+	t.Parallel()
+
+	// Real terminal tool event shape: completed with a measured window.
+	msg := toolResultFrom(t, `{"type":"tool_use","timestamp":1002,"sessionID":"ses_dur","part":{"tool":"bash","callID":"call_dur","state":{"status":"completed","input":{"command":"go test"},"output":"ok","time":{"start":100000,"end":112345}}}}`)
+	if msg.DurationMs != 12345 {
+		t.Errorf("duration: got %d, want 12345", msg.DurationMs)
+	}
+}
+
+func TestOpencodeToolDurationMissingTime(t *testing.T) {
+	t.Parallel()
+
+	// No time block at all — the duration stays 0 (unknown), the run is
+	// unaffected, and the result is still emitted.
+	msg := toolResultFrom(t, `{"type":"tool_use","timestamp":1002,"sessionID":"ses_dur","part":{"tool":"bash","callID":"call_dur","state":{"status":"completed","input":{"command":"go test"},"output":"ok"}}}`)
+	if msg.DurationMs != 0 {
+		t.Errorf("duration: got %d, want 0", msg.DurationMs)
+	}
+}
+
+func TestOpencodeToolDurationEndBeforeStart(t *testing.T) {
+	t.Parallel()
+
+	// end < start is a malformed window — fall back to 0 (unknown), not a
+	// negative or nonsense duration.
+	msg := toolResultFrom(t, `{"type":"tool_use","timestamp":1002,"sessionID":"ses_dur","part":{"tool":"bash","callID":"call_dur","state":{"status":"completed","input":{"command":"go test"},"output":"ok","time":{"start":112345,"end":100000}}}}`)
+	if msg.DurationMs != 0 {
+		t.Errorf("duration: got %d, want 0", msg.DurationMs)
+	}
+}
+
+func TestOpencodeToolDurationErrorStatePreserved(t *testing.T) {
+	t.Parallel()
+
+	// A recovered tool error still carries the real execution window: the
+	// duration must be preserved alongside the error output.
+	msg := toolResultFrom(t, `{"type":"tool_use","timestamp":1002,"sessionID":"ses_dur","part":{"tool":"bash","callID":"call_dur","state":{"status":"error","input":{"command":"exit 1"},"error":"command failed","time":{"start":100000,"end":112345}}}}`)
+	if msg.DurationMs != 12345 {
+		t.Errorf("duration: got %d, want 12345", msg.DurationMs)
+	}
+	if msg.Output != "command failed" {
+		t.Errorf("output: got %q, want %q", msg.Output, "command failed")
+	}
+}
+
 // ── Error event tests ──
 
 func TestOpencodeHandleErrorEvent(t *testing.T) {

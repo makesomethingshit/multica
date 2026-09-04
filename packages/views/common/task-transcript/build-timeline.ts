@@ -10,6 +10,9 @@ export interface TimelineItem {
   input?: Record<string, unknown>;
   output?: string;
   created_at?: string;
+  /** Provider-reported tool-call duration in ms, when the runtime measured
+   *  it. Absent/0 = unknown; consumers fall back to created_at differences. */
+  duration_ms?: number;
 }
 
 function canMergeStreamingText(prev: TimelineItem, next: TimelineItem): boolean {
@@ -61,6 +64,7 @@ export function buildTimeline(msgs: TaskMessagePayload[]): TimelineItem[] {
       input: msg.input,
       output: msg.output,
       created_at: msg.created_at,
+      duration_ms: msg.duration_ms,
     });
   }
   return redactTimelineItems(coalesceTimelineItems(items));

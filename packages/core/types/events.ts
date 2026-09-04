@@ -295,6 +295,11 @@ export interface TaskMessagePayload {
   input?: Record<string, unknown>;
   output?: string;
   created_at?: string;
+  /** Provider-reported wall-clock duration of a tool call, in ms. Present
+   *  only when the runtime measured the call itself (e.g. OpenCode's
+   *  part.state.time); absent means the consumer falls back to the
+   *  created_at difference. 0 is treated as unknown, like absence. */
+  duration_ms?: number;
 }
 
 export interface TaskQueuedPayload {

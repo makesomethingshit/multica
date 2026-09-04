@@ -1,6 +1,8 @@
 -- name: CreateTaskMessage :one
-INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+-- duration_ms carries the provider-reported tool-call duration (NULL = not
+-- reported). Nullable BIGINT param: pass a zero Int8 for "no duration".
+INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, duration_ms)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING *;
 
 -- name: CreateTaskMessages :many
@@ -56,9 +58,10 @@ WITH incoming AS (
         unnest(sqlc.arg('tools')::text[]) AS tool,
         unnest(sqlc.arg('contents')::text[]) AS content,
         unnest(sqlc.arg('inputs')::text[]) AS input,
-        unnest(sqlc.arg('outputs')::text[]) AS output
+        unnest(sqlc.arg('outputs')::text[]) AS output,
+        unnest(sqlc.arg('duration_mss')::bigint[]) AS duration_ms
 ), inserted AS (
-    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output)
+    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, duration_ms)
     SELECT
         m.id,
         sqlc.arg('task_id')::uuid,
@@ -67,7 +70,10 @@ WITH incoming AS (
         NULLIF(m.tool, ''),
         NULLIF(m.content, ''),
         NULLIF(m.input, '')::jsonb,
-        NULLIF(m.output, '')
+        NULLIF(m.output, ''),
+        -- 0 = not reported (NULL); a negative value is malformed rather than
+        -- a duration, so it is clamped to unknown instead of stored.
+        NULLIF(GREATEST(m.duration_ms, 0), 0)
     FROM incoming AS m
     RETURNING *
 )
