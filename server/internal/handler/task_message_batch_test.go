@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/middleware"
@@ -111,6 +112,53 @@ func TestReportTaskMessagesPersistsWholeBatch(t *testing.T) {
 	}
 	if stored[2].Type != "text" || stored[2].Content.String != "done" {
 		t.Fatalf("text row = %+v, want type=text content=done", stored[2])
+	}
+}
+
+// TestCreateTaskMessageClampsSingleRowDuration covers the single-row insert,
+// which no handler currently drives with a duration but any direct caller can:
+// outside the handler path a pgtype.Int8 can carry anything, so the query
+// itself has to clamp. Same contract as the batch insert — 0 stays NULL (not
+// reported) and a negative value is malformed rather than a measurement.
+func TestCreateTaskMessageClampsSingleRowDuration(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	taskID := util.MustParseUUID(seedBatchTask(t, "single-duration"))
+
+	for i, tc := range []struct {
+		name    string
+		param   pgtype.Int8
+		wantSet bool
+		want    int64
+	}{
+		{"measured duration is stored", pgtype.Int8{Valid: true, Int64: 4321}, true, 4321},
+		{"explicit zero stays NULL", pgtype.Int8{Valid: true}, false, 0},
+		{"negative stays NULL", pgtype.Int8{Valid: true, Int64: -7}, false, 0},
+		{"unset stays NULL", pgtype.Int8{}, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, err := uuid.NewV7()
+			if err != nil {
+				t.Fatalf("new v7: %v", err)
+			}
+			row, err := testHandler.Queries.CreateTaskMessage(ctx, db.CreateTaskMessageParams{
+				ID:         pgtype.UUID{Bytes: id, Valid: true},
+				TaskID:     taskID,
+				Seq:        int32(i + 1),
+				Type:       "tool_result",
+				Tool:       pgtype.Text{Valid: true, String: "bash"},
+				Output:     pgtype.Text{Valid: true, String: "ok"},
+				DurationMs: tc.param,
+			})
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if row.DurationMs.Valid != tc.wantSet || row.DurationMs.Int64 != tc.want {
+				t.Fatalf("duration_ms = %+v, want Valid=%v %d", row.DurationMs, tc.wantSet, tc.want)
+			}
+		})
 	}
 }
 

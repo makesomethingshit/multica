@@ -13,7 +13,7 @@ import (
 
 const createTaskMessage = `-- name: CreateTaskMessage :one
 INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, duration_ms)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF(GREATEST($9::bigint, 0), 0))
 RETURNING id, task_id, seq, type, tool, content, input, output, created_at, duration_ms
 `
 
@@ -31,6 +31,9 @@ type CreateTaskMessageParams struct {
 
 // duration_ms carries the provider-reported tool-call duration (NULL = not
 // reported). Nullable BIGINT param: pass a zero Int8 for "no duration".
+// Same clamp as the batch insert below: 0 stays NULL (not reported) and a
+// negative value is malformed rather than a duration, so neither ever
+// reaches the column as a number.
 func (q *Queries) CreateTaskMessage(ctx context.Context, arg CreateTaskMessageParams) (TaskMessage, error) {
 	row := q.db.QueryRow(ctx, createTaskMessage,
 		arg.ID,

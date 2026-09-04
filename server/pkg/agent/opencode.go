@@ -746,6 +746,36 @@ type opencodeToolTime struct {
 	End   int64 `json:"end,omitempty"`
 }
 
+// UnmarshalJSON absorbs malformed timing so a bad window can never fail the
+// enclosing event. Timing is best-effort metadata: a "time":"bad" string or
+// a start value outside int64 must leave the tool_use/result intact (a
+// dropped event would surface as an empty step and flip the run to failed),
+// with the window simply staying unknown.
+func (t *opencodeToolTime) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil // not even an object, e.g. "time":"bad" — keep unknown
+	}
+	t.Start = opencodeTimeMs(fields["start"])
+	t.End = opencodeTimeMs(fields["end"])
+	return nil
+}
+
+// opencodeTimeMs decodes a single epoch-milliseconds field. Anything that is
+// not a plain positive in-range integer — strings, fractions, overflow,
+// non-positive values — decodes to 0 = unknown.
+func opencodeTimeMs(raw json.RawMessage) int64 {
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0
+	}
+	v, err := n.Int64()
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
+}
+
 // opencodeToolState represents the state of a tool invocation.
 type opencodeToolState struct {
 	Status string            `json:"status,omitempty"`

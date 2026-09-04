@@ -157,6 +157,39 @@ describe("buildSteps", () => {
 
     expect(steps[0]!.durationMs).toBe(5000);
   });
+
+  it("lets an explicit duration_ms of 0 beat the created_at difference", () => {
+    // 0 on the wire is a deliberate provider value (the daemon omits the
+    // field entirely when it doesn't know) — it wins like any other number.
+    const steps = buildSteps([
+      { seq: 1, type: "tool_use", tool: "Bash", created_at: at(0) },
+      { seq: 2, type: "tool_result", tool: "Bash", output: "ok", created_at: at(4), duration_ms: 0 },
+    ]) as TraceCallStep[];
+
+    expect(steps[0]!.durationMs).toBe(0);
+  });
+
+  it("keeps the transcript renderable when a provider duration is huge", () => {
+    // end - durationMs can land outside the Date range (±8.64e15 ms), where
+    // toISOString() throws a RangeError that would break the whole transcript
+    // view. The step must keep the number and its real timestamps instead.
+    const steps = buildSteps([
+      { seq: 1, type: "tool_use", tool: "Bash", created_at: at(0) },
+      {
+        seq: 2,
+        type: "tool_result",
+        tool: "Bash",
+        output: "ok",
+        created_at: at(4),
+        duration_ms: Number.MAX_VALUE,
+      },
+    ]) as TraceCallStep[];
+
+    const step = steps[0]!;
+    expect(step.durationMs).toBe(Number.MAX_VALUE);
+    expect(step.startedAt).toBe(at(0));
+    expect(step.endedAt).toBe(at(4));
+  });
 });
 
 describe("groupSteps", () => {
