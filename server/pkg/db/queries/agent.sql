@@ -782,26 +782,15 @@ WHERE id = (
             AND COALESCE(r.last_seen_at, r.updated_at) >=
                 now() - make_interval(secs => @runtime_stale_secs::double precision)
       )
-      -- Soft-order the first task of a quick-created issue behind its exact
-      -- origin task, but only inside a bounded window. The positive
-      -- active-status list (never a broad negative filter) keeps 'deferred' —
-      -- and any future task state — from becoming a permanent handoff
-      -- blocker, and the age bound (quick_create_handoff_wait_secs) prevents
-      -- an orphaned/stuck origin from blocking the issue forever: once the
-      -- candidate outlives the window it claims cold even while the origin
-      -- is still active.
-      AND (
-          atq.created_at <= now() - make_interval(secs => @quick_create_handoff_wait_secs::double precision)
-          OR NOT EXISTS (
-              SELECT 1
-              FROM issue handoff_issue
-              JOIN agent_task_queue origin ON origin.id = handoff_issue.origin_id
-              WHERE handoff_issue.id = atq.issue_id
-                AND handoff_issue.origin_type = 'quick_create'
-                AND origin.agent_id = atq.agent_id
-                AND origin.runtime_id = atq.runtime_id
-                AND origin.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
-          )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM issue handoff_issue
+          JOIN agent_task_queue origin ON origin.id = handoff_issue.origin_id
+          WHERE handoff_issue.id = atq.issue_id
+            AND handoff_issue.origin_type = 'quick_create'
+            AND origin.agent_id = atq.agent_id
+            AND origin.runtime_id = atq.runtime_id
+            AND origin.status NOT IN ('completed', 'failed', 'cancelled')
       )
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active

@@ -139,11 +139,10 @@ func TestRuntimeAccessGatesQueuedTaskClaims(t *testing.T) {
 			}
 
 			claimed, err := q.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-				AgentID:                    fixture.agentID,
-				RuntimeID:                  fixture.runtimeID,
-				PrepareLeaseSecs:           60,
-				RuntimeStaleSecs:           RuntimeClaimFreshnessSeconds,
-				QuickCreateHandoffWaitSecs: quickCreateHandoffWait.Seconds(),
+				AgentID:          fixture.agentID,
+				RuntimeID:        fixture.runtimeID,
+				PrepareLeaseSecs: 60,
+				RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
 			})
 			if !tt.wantClaim {
 				if !errors.Is(err, pgx.ErrNoRows) {

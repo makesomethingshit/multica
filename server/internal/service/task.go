@@ -193,13 +193,6 @@ const (
 	// stretching this global crash-recovery window.
 	claimResponseRecoveryWindow = 90 * time.Second
 	prepareLeaseDuration        = 45 * time.Second
-	// quickCreateHandoffWait bounds the soft ordering between a quick-create
-	// origin and the first task of the issue it creates. While the origin is
-	// active, the queued issue task is skipped and retried by the daemon's
-	// normal poll loop; after this window the issue task claims cold (no
-	// session or workdir inheritance from the still-active origin) — task
-	// liveness wins over session continuity.
-	quickCreateHandoffWait = 2 * time.Minute
 )
 
 func (s *TaskService) trackTaskForReclaim(task db.AgentTaskQueue, checkAfter time.Time) {
@@ -3507,11 +3500,10 @@ func (s *TaskService) claimTask(ctx context.Context, agentID, runtimeID pgtype.U
 		t0 = time.Now()
 		reclaimCheckAfter = t0.Add(claimResponseRecoveryWindow + ReclaimCheckHintSafetyMargin)
 		task, err := qtx.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
-			AgentID:                    agentID,
-			RuntimeID:                  claimRuntimeID,
-			PrepareLeaseSecs:           prepareLeaseDuration.Seconds(),
-			RuntimeStaleSecs:           RuntimeClaimFreshnessSeconds,
-			QuickCreateHandoffWaitSecs: quickCreateHandoffWait.Seconds(),
+			AgentID:          agentID,
+			RuntimeID:        claimRuntimeID,
+			PrepareLeaseSecs: prepareLeaseDuration.Seconds(),
+			RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
 		})
 		claimAgentMs = time.Since(t0).Milliseconds()
 		if err != nil {
