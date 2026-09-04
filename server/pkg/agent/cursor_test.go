@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildCursorArgs(t *testing.T) {
@@ -740,12 +743,13 @@ func TestParseCursorToolCall(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		event      string
-		wantName   string
-		wantCallID string
-		wantArg    string
-		wantResult string
+		name           string
+		event          string
+		wantName       string
+		wantCallID     string
+		wantArg        string
+		wantResult     string
+		wantBackground bool
 	}{
 		{
 			name: "started names the tool from the nested key",
@@ -765,6 +769,55 @@ func TestParseCursorToolCall(t *testing.T) {
 			wantCallID: "call-2",
 			wantArg:    "x",
 			wantResult: `{"success":{"exitCode":0}}`,
+		},
+		{
+			// Case A (GH #7833): Cursor confirmed it actually launched the
+			// shell in background mode. The completed result's isBackground
+			// field is the authoritative signal; the raw result is preserved.
+			name: "background shell result is authoritative",
+			event: `{"type":"tool_call","subtype":"completed",
+				"call_id":"call-bg",
+				"tool_call":{"shellToolCall":{"args":{"command":"vite"},"result":{"success":{"exitCode":0},"isBackground":true}}}}`,
+			wantName:       "shell",
+			wantCallID:     "call-bg",
+			wantResult:     `{"success":{"exitCode":0},"isBackground":true}`,
+			wantBackground: true,
+		},
+		{
+			// Case B: an explicit false stays foreground.
+			name: "explicit foreground result stays foreground",
+			event: `{"type":"tool_call","subtype":"completed",
+				"call_id":"call-fg",
+				"tool_call":{"shellToolCall":{"args":{"command":"ls"},"result":{"success":{"exitCode":0},"isBackground":false}}}}`,
+			wantName:       "shell",
+			wantCallID:     "call-fg",
+			wantResult:     `{"success":{"exitCode":0},"isBackground":false}`,
+			wantBackground: false,
+		},
+		{
+			// Case C: tool output that merely mentions the key must never be
+			// mistaken for the field itself — a strings.Contains implementation
+			// would fail this case.
+			name: "mentioned-in-stdout isBackground does not leak into detection",
+			event: `{"type":"tool_call","subtype":"completed",
+				"call_id":"call-fp",
+				"tool_call":{"shellToolCall":{"args":{"command":"echo"},"result":{"success":{"stdout":"example payload: {\"isBackground\":true}"},"isBackground":false}}}}`,
+			wantName:       "shell",
+			wantCallID:     "call-fp",
+			wantResult:     `{"success":{"stdout":"example payload: {\"isBackground\":true}"},"isBackground":false}`,
+			wantBackground: false,
+		},
+		{
+			// Case D: a result that is not a decodeable object must keep the
+			// rest of the tool parsing intact and stay foreground, without a panic.
+			name: "malformed result payload keeps parsing and stays foreground",
+			event: `{"type":"tool_call","subtype":"completed",
+				"call_id":"call-md",
+				"tool_call":{"shellToolCall":{"args":{"command":"echo"},"result":"plain-string"}}}`,
+			wantName:       "shell",
+			wantCallID:     "call-md",
+			wantResult:     `"plain-string"`,
+			wantBackground: false,
 		},
 		{
 			name: "call id falls back to the nested tool call id",
@@ -807,7 +860,76 @@ func TestParseCursorToolCall(t *testing.T) {
 			if call.Result != tt.wantResult {
 				t.Errorf("Result = %q, want %q", call.Result, tt.wantResult)
 			}
+			if call.Background != tt.wantBackground {
+				t.Errorf("Background = %v, want %v", call.Background, tt.wantBackground)
+			}
 		})
+	}
+}
+
+// TestCursorExecuteFailsPromptlyOnBackgroundShellWithoutTerminalResult is the
+// end-to-end regression for GH #7833: Cursor can report a successful
+// background shellToolCall ("isBackground": true on the completed result) and
+// then never emit a terminal result while the shell stays alive. The backend
+// must treat that signal as a hard guard — cancel the managed process through
+// the existing owned-process path and finalise as failed — instead of waiting
+// for a terminal result that never arrives (before the fix, the run only ended
+// at the exec timeout as "timeout" and misclassified the failure).
+func TestCursorExecuteFailsPromptlyOnBackgroundShellWithoutTerminalResult(t *testing.T) {
+	t.Parallel()
+
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	backend, err := New("cursor", Config{
+		ExecutablePath: self,
+		Env:            map[string]string{"CURSOR_FAKE_MODE": "background_shell_no_result"},
+		Logger:         slog.Default(),
+	})
+	if err != nil {
+		t.Fatalf("New(cursor): %v", err)
+	}
+
+	// The outer context and exec timeout only bound the test; the assertion is
+	// that the result arrives well before either of them fires.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	session, err := backend.Execute(ctx, "run a long-running server", ExecOptions{Timeout: 8 * time.Second})
+	if err != nil {
+		t.Fatalf("execute returned error: %v", err)
+	}
+	go func() {
+		for range session.Messages {
+		}
+	}()
+
+	select {
+	case result, ok := <-session.Result:
+		if !ok {
+			t.Fatal("result channel closed without a value")
+		}
+		if result.Status != "failed" {
+			t.Fatalf("expected status=failed, got %q (error=%q)", result.Status, result.Error)
+		}
+		if result.Status == "aborted" || result.Status == "timeout" {
+			t.Fatalf("background guard must not be misclassified as %q", result.Status)
+		}
+		for _, want := range []string{"background shell", "foreground execution"} {
+			if !strings.Contains(result.Error, want) {
+				t.Fatalf("expected error to contain %q, got %q", want, result.Error)
+			}
+		}
+		if result.Output != "" {
+			t.Fatalf("partial transcript must not surface as Result.Output, got %q", result.Output)
+		}
+		if result.SessionID != "sess-cursor-bg" {
+			t.Fatalf("expected session id sess-cursor-bg, got %q", result.SessionID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for result — cursor backend did not fail promptly on a background shell without a terminal result")
 	}
 }
 

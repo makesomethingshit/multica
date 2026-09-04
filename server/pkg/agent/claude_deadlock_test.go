@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -27,6 +28,15 @@ func TestMain(m *testing.M) {
 	if os.Getenv(opencodeStdinHelperEnv) == "1" {
 		runFakeOpencodeStdinHelper()
 		os.Exit(0)
+	}
+	switch mode := os.Getenv("CURSOR_FAKE_MODE"); mode {
+	case "":
+	case "background_shell_no_result":
+		runFakeCursorBackgroundShellNoResult()
+		os.Exit(0)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown CURSOR_FAKE_MODE: %q\n", mode)
+		os.Exit(2)
 	}
 	switch mode := os.Getenv("CLAUDE_FAKE_MODE"); mode {
 	case "":
@@ -153,6 +163,24 @@ func runFakeClaudeAsyncLaunchedToolResult() {
 	fmt.Println(`{"type":"system","session_id":"sess-async-launched"}`)
 	fmt.Println(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-async","content":{"status":"async_launched","message":"background task launched"}}]}}`)
 	fmt.Println(`{"type":"result","subtype":"success","is_error":false,"session_id":"sess-async-launched","result":"parent turn completed early"}`)
+}
+
+// runFakeCursorBackgroundShellNoResult reproduces the GH #7833 failure shape:
+// cursor-agent launches a shell in background mode (the completed shellToolCall
+// result carries "isBackground": true) and then never emits its terminal result
+// while the background process stays alive. Like the real CLI, the fake reads
+// the prompt to EOF, streams the init/started/completed events, and then blocks
+// without ever sending a result.
+func runFakeCursorBackgroundShellNoResult() {
+	if _, err := io.ReadAll(os.Stdin); err != nil {
+		fmt.Fprintf(os.Stderr, "read prompt: %v\n", err)
+		os.Exit(51)
+	}
+	fmt.Println(`{"type":"system","subtype":"init","session_id":"sess-cursor-bg"}`)
+	fmt.Println(`{"type":"tool_call","subtype":"started","call_id":"call-bg","tool_call":{"shellToolCall":{"args":{"command":"long-running-server"}},"toolCallId":"call-bg"}}`)
+	fmt.Println(`{"type":"tool_call","subtype":"completed","call_id":"call-bg","tool_call":{"shellToolCall":{"args":{"command":"long-running-server"},"result":{"success":{"exitCode":0},"isBackground":true}},"toolCallId":"call-bg"}}`)
+	// No terminal result: block until the managed process is torn down.
+	time.Sleep(2 * time.Minute)
 }
 
 // TestClaudeExecuteDoesNotDeadlockOnStartupStdoutBurst verifies that the

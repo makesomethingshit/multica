@@ -112,6 +112,12 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		invalidEventCount := 0
 		assistantEventCount := 0
 		toolUseCount := 0
+		// backgroundShellDetected latches the authoritative completed-shell
+		// "isBackground": true signal. Once set it outranks both a later
+		// terminal result and context cancellation at finalization: the run
+		// failed because Cursor launched a shell it cannot own in a managed
+		// run, regardless of anything the stream says afterwards.
+		backgroundShellDetected := false
 		// unhandledSubtypeCount tracks thinking/tool_call events whose subtype we
 		// don't recognize. They are ignored (never synthesized into a message)
 		// and surfaced once as a bounded, content-free diagnostic so an upstream
@@ -215,12 +221,26 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					})
 				case "completed":
 					call := parseCursorToolCall(&evt)
+
 					trySend(msgCh, Message{
 						Type:   MessageToolResult,
 						Tool:   call.Name,
 						CallID: call.CallID,
 						Output: call.Result,
 					})
+
+					// Guard only the observed protocol shape: a completed
+					// shellToolCall whose result itself reports isBackground
+					// true. Arguments (block_until_ms etc.), command strings,
+					// and other tool types are never inspected — args are
+					// request intent, this field is what Cursor actually did.
+					if call.Name == "shell" && call.Background && !backgroundShellDetected {
+						backgroundShellDetected = true
+						b.cfg.Logger.Warn("cursor-agent launched a background shell; cancelling managed run")
+						// Use the existing lifecycle ownership: context
+						// cancellation tears down the owned process group.
+						cancel()
+					}
 				default:
 					unhandledSubtypeCount++
 				}
@@ -339,7 +359,14 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// on a full pipe has returned by now; the writer sends exactly once.
 		writeErr := <-writeErrCh
 
-		if resultSeen {
+		// The background guard outranks everything: a terminal result that
+		// follows the background signal (or its absence — the usual case, the
+		// stream simply stops) does not change the verdict, and it must not be
+		// rewritten into the generic "aborted" that cancellation would produce.
+		if backgroundShellDetected {
+			finalStatus = "failed"
+			finalError = cursorBackgroundShellGuardError
+		} else if resultSeen {
 			// A parsed result is the protocol boundary. Ignore the cancellation and
 			// exit error caused by stopping a Cursor worker that lingers afterward.
 			if finalStatus == "failed" && finalError == "" {
@@ -452,6 +479,12 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 }
 
 const cursorIncompleteFinalizationWarning = "actions completed before finalization may already have taken effect"
+
+// cursorBackgroundShellGuardError is the content-free failure reason for a
+// managed Cursor run in which Cursor itself confirmed (shellToolCall result
+// "isBackground": true) that it launched a shell in background mode. It must
+// stay free of the command, its output, paths, or any provider payload.
+const cursorBackgroundShellGuardError = "cursor-agent launched a background shell; Multica-managed runs require foreground execution"
 
 func cursorFailureDiagnostic(message string, exitErr, scanErr error, eventCount, invalidEventCount int, lastEventType string) string {
 	return fmt.Sprintf(
@@ -669,6 +702,12 @@ type cursorToolCall struct {
 	CallID string
 	Input  map[string]any
 	Result string
+	// Background is authoritative lifecycle evidence from a completed
+	// shellToolCall result: Cursor sets "isBackground": true only when it
+	// actually launched the shell in background mode. It is read from the
+	// result object's own field (never from args or a string search) and
+	// drives the managed-run background guard in Execute.
+	Background bool
 }
 
 // cursorToolCallKeySuffix is how Cursor names the per-tool payload: the tool is
@@ -714,6 +753,17 @@ func parseCursorToolCall(evt *cursorStreamEvent) cursorToolCall {
 	call.Input = payload.Args
 	if len(payload.Result) > 0 {
 		call.Result = string(payload.Result)
+
+		// Read only the result object's own isBackground field. A string search
+		// would fire on tool output that merely mentions the key (e.g. an echo
+		// of a command's own JSON), so this must stay structural; and a result
+		// we cannot decode must not fail the whole tool parse.
+		var resultMeta struct {
+			IsBackground bool `json:"isBackground"`
+		}
+		if json.Unmarshal(payload.Result, &resultMeta) == nil {
+			call.Background = resultMeta.IsBackground
+		}
 	}
 	return call
 }
