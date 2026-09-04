@@ -54,7 +54,8 @@ export function agentListOptions(wsId: string) {
       query.state.data?.some(
         (agent) =>
           !agent.archived_at &&
-          agent.runtime_availability !== undefined,
+          (agent.runtime_availability === "online" ||
+            agent.runtime_availability === "unstable"),
       )
         ? 30_000
         : false,
