@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 		runFakeOpencodeStdinHelper()
 		os.Exit(0)
 	}
-	// Cursor fakes are dispatched the same way as Claude's: the behavior lives
+	// Cursor fakes are dispatched via the same TestMain mechanism as the other provider fakes: the behavior lives
 	// with the Cursor tests (cursor_liveness_test.go), and only this dispatcher is
 	// package-wide, because the package may have exactly one TestMain.
 	if mode := os.Getenv(cursorFakeModeEnv); mode != "" {
