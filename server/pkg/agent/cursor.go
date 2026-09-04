@@ -141,6 +141,11 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		var finalError string
 		var protocolError string
 		resultSeen := false
+		// resultAuthoritative distinguishes a terminal result that landed while the
+		// run was still alive from one that arrived after the background liveness
+		// guard had already ended it. Only the former is the protocol boundary; see
+		// the `result` case below.
+		resultAuthoritative := false
 		resultIsError := false
 		resultBytes := 0
 		eventCount := 0
@@ -300,13 +305,30 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 			case "result":
 				resultSeen = true
+				// Whether this result owns the outcome is decided here, at the moment it
+				// is observed, and not reconstructed at finalization time from whichever
+				// cancellation happens to be visible then. A result that lands after the
+				// liveness guard ended the run is late evidence: it cannot revive a
+				// cancellation the guard itself caused, and its text must not surface as
+				// the answer.
+				resultAuthoritative = cursorTerminalResultObserved(guard)
+				if !resultAuthoritative {
+					b.cfg.Logger.Warn("cursor-agent emitted a terminal result after the background liveness guard ended the run; keeping the run failed",
+						"result_bytes", len(evt.ResultText))
+				}
 				if evt.IsError || evt.Subtype == "error" {
-					finalStatus = "failed"
-					finalError = cursorErrorText(&evt)
 					resultIsError = true
+					if resultAuthoritative {
+						finalStatus = "failed"
+						finalError = cursorErrorText(&evt)
+					}
 				}
 				resultBytes = len(evt.ResultText)
-				if evt.ResultText != "" && output.Len() == 0 {
+				// Only an authoritative result may become the answer. A late one is
+				// recorded in the protocol observation and the WARN above, and nothing
+				// else: forwarding it as a transcript message too would make the run look
+				// like it had said something final while it is being reported as failed.
+				if resultAuthoritative && evt.ResultText != "" && output.Len() == 0 {
 					output.WriteString(evt.ResultText)
 					trySend(msgCh, Message{Type: MessageText, Content: evt.ResultText})
 				}
@@ -318,11 +340,11 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				// event but keep a worker process alive. Treat result as the
 				// protocol boundary so the daemon can report completion.
 				//
-				// A previously observed background shell does NOT outrank this: the
-				// terminal result is Cursor's authoritative completion boundary, so
-				// the guard is disarmed here and finalization takes the resultSeen
-				// branch.
-				guard.Stop()
+				// A previously observed background shell does NOT outrank an
+				// authoritative result: the terminal result is Cursor's completion
+				// boundary, so the guard is disarmed above and finalization takes the
+				// authoritative branch. What it does not buy is a result that arrives
+				// after the guard already fired — that run stays failed.
 				cancel()
 
 			case "error":
@@ -398,7 +420,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// on a full pipe has returned by now; the writer sends exactly once.
 		writeErr := <-writeErrCh
 
-		if resultSeen {
+		if resultAuthoritative {
 			// A parsed result is the protocol boundary. Ignore the cancellation and
 			// exit error caused by stopping a Cursor worker that lingers afterward.
 			if finalStatus == "failed" && finalError == "" {
@@ -449,7 +471,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		if finalError != "" {
 			finalError = sanitizeAgentDiagnostic(finalError)
 		}
-		if finalStatus == "failed" && !resultSeen {
+		if finalStatus == "failed" && !resultAuthoritative {
 			finalError = cursorFailureDiagnostic(
 				finalError,
 				exitErr,
@@ -789,10 +811,23 @@ func parseCursorToolCall(evt *cursorStreamEvent) cursorToolCall {
 	call.Input = payload.Args
 	if len(payload.Result) > 0 {
 		call.Result = string(payload.Result)
-		call.Background = cursorResultReportsBackground(payload.Result)
+		// The observation the spec names is `shellToolCall.result.isBackground`.
+		// Another tool carrying the same field at its result root is not evidence
+		// that Cursor detached a process, so the flag is read only for the shell
+		// payload rather than off every tool result.
+		call.Background = call.Name == cursorShellToolName && cursorResultReportsBackground(payload.Result)
 	}
 	return call
 }
+
+// cursorShellToolName is the tool Cursor identifies by the `shellToolCall`
+// payload key (see cursorToolCallKeySuffix). Deliberately exactly this one and
+// not a broader alias set: ACP backends match tool names like `bash` or
+// `terminal`, but those are ACP namespaces, and Cursor's stream-json has only
+// ever keyed the shell payload as `shellToolCall` in this adapter's fixtures.
+// A key this check does not recognise leaves the run unsupervised, which is the
+// pre-existing behaviour, not a new failure.
+const cursorShellToolName = "shell"
 
 // cursorResultReportsBackground reads the single lifecycle flag the adapter acts
 // on: the `isBackground` boolean at the ROOT of a completed tool call's result.
@@ -894,8 +929,13 @@ const cursorBackgroundLivenessGuardError = "cursor-agent stopped producing seman
 // silently extend a stalled run forever.
 func cursorSemanticProgressEvent(eventType, subtype string) bool {
 	switch eventType {
-	case "assistant", "tool_call", "tool_use", "tool_result", "text", "step_finish":
+	case "assistant", "tool_use", "tool_result", "text", "step_finish":
 		return true
+	case "tool_call":
+		// Only the two subtypes Execute actually handles. A third would be counted
+		// as unhandled and dropped, so believing it as progress would let a stream
+		// that produces nothing but ignored subtypes extend its deadline forever.
+		return subtype == "started" || subtype == "completed"
 	case "thinking":
 		// Only the two recognized subtypes: a delta carries reasoning the agent
 		// is producing now, `completed` closes a block. An unknown subtype is
@@ -932,7 +972,9 @@ type cursorBackgroundGuard struct {
 	done     chan struct{}
 
 	// The terminal-result path and the deferred teardown both disarm the same
-	// guard, so closing `done` has to survive being called twice.
+	// guard, so both channel closes have to survive being called twice, including
+	// concurrently.
+	stopOnce  sync.Once
 	closeDone sync.Once
 
 	mu       sync.Mutex
@@ -984,24 +1026,29 @@ func (g *cursorBackgroundGuard) ObserveProgress() {
 	}
 }
 
-// Stop disarms the guard and waits for its goroutine to exit. Idempotent, safe
-// from any goroutine, and safe to call for a guard that was never armed.
-func (g *cursorBackgroundGuard) Stop() {
+// Stop disarms the guard, waits for its goroutine to exit, and reports the
+// guard's cause as of that moment: "" when the guard had not ended the run, or
+// the dedicated reason when it already had. The caller that is about to treat a
+// terminal result as authoritative needs exactly that answer, because the
+// guard's own cancellation is otherwise indistinguishable from a caller's.
+//
+// Idempotent, safe from any goroutine and safe to call concurrently, including
+// for a guard that was never armed.
+func (g *cursorBackgroundGuard) Stop() string {
 	g.mu.Lock()
 	watching := g.watching
 	g.stopped = true
 	g.mu.Unlock()
 
-	select {
-	case <-g.stop:
-	default:
-		close(g.stop)
-	}
+	g.stopOnce.Do(func() { close(g.stop) })
 	if !watching {
 		// No goroutine will ever close it.
 		g.closeDone.Do(func() { close(g.done) })
 	}
 	<-g.done
+	// Reading the cause after `done` is closed cannot lose a fire: the monitor
+	// latches it before it returns, and the close is its last action.
+	return g.Cause()
 }
 
 func (g *cursorBackgroundGuard) watch() {
@@ -1056,6 +1103,25 @@ func (g *cursorBackgroundGuard) Cause() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.cause
+}
+
+// cursorTerminalResultObserved records that Cursor's terminal result event
+// reached the reader and reports whether that result is authoritative: true when
+// it landed while the run was still alive, false when the background liveness
+// guard had already ended the run.
+//
+// It exists as a named seam because the ordering it encodes is the rule: which
+// of the two — a native terminal result or the guard — reached the loop first is
+// what decides the outcome, and nothing downstream can recover that afterwards.
+// Call it exactly once per result event, before any of the result's own fields
+// are applied.
+//
+// A run the guard *declined* to claim — one the execution deadline or the caller
+// had already ended — reports authoritative, because fire() never latches a
+// cause for those. So a result already in the buffer when a configured deadline
+// expires still wins, as the precedence the spec sets requires.
+func cursorTerminalResultObserved(g *cursorBackgroundGuard) bool {
+	return g.Stop() == ""
 }
 
 // ── Cursor stream-json types ──

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -38,6 +39,7 @@ const (
 	cursorFakeResultWins         = "background_shell_result_wins"
 	cursorFakeMalformedStall     = "background_shell_malformed_stall"
 	cursorFakeUnverifiedActivity = "background_shell_unverified_activity"
+	cursorFakeNonShellStall      = "nonshell_background_flag_stall"
 )
 
 // cursorBGSessionID is emitted by every fake below; the guard must fail closed
@@ -75,7 +77,26 @@ const (
 
 	cursorBGResult = `{"type":"result","subtype":"success","is_error":false,` +
 		`"result":"dev server checked and stopped","session_id":"` + cursorBGSessionID + `"}`
+
+	// cursorNonShellBGCompleted carries the same root flag on a *read* payload.
+	// It is not a launched shell, so it must not put the run under the guard.
+	cursorNonShellBGCompleted = `{"type":"tool_call","subtype":"completed","call_id":"call-read",` +
+		`"tool_call":{"readToolCall":{"args":{"path":"server.log"},` +
+		`"result":{"content":"listening on 8000","isBackground":true},"toolCallId":"call-read"}}}`
 )
+
+// cursorFakeStaysAlive reports the fakes that hang instead of exiting, so only
+// the daemon can end the run. A fake that finished normally exits before the
+// test framework can print PASS/ok into the same stdout.
+func cursorFakeStaysAlive(mode string) bool {
+	switch mode {
+	case cursorFakeStall, cursorFakeMalformedStall,
+		cursorFakeUnverifiedActivity, cursorFakeNonShellStall:
+		return true
+	default:
+		return false
+	}
+}
 
 // cursorFakeEvent is one stream-json line, written after the given delay.
 type cursorFakeEvent struct {
@@ -151,6 +172,13 @@ func runFakeCursorStream(mode string) {
 			{line: cursorBGShellStarted},
 			{line: cursorBGShellCompleted},
 		}
+	case cursorFakeNonShellStall:
+		// The same stall, but the flag was reported by a read tool: there is no
+		// launched shell to supervise, so the guard must never arm.
+		events = []cursorFakeEvent{
+			{line: cursorBGInit},
+			{line: cursorNonShellBGCompleted},
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown CURSOR_FAKE_MODE: %q\n", mode)
 		os.Exit(2)
@@ -185,7 +213,7 @@ func runFakeCursorStream(mode string) {
 		}
 	}
 
-	if mode != cursorFakeStall && mode != cursorFakeMalformedStall && mode != cursorFakeUnverifiedActivity {
+	if !cursorFakeStaysAlive(mode) {
 		// The fake completed normally: exit before the test framework can print
 		// PASS/ok into the JSON stream.
 		os.Exit(0)
@@ -221,7 +249,6 @@ func runCursorFake(t *testing.T, mode string, guard, execTimeout time.Duration) 
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-
 	backend, err := New("cursor", Config{
 		ExecutablePath: self,
 		Env:            map[string]string{cursorFakeModeEnv: mode},
@@ -382,13 +409,15 @@ func TestCursorBackgroundShellProgressExtendsGuard(t *testing.T) {
 }
 
 // TestCursorBackgroundOutputTextCannotFakeLifecycleIsStructural is Test D: the
-// observation comes from the result object's root boolean and nowhere else.
+// observation comes from the shell payload's result root boolean and nowhere
+// else.
 func TestCursorBackgroundOutputTextCannotFakeLifecycleIsStructural(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name           string
 		event          string
+		wantName       string
 		wantBackground bool
 		wantResult     string
 	}{
@@ -396,13 +425,23 @@ func TestCursorBackgroundOutputTextCannotFakeLifecycleIsStructural(t *testing.T)
 			name: "root boolean true is the observation",
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c1",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"serve"},"result":{"success":{"exitCode":0},"isBackground":true},"toolCallId":"c1"}}}`,
+			wantName:       "shell",
 			wantBackground: true,
 			wantResult:     `{"success":{"exitCode":0},"isBackground":true}`,
+		},
+		{
+			name: "isBackground on another tool is not a launched shell",
+			event: `{"type":"tool_call","subtype":"completed","call_id":"c9",` +
+				`"tool_call":{"readToolCall":{"args":{"path":"server.log"},` +
+				`"result":{"content":"ok","isBackground":true},"toolCallId":"c9"}}}`,
+			wantName:   "read",
+			wantResult: `{"content":"ok","isBackground":true}`,
 		},
 		{
 			name: "explicit false is foreground",
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c2",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"ls"},"result":{"success":{"exitCode":0},"isBackground":false},"toolCallId":"c2"}}}`,
+			wantName:   "shell",
 			wantResult: `{"success":{"exitCode":0},"isBackground":false}`,
 		},
 		{
@@ -410,6 +449,7 @@ func TestCursorBackgroundOutputTextCannotFakeLifecycleIsStructural(t *testing.T)
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c3",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"grep -r isBackground ."},` +
 				`"result":{"stdout":"{\"isBackground\":true}","exitCode":0},"toolCallId":"c3"}}}`,
+			wantName:   "shell",
 			wantResult: `{"stdout":"{\"isBackground\":true}","exitCode":0}`,
 		},
 		{
@@ -417,6 +457,7 @@ func TestCursorBackgroundOutputTextCannotFakeLifecycleIsStructural(t *testing.T)
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c4",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"serve"},` +
 				`"result":{"meta":{"isBackground":true},"exitCode":0},"toolCallId":"c4"}}}`,
+			wantName:   "shell",
 			wantResult: `{"meta":{"isBackground":true},"exitCode":0}`,
 		},
 		{
@@ -424,23 +465,27 @@ func TestCursorBackgroundOutputTextCannotFakeLifecycleIsStructural(t *testing.T)
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c5",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"serve"},` +
 				`"result":{"isBackground":"true"},"toolCallId":"c5"}}}`,
+			wantName:   "shell",
 			wantResult: `{"isBackground":"true"}`,
 		},
 		{
 			name: "non-object result is not an observation",
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c6",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"serve"},"result":[{"isBackground":true}],"toolCallId":"c6"}}}`,
+			wantName:   "shell",
 			wantResult: `[{"isBackground":true}]`,
 		},
 		{
 			name: "missing result stays foreground",
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c7",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"serve"},"toolCallId":"c7"}}}`,
+			wantName: "shell",
 		},
 		{
 			name: "null result stays foreground",
 			event: `{"type":"tool_call","subtype":"completed","call_id":"c8",` +
 				`"tool_call":{"shellToolCall":{"args":{"command":"serve"},"result":null,"toolCallId":"c8"}}}`,
+			wantName:   "shell",
 			wantResult: `null`,
 		},
 	}
@@ -461,8 +506,8 @@ func TestCursorBackgroundOutputTextCannotFakeLifecycleIsStructural(t *testing.T)
 			if call.Result != tt.wantResult {
 				t.Errorf("Result = %q, want %q (raw result must be preserved verbatim)", call.Result, tt.wantResult)
 			}
-			if call.Name != "shell" || call.CallID == "" {
-				t.Errorf("shell identity lost: name=%q callID=%q", call.Name, call.CallID)
+			if call.Name != tt.wantName || call.CallID == "" {
+				t.Errorf("tool identity lost: name=%q want %q, callID=%q", call.Name, tt.wantName, call.CallID)
 			}
 		})
 	}
@@ -506,6 +551,32 @@ func TestCursorBackgroundShellMalformedResultDoesNotArmGuard(t *testing.T) {
 	}
 	if !sawRawResult {
 		t.Errorf("malformed tool result was not forwarded unchanged: %+v", run.messages)
+	}
+}
+
+// TestCursorBackgroundFlagOutsideShellDoesNotArmGuard is the companion of Test E
+// for the other half of "structural": the flag has to sit on the *shell* result.
+// A read tool reporting `isBackground` at its result root is not a launched
+// process, so arming on it would put ordinary runs under a deadline they were
+// never meant to have. The run must still be ended only by the execution
+// timeout, exactly like a run with no background observation at all.
+func TestCursorBackgroundFlagOutsideShellDoesNotArmGuard(t *testing.T) {
+	t.Parallel()
+
+	run := runCursorFake(t, cursorFakeNonShellStall, 500*time.Millisecond, 3*time.Second)
+
+	if run.result.Status != "timeout" {
+		t.Errorf("status = %q, want %q: a non-shell isBackground must not arm the guard",
+			run.result.Status, "timeout")
+	}
+	if !strings.Contains(run.result.Error, "timed out after 3s") {
+		t.Errorf("error = %q, want the execution deadline's own wording", run.result.Error)
+	}
+	if strings.Contains(run.result.Error, "background shell") {
+		t.Errorf("error = %q, must not claim a background shell that was never launched", run.result.Error)
+	}
+	if run.elapsed < 2*time.Second || run.elapsed > 9*time.Second {
+		t.Errorf("elapsed = %s, want the 3s execution deadline to be what ended the run", run.elapsed)
 	}
 }
 
@@ -581,6 +652,11 @@ func TestCursorSemanticProgressEvent(t *testing.T) {
 		{"result", "success"},
 		{"thinking", "progress"}, // the non-terminal noise MUL-5231/MUL-5434 exclude
 		{"thinking", ""},
+		// Execute handles exactly started/completed and counts everything else as
+		// unhandled, so a subtype it drops cannot be evidence of progress.
+		{"tool_call", "progress"},
+		{"tool_call", "delta"},
+		{"tool_call", ""},
 		{"background_log", ""}, // an unhandled type is not evidence of progress
 		{"user", ""},           // a CLI echoing our own prompt proves nothing
 		{"connection", ""},
@@ -720,6 +796,63 @@ func TestCursorBackgroundGuardWithoutObservationOwnsNoTimer(t *testing.T) {
 	stopGuardWithin(t, g, 2*time.Second)
 }
 
+// TestCursorTerminalResultObservedDecidesByObservationOrder pins the precedence
+// rule the Execute result path applies through cursorTerminalResultObserved: a
+// native terminal result outranks the guard only when it arrives first.
+//
+// The scenarios are the three orderings that can happen, each set up directly on
+// the guard rather than by racing a child process, because "the result bytes were
+// already buffered when the guard fired" is not something a subprocess test can
+// force deterministically.
+func TestCursorTerminalResultObservedDecidesByObservationOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("result observed before the guard fires is authoritative", func(t *testing.T) {
+		runCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g := newCursorBackgroundGuard(context.Background(), runCtx, cancel, time.Hour)
+		g.ObserveBackground()
+
+		if !cursorTerminalResultObserved(g) {
+			t.Fatal("a terminal result that lands inside the window must own the outcome")
+		}
+	})
+
+	t.Run("result observed after the guard fires is not authoritative", func(t *testing.T) {
+		runCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g := newCursorBackgroundGuard(context.Background(), runCtx, cancel, 20*time.Millisecond)
+		g.ObserveBackground()
+		if !waitForGuardFire(g, 2*time.Second) {
+			t.Fatal("guard never fired")
+		}
+
+		if cursorTerminalResultObserved(g) {
+			t.Fatal("a result that lands after the guard ended the run must not revive it as completed")
+		}
+	})
+
+	// Precedence 2 is untouched: the guard never claims a run the deadline or the
+	// caller had already ended, so a buffered result in such a run is still
+	// authoritative rather than being stolen by the guard.
+	t.Run("a cause the guard declined to claim leaves the result authoritative", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		defer cancelParent()
+
+		runCtx, runCancel := context.WithDeadline(parent, time.Now().Add(-time.Second))
+		defer runCancel()
+
+		g := newCursorBackgroundGuard(parent, runCtx, runCancel, time.Millisecond)
+		g.ObserveBackground()
+		if !cursorTerminalResultObserved(g) {
+			t.Fatal("the guard must not demote a result in a run it never claimed")
+		}
+		if got := g.Cause(); got != "" {
+			t.Fatalf("Cause = %q, want the guard to have yielded to the real deadline", got)
+		}
+	})
+}
+
 func waitForGuardFire(g *cursorBackgroundGuard, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -745,5 +878,95 @@ func stopGuardWithin(t *testing.T, g *cursorBackgroundGuard, timeout time.Durati
 	case <-stopped:
 	case <-time.After(timeout):
 		t.Fatal("guard.Stop did not return: the background-liveness watcher outlived the run")
+	}
+}
+
+// TestCursorBackgroundGuardStopReportsWhetherTheRunWasAlreadyEnded pins the
+// ordering contract behind the late-result boundary: Stop reports the guard's
+// cause as of the moment it is called, which is the only way the result handler
+// can tell an authoritative terminal result from one that arrived after the
+// guard had ended the run.
+func TestCursorBackgroundGuardStopReportsWhetherTheRunWasAlreadyEnded(t *testing.T) {
+	t.Parallel()
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	live := newCursorBackgroundGuard(context.Background(), runCtx, cancel, time.Hour)
+	live.ObserveBackground()
+	if got := live.Stop(); got != "" {
+		t.Errorf("Stop before the deadline = %q, want empty so the terminal result owns the outcome", got)
+	}
+	if runCtx.Err() != nil {
+		t.Error("Stop must only disarm the guard, never cancel the run")
+	}
+
+	endedCtx, endedCancel := context.WithCancel(context.Background())
+	defer endedCancel()
+	fired := newCursorBackgroundGuard(context.Background(), endedCtx, endedCancel, 20*time.Millisecond)
+	fired.ObserveBackground()
+	if !waitForGuardFire(fired, 2*time.Second) {
+		t.Fatal("guard never fired")
+	}
+	if got := fired.Stop(); got != cursorBackgroundLivenessGuardError {
+		t.Errorf("Stop after the guard fired = %q, want the latched cause so a late result cannot win", got)
+	}
+}
+
+// TestCursorBackgroundGuardConcurrentStopDoesNotPanic covers the idempotency the
+// guard documents: the terminal-result path and the deferred teardown can reach
+// Stop at the same moment, and a second close of either channel must not panic
+// or lose the latched cause.
+func TestCursorBackgroundGuardConcurrentStopDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newCursorBackgroundGuard(context.Background(), runCtx, cancel, 20*time.Millisecond)
+	g.ObserveBackground()
+	if !waitForGuardFire(g, 2*time.Second) {
+		t.Fatal("guard never fired")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = g.Stop()
+		}()
+	}
+
+	all := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(all)
+	}()
+	select {
+	case <-all:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Stop did not return")
+	}
+	if g.Cause() != cursorBackgroundLivenessGuardError {
+		t.Errorf("Cause after concurrent Stop = %q, want the latched cause preserved", g.Cause())
+	}
+}
+
+// TestCursorBackgroundGuardStopIsIdempotentBeforeArm checks the same close
+// discipline for a guard that never saw a background shell: no watcher exists to
+// close `done`, so repeated Stop calls must still return.
+func TestCursorBackgroundGuardStopIsIdempotentBeforeArm(t *testing.T) {
+	t.Parallel()
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g := newCursorBackgroundGuard(context.Background(), runCtx, cancel, time.Hour)
+
+	for i := 0; i < 3; i++ {
+		if got := g.Stop(); got != "" {
+			t.Fatalf("Stop #%d = %q, want empty", i+1, got)
+		}
+	}
+	if runCtx.Err() != nil {
+		t.Error("an unarmed guard must not cancel the run")
 	}
 }
