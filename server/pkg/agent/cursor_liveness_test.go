@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -310,9 +311,8 @@ func (r cursorFakeRun) assertGuardFailure(t *testing.T) {
 	if r.result.Status != "failed" {
 		t.Fatalf("status = %q, want failed; error=%q", r.result.Status, r.result.Error)
 	}
-	if !strings.Contains(r.result.Error, "background shell") ||
-		!strings.Contains(r.result.Error, "did not emit a terminal result") {
-		t.Errorf("error = %q, want the dedicated background-liveness reason", r.result.Error)
+	if r.result.Error != cursorBackgroundLivenessGuardError {
+		t.Errorf("error = %q, want only the content-free background-liveness reason", r.result.Error)
 	}
 	// The guard's own cancellation must not be rewritten into the generic one.
 	if strings.Contains(r.result.Error, "execution cancelled") {
@@ -726,6 +726,44 @@ func TestCursorBackgroundGuardProgressExtendsDeadline(t *testing.T) {
 		t.Fatal("guard never fired once the progress stopped")
 	}
 	stopGuardWithin(t, g, 2*time.Second)
+}
+
+// A timer notification selected before a progress reset is processed must be
+// checked against the observation time, not treated as proof of inactivity.
+func TestCursorBackgroundGuardStaleTimerAfterProgress(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		runCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g := newCursorBackgroundGuard(context.Background(), runCtx, cancel, time.Minute)
+		defer g.Stop()
+		g.ObserveBackground()
+		synctest.Wait()
+
+		time.Sleep(59 * time.Second)
+		g.ObserveProgress()
+		time.Sleep(time.Second)
+		// Model the old timer's expiry reaching fire after progress was
+		// observed. Calling the expiry gate directly makes this ordering
+		// deterministic instead of depending on select choosing timer.C.
+		g.fire()
+		if runCtx.Err() != nil || g.Cause() != "" {
+			t.Fatalf("stale timer cancelled a progressing run: context=%v cause=%q", runCtx.Err(), g.Cause())
+		}
+
+		// The deadline is exactly one interval after the observation, not
+		// one interval after the stale timer was handled.
+		time.Sleep(58 * time.Second)
+		if runCtx.Err() != nil {
+			t.Fatal("guard cancelled before a full interval without progress")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if runCtx.Err() == nil || g.Cause() != cursorBackgroundLivenessGuardError {
+			t.Fatalf("guard did not expire after progress stopped: context=%v cause=%q", runCtx.Err(), g.Cause())
+		}
+	})
 }
 
 // TestCursorBackgroundGuardYieldsToRealCauses covers precedence: an execution
