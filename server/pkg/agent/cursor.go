@@ -420,6 +420,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		// on a full pipe has returned by now; the writer sends exactly once.
 		writeErr := <-writeErrCh
 
+		guardCause := guard.Stop()
 		if resultAuthoritative {
 			// A parsed result is the protocol boundary. Ignore the cancellation and
 			// exit error caused by stopping a Cursor worker that lingers afterward.
@@ -435,7 +436,7 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			// external cancellation still reports `aborted`, and a cancellation the
 			// guard itself provoked is never rewritten into the generic
 			// "execution cancelled".
-			switch guardCause := guard.Cause(); {
+			switch {
 			case guardCause != "":
 				finalStatus = "failed"
 				finalError = guardCause
@@ -471,7 +472,9 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		if finalError != "" {
 			finalError = sanitizeAgentDiagnostic(finalError)
 		}
-		if finalStatus == "failed" && !resultAuthoritative {
+		// The guard has a content-free failure contract. Keep process details
+		// in the protocol log below, rather than appending stderr to this cause.
+		if finalStatus == "failed" && !resultAuthoritative && guardCause == "" {
 			finalError = cursorFailureDiagnostic(
 				finalError,
 				exitErr,
@@ -953,9 +956,9 @@ func cursorSemanticProgressEvent(eventType, subtype string) bool {
 //
 // It holds the two pieces of state the design calls for — `active` (at least one
 // background shell has been observed, so this run needs the extra supervision)
-// and the rolling semantic-progress deadline (materialised as the timer, which
-// IS last-progress-plus-timeout) — and owns exactly one goroutine, started on
-// the first background observation and never restarted.
+// and the last semantic-progress observation — and owns exactly one goroutine,
+// started on the first background observation and never restarted. The timer
+// wakes that goroutine; the observation time remains the deadline's authority.
 //
 // The timer is touched only by that goroutine: observers hand it a coalesced
 // reset signal instead of calling Reset themselves, so there is no racing
@@ -977,11 +980,12 @@ type cursorBackgroundGuard struct {
 	stopOnce  sync.Once
 	closeDone sync.Once
 
-	mu       sync.Mutex
-	active   bool // a background shell has been observed
-	watching bool // the single monitor goroutine has been started
-	stopped  bool
-	cause    string // non-empty once the guard itself ended the run
+	mu           sync.Mutex
+	active       bool // a background shell has been observed
+	watching     bool // the single monitor goroutine has been started
+	stopped      bool
+	cause        string    // non-empty once the guard itself ended the run
+	lastProgress time.Time // monotonic observation time, protected by mu
 }
 
 func newCursorBackgroundGuard(parent, runCtx context.Context, cancel context.CancelFunc, timeout time.Duration) *cursorBackgroundGuard {
@@ -1007,6 +1011,7 @@ func (g *cursorBackgroundGuard) ObserveBackground() {
 		return
 	}
 	g.active = true
+	g.lastProgress = time.Now()
 	started := g.watching
 	g.watching = true
 	g.mu.Unlock()
@@ -1016,10 +1021,19 @@ func (g *cursorBackgroundGuard) ObserveBackground() {
 	}
 }
 
-// ObserveProgress rolls the deadline forward. It is non-blocking by design: the
-// stream reader must never wait on supervision, and a burst of events needs only
-// one pending reset.
+// ObserveProgress records progress before waking the watcher, so a timer selected
+// ahead of the reset cannot cancel a run that already made progress. The mutex
+// only protects the observation; notification never waits for the watcher and a
+// burst of events needs only one pending reset.
 func (g *cursorBackgroundGuard) ObserveProgress() {
+	g.mu.Lock()
+	if !g.active || g.stopped || g.cause != "" {
+		g.mu.Unlock()
+		return
+	}
+	g.lastProgress = time.Now()
+	g.mu.Unlock()
+
 	select {
 	case g.progress <- struct{}{}:
 	default:
@@ -1054,31 +1068,39 @@ func (g *cursorBackgroundGuard) Stop() string {
 func (g *cursorBackgroundGuard) watch() {
 	defer g.closeDone.Do(func() { close(g.done) })
 
-	timer := time.NewTimer(g.timeout)
+	// Check the observation immediately even if starting this goroutine was
+	// delayed; scheduling time must not extend the inactivity window.
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-timer.C:
-			g.fire()
-			return
 		case <-g.progress:
-			// Stop-and-drain keeps a signal that raced the expiry from
-			// resurrecting an already-fired deadline.
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(g.timeout)
 		case <-g.stop:
 			return
 		}
+		// Both notifications may be ready together, and select has no priority.
+		// Recheck the actual observation on either path instead of treating a
+		// timer tick as proof of inactivity or a queued reset as new progress.
+		remaining := g.fire()
+		if remaining <= 0 {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(remaining)
 	}
 }
 
-// fire ends the run, but only if the guard is genuinely the first cause.
+// fire ends the run only after a full interval without observed progress and
+// only if the guard is genuinely the first cause. A positive return value is
+// the remaining wait after a stale timer tick or a coalesced progress reset;
+// zero means the watcher is finished.
 //
 // This is where the precedence rules are enforced rather than guessed at
 // finalization time: if the execution deadline had passed, or the caller had
@@ -1086,15 +1108,19 @@ func (g *cursorBackgroundGuard) watch() {
 // must not claim it — those two retain `timeout` and `aborted`. Conversely, when
 // the guard does cancel, that cancellation shows up later as runCtx being
 // cancelled, and must stay the dedicated background-liveness failure.
-func (g *cursorBackgroundGuard) fire() {
+func (g *cursorBackgroundGuard) fire() time.Duration {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.stopped || g.runCtx.Err() != nil || g.parent.Err() != nil {
-		return
+	if !g.active || g.stopped || g.runCtx.Err() != nil || g.parent.Err() != nil {
+		return 0
+	}
+	if remaining := time.Until(g.lastProgress.Add(g.timeout)); remaining > 0 {
+		return remaining
 	}
 	g.cause = cursorBackgroundLivenessGuardError
 	g.cancel()
+	return 0
 }
 
 // Cause returns the dedicated failure reason when the guard ended this run, and
