@@ -2359,8 +2359,11 @@ func TestGH8082GateToBackendHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fake Pi never recorded cwd: %v; result=%+v", err, result)
 	}
-	// Out-File -Encoding utf8 writes a BOM and CRLF line endings.
-	argv := strings.Split(strings.TrimPrefix(string(argvRaw), "\ufeff"), "\r\n")
+	// Windows Out-File -Encoding utf8 writes a BOM and CRLF line endings;
+	// the Unix fake writes plain LF. Normalize to LF before splitting so
+	// both parse (kept line-based, not Fields, to preserve paths with
+	// spaces).
+	argv := strings.Split(strings.ReplaceAll(strings.TrimPrefix(string(argvRaw), "\ufeff"), "\r\n", "\n"), "\n")
 	sessionIdx := -1
 	for i, a := range argv {
 		if a == "--session" && i+1 < len(argv) {
@@ -2430,11 +2433,16 @@ func writeGH8082FakePi(t *testing.T, base string) string {
 		return cmdPath
 	}
 	fakeBin := filepath.Join(base, "pi")
+	// Each event is its own printf argument: a bare newline-joined string
+	// would run the 2nd/3rd lines as shell commands (exit 127). The events
+	// are already single-quoted lines, so joining them with spaces yields
+	// three separate arguments (the JSON contains no single quotes).
+	shEvents := "printf '%s\\n' " + strings.ReplaceAll(events, "\n", " ")
 	script := "#!/bin/sh\n" +
 		"cat > \"${GH8082_OBSERVE_STDIN:-/dev/null}\"\n" +
 		"printf '%s\\n' \"$@\" > \"${GH8082_OBSERVE_ARGV}\"\n" +
 		"pwd > \"${GH8082_OBSERVE_CWD}\"\n" +
-		"printf '%s\\n' " + events + "\n"
+		shEvents + "\n"
 	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake pi: %v", err)
 	}
