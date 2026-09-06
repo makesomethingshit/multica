@@ -6189,10 +6189,20 @@ func piSessionFilePresent(sessionID string) bool {
 	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
-// piSessionHeaderLimit caps how much of a Pi session file the resume gate
-// reads. It is a defensive read bound for this check, not Pi's official
-// header limit; anything larger is treated as undecidable, never as missing.
+// piSessionHeaderLimit caps how much of a Pi session file's FIRST LINE the
+// resume gate reads. It is a defensive read bound for this check, not Pi's
+// official header limit; a first line beyond it is undecidable, never
+// missing. Bytes past the first newline are never read, so a long
+// transcript body cannot push a healthy header over the bound (GH #8082).
 const piSessionHeaderLimit = 64 * 1024
+
+// piSessionHeader carries only the fields the resume gate needs. Unknown
+// extra fields are ignored by the decoder; no constraints are placed on
+// version/id/timestamp shapes.
+type piSessionHeader struct {
+	Type string `json:"type"`
+	Cwd  string `json:"cwd"`
+}
 
 // piSessionRecordedCwdMissing reports whether a Pi session file's recorded
 // working directory is confirmed absent (GH #8082). It answers only that:
@@ -6209,28 +6219,42 @@ func piSessionRecordedCwdMissing(sessionPath string) bool {
 		return false
 	}
 	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, piSessionHeaderLimit+1))
-	if err != nil || len(raw) > piSessionHeaderLimit {
+	// Bounded first-line read: stop at the newline so the transcript body
+	// is never consumed. Handles LF, CRLF, and a missing trailing newline.
+	var line []byte
+	one := make([]byte, 1)
+	for len(line) <= piSessionHeaderLimit {
+		n, rerr := f.Read(one)
+		if n > 0 {
+			if one[0] == '\n' {
+				break
+			}
+			line = append(line, one[0])
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				break
+			}
+			return false
+		}
+	}
+	if len(line) > piSessionHeaderLimit {
 		return false
 	}
-	// The cwd lives in the first-line session header; the transcript body
-	// below it is never searched.
-	if i := bytes.IndexByte(raw, '\n'); i >= 0 {
-		raw = raw[:i]
-	}
-	raw = bytes.TrimSuffix(raw, []byte("\r"))
-	var header map[string]any
-	if err := json.Unmarshal(raw, &header); err != nil {
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	var header piSessionHeader
+	if err := json.NewDecoder(bytes.NewReader(line)).Decode(&header); err != nil {
 		return false
 	}
-	if header["type"] != "session" {
+	if header.Type != "session" {
 		return false
 	}
-	cwd, ok := header["cwd"].(string)
-	if !ok || cwd == "" || !filepath.IsAbs(cwd) {
+	// A non-string cwd fails to decode into the struct as a type error,
+	// which Decode reports — same undecidable outcome as before.
+	if header.Cwd == "" || !filepath.IsAbs(header.Cwd) {
 		return false
 	}
-	_, err = os.Stat(cwd)
+	_, err = os.Stat(header.Cwd)
 	return err != nil && os.IsNotExist(err)
 }
 

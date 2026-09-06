@@ -2499,6 +2499,57 @@ func TestGH8082HeaderFormatCompatibility(t *testing.T) {
 	})
 }
 
+// TestGH8082LongTranscriptStillDrops: a healthy first-line header followed by
+// a body larger than the read bound must still drop when the recorded cwd is
+// gone. Guards the first-line-only reader: a whole-file bounded read would
+// misclassify this as oversized/undecidable and wrongly resume (GH #8082).
+func TestGH8082LongTranscriptStillDrops(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	recorded := filepath.Join(base, "recorded-a")
+	if err := os.MkdirAll(recorded, 0o755); err != nil {
+		t.Fatalf("create recorded: %v", err)
+	}
+	envDir := filepath.Join(base, "fresh-b")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatalf("create env: %v", err)
+	}
+	headerRaw, err := json.Marshal(map[string]any{"type": "session", "cwd": recorded})
+	if err != nil {
+		t.Fatalf("marshal header: %v", err)
+	}
+	// Body well past the 64KiB header bound, containing a decoy existing
+	// path that must never be consulted — only the header cwd counts.
+	body := strings.Repeat(`{"type":"message","text":"decoy `+envDir+`"}`+"\n", 4096)
+	sessionPath := filepath.Join(base, "long-session.jsonl")
+	if err := os.WriteFile(sessionPath, append(append(headerRaw, '\n'), body...), 0o644); err != nil {
+		t.Fatalf("write long session: %v", err)
+	}
+	info, err := os.Stat(sessionPath)
+	if err != nil || info.Size() <= 64*1024 {
+		t.Fatalf("fixture too small to prove bounded read: size=%v err=%v", info.Size(), err)
+	}
+	if err := os.RemoveAll(recorded); err != nil {
+		t.Fatalf("delete recorded: %v", err)
+	}
+
+	task := Task{PriorSessionID: sessionPath, PriorWorkDir: recorded}
+	taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+
+	reachable := gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default())
+
+	if reachable {
+		t.Fatal("reachable = true for a long-transcript session whose recorded cwd is gone")
+	}
+	if task.PriorSessionID != "" {
+		t.Fatalf("PriorSessionID = %q, want empty", task.PriorSessionID)
+	}
+	if !taskCtx.PriorSessionResumeUnavailable || !task.PriorSessionResumeUnavailable {
+		t.Fatal("resume-unavailable notice missing on task or taskCtx")
+	}
+}
+
 // TestGH8082OmpAndOtherProvidersUnaffected: the missing-cwd check is
 // Pi-only, so OMP keeps a deleted-cwd session reachable (prior behaviour)
 // and cwd-keyed providers are untouched.
