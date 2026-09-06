@@ -2162,6 +2162,386 @@ func TestGatePiResumeDropsUnusableSessionFile(t *testing.T) {
 	}
 }
 
+// writeGH8082Session writes a Pi session file whose first line is a session
+// header with the given extra fields, followed by a transcript body line so
+// tests prove only the header is consulted. Fixtures use json.Marshal, never
+// string concatenation.
+func writeGH8082Session(t *testing.T, path string, extra map[string]any, body string) {
+	t.Helper()
+	header := map[string]any{"type": "session"}
+	for k, v := range extra {
+		header[k] = v
+	}
+	raw, err := json.Marshal(header)
+	if err != nil {
+		t.Fatalf("marshal session header: %v", err)
+	}
+	if body == "" {
+		body = `{"type":"message","cwd decoy":"/nonexistent-decoy"}`
+	}
+	if err := os.WriteFile(path, append(append(raw, '\n'), body+"\n"...), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+}
+
+// TestGH8082MissingRecordedCwdDropsPiResume is the core GH #8082 repro: the
+// session file exists but its recorded cwd was deleted, so the Pi resume
+// must be dropped via the existing fresh-session path. Fails on base with
+// reachable=true (file presence alone), passes with the helper wired in.
+func TestGH8082MissingRecordedCwdDropsPiResume(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	recorded := filepath.Join(base, "recorded-a")
+	if err := os.MkdirAll(recorded, 0o755); err != nil {
+		t.Fatalf("create recorded dir: %v", err)
+	}
+	envDir := filepath.Join(base, "fresh-b")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatalf("create env dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "sentinel"), []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	sessionPath := filepath.Join(base, "pi-session.jsonl")
+	writeGH8082Session(t, sessionPath, map[string]any{"cwd": recorded}, "")
+	if err := os.RemoveAll(recorded); err != nil {
+		t.Fatalf("delete recorded dir: %v", err)
+	}
+	before, err := os.ReadFile(sessionPath)
+	if err != nil {
+		t.Fatalf("read session before gate: %v", err)
+	}
+
+	task := Task{PriorSessionID: sessionPath, PriorWorkDir: recorded}
+	taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+
+	reachable := gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default())
+
+	if reachable {
+		t.Fatal("reachable = true for a Pi session whose recorded cwd is gone")
+	}
+	if task.PriorSessionID != "" {
+		t.Fatalf("PriorSessionID = %q, want empty", task.PriorSessionID)
+	}
+	if taskCtx.PriorSessionResumed {
+		t.Fatal("PriorSessionResumed stayed true for a dropped Pi session")
+	}
+	if !taskCtx.PriorSessionResumeUnavailable || !task.PriorSessionResumeUnavailable {
+		t.Fatal("resume-unavailable notice missing on task or taskCtx")
+	}
+	if task.PriorWorkDir != recorded {
+		t.Fatalf("PriorWorkDir = %q, want %q (gate must not clear it)", task.PriorWorkDir, recorded)
+	}
+	if _, err := os.Stat(filepath.Join(envDir, "sentinel")); err != nil {
+		t.Fatalf("env workdir disturbed: %v", err)
+	}
+	after, err := os.ReadFile(sessionPath)
+	if err != nil {
+		t.Fatalf("read session after gate: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("session file was modified by the gate")
+	}
+	if _, err := os.Stat(recorded); !os.IsNotExist(err) {
+		t.Fatalf("recorded dir was recreated by the gate: %v", err)
+	}
+	// §6H boundary (unit-level): the gate output IS the backend input — runTask
+	// forwards task.PriorSessionID as ResumeSessionID (daemon.go runTask),
+	// and the Pi backend mints a new session path for --session when it is
+	// empty (pi.go: empty ResumeSessionID -> newPiSessionPath). The cleared
+	// PriorSessionID asserted above is therefore exactly what keeps the stale
+	// path S out of --session. Full fake-CLI invocation is out of scope for
+	// this narrow gate change; no new backend plumbing is added.
+}
+
+// TestGH8082CrossWorkdirResumePreserved guards PR #7760: different but
+// existing recorded cwd and env workdir must still resume.
+func TestGH8082CrossWorkdirResumePreserved(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	recorded := filepath.Join(base, "recorded-a")
+	envDir := filepath.Join(base, "fresh-b")
+	for _, dir := range []string{recorded, envDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create %s: %v", dir, err)
+		}
+	}
+	sessionPath := filepath.Join(base, "pi-session.jsonl")
+	writeGH8082Session(t, sessionPath, map[string]any{"cwd": recorded}, "")
+
+	task := Task{PriorSessionID: sessionPath, PriorWorkDir: recorded}
+	taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+
+	reachable := gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default())
+
+	if !reachable {
+		t.Fatal("reachable = false for a Pi session whose recorded cwd still exists")
+	}
+	if task.PriorSessionID != sessionPath {
+		t.Fatalf("PriorSessionID = %q, want %q", task.PriorSessionID, sessionPath)
+	}
+	if !taskCtx.PriorSessionResumed {
+		t.Fatal("PriorSessionResumed was cleared for a healthy cross-workdir resume")
+	}
+	if taskCtx.PriorSessionResumeUnavailable || task.PriorSessionResumeUnavailable {
+		t.Fatal("healthy resume was reported unavailable")
+	}
+}
+
+// TestGH8082HeaderCwdNotPriorWorkDir proves the gate reads header.cwd, not
+// task.PriorWorkDir: an existing PriorWorkDir cannot rescue a session whose
+// recorded cwd is gone, and vice versa.
+func TestGH8082HeaderCwdNotPriorWorkDir(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	existing := filepath.Join(base, "existing-c")
+	envDir := filepath.Join(base, "fresh-b")
+	for _, dir := range []string{existing, envDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create %s: %v", dir, err)
+		}
+	}
+	gone := filepath.Join(base, "deleted-a")
+
+	t.Run("existing PriorWorkDir does not rescue missing recorded cwd", func(t *testing.T) {
+		t.Parallel()
+		sessionPath := filepath.Join(base, "gone-session.jsonl")
+		writeGH8082Session(t, sessionPath, map[string]any{"cwd": gone}, "")
+		task := Task{PriorSessionID: sessionPath, PriorWorkDir: existing}
+		taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+		if gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default()) {
+			t.Fatal("reachable = true despite missing recorded cwd")
+		}
+		if task.PriorSessionID != "" {
+			t.Fatalf("PriorSessionID = %q, want empty", task.PriorSessionID)
+		}
+	})
+
+	t.Run("existing recorded cwd survives empty PriorWorkDir", func(t *testing.T) {
+		t.Parallel()
+		sessionPath := filepath.Join(base, "kept-session.jsonl")
+		writeGH8082Session(t, sessionPath, map[string]any{"cwd": existing}, "")
+		task := Task{PriorSessionID: sessionPath}
+		taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+		if !gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default()) {
+			t.Fatal("reachable = false despite existing recorded cwd")
+		}
+		if task.PriorSessionID != sessionPath {
+			t.Fatalf("PriorSessionID = %q, want %q", task.PriorSessionID, sessionPath)
+		}
+	})
+}
+
+// TestGH8082UndecidableHeaderStaysResumable: malformed or incomplete headers
+// must not become new drop reasons — only a confirmed-missing cwd narrows.
+func TestGH8082UndecidableHeaderStaysResumable(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]func(t *testing.T, path string){
+		"missing cwd": func(t *testing.T, path string) {
+			t.Helper()
+			writeGH8082Session(t, path, map[string]any{"version": 3}, "")
+		},
+		"empty cwd": func(t *testing.T, path string) {
+			t.Helper()
+			writeGH8082Session(t, path, map[string]any{"cwd": ""}, "")
+		},
+		"null cwd": func(t *testing.T, path string) {
+			t.Helper()
+			writeGH8082Session(t, path, map[string]any{"cwd": nil}, "")
+		},
+		"non-string cwd": func(t *testing.T, path string) {
+			t.Helper()
+			writeGH8082Session(t, path, map[string]any{"cwd": 42}, "")
+		},
+		"malformed JSON": func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.WriteFile(path, []byte("not json at all\n"), 0o644); err != nil {
+					t.Fatalf("write malformed: %v", err)
+				}
+		},
+		"non-session first line": func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+					t.Fatalf("write bare header: %v", err)
+				}
+		},
+		"relative cwd": func(t *testing.T, path string) {
+			t.Helper()
+			writeGH8082Session(t, path, map[string]any{"cwd": "some/relative/dir"}, "")
+		},
+		"oversize header": func(t *testing.T, path string) {
+			t.Helper()
+			pad := strings.Repeat("x", 64*1024+8) // piSessionHeaderLimit, inlined so this test compiles on base for RED
+			writeGH8082Session(t, path, map[string]any{"cwd": filepath.Join(t.TempDir(), "gone"), "pad": pad}, "")
+		},
+	}
+
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			base := t.TempDir()
+			envDir := filepath.Join(base, "workdir")
+			if err := os.MkdirAll(envDir, 0o755); err != nil {
+				t.Fatalf("create workdir: %v", err)
+				}
+			sessionPath := filepath.Join(base, "session.jsonl")
+			setup(t, sessionPath)
+			before, err := os.ReadFile(sessionPath)
+			if err != nil {
+					t.Fatalf("read before: %v", err)
+				}
+			task := Task{PriorSessionID: sessionPath, PriorWorkDir: envDir}
+			taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+			reachable := gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default())
+			if !reachable {
+				t.Fatalf("%s: undecidable header dropped a session", name)
+			}
+			if task.PriorSessionID != sessionPath {
+				t.Fatalf("%s: PriorSessionID changed to %q", name, task.PriorSessionID)
+			}
+			after, err := os.ReadFile(sessionPath)
+			if err != nil {
+					t.Fatalf("read after: %v", err)
+				}
+			if string(after) != string(before) {
+				t.Fatalf("%s: session file modified", name)
+			}
+		})
+	}
+}
+
+// TestGH8082HeaderFormatCompatibility is table-driven over line endings,
+// missing trailing newlines, unicode/space paths, and unknown header fields.
+func TestGH8082HeaderFormatCompatibility(t *testing.T) {
+	t.Parallel()
+
+	mkworld := func(t *testing.T) (recorded, envDir, base string) {
+		t.Helper()
+		base = t.TempDir()
+		recorded = filepath.Join(base, "work dir 한글")
+		envDir = filepath.Join(base, "fresh")
+		for _, dir := range []string{recorded, envDir} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("create %s: %v", dir, err)
+				}
+		}
+		return recorded, envDir, base
+	}
+	writeRaw := func(t *testing.T, path, line, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, append([]byte(line), body...), 0o644); err != nil {
+			t.Fatalf("write raw session: %v", err)
+			}
+	}
+	marshalHeader := func(t *testing.T, cwd string) string {
+		t.Helper()
+		raw, err := json.Marshal(map[string]any{
+				"type": "session", "version": 3, "id": "test-id",
+				"timestamp": "2026-09-06T00:00:00Z", "cwd": cwd,
+				"unknownFutureField": map[string]any{"nested": true},
+			})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+			}
+		return string(raw)
+	}
+
+	t.Run("existing cwd variants stay resumable", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct{ name, suffix, body string }{
+			{name: "LF", suffix: "\n", body: "{\"type\":\"message\"}\n"},
+			{name: "CRLF", suffix: "\r\n", body: "{\"type\":\"message\"}\r\n"},
+			{name: "no trailing newline", suffix: "", body: ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			recorded, envDir, base := mkworld(t)
+				sessionPath := filepath.Join(base, "s.jsonl")
+				writeRaw(t, sessionPath, marshalHeader(t, recorded)+tc.suffix, tc.body)
+				task := Task{PriorSessionID: sessionPath, PriorWorkDir: recorded}
+				taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+				if !gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default()) {
+					t.Fatalf("%s: existing recorded cwd dropped", tc.name)
+				}
+			})
+		}
+	})
+
+	t.Run("deleted cwd variants drop", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct{ name, suffix, body string }{
+			{name: "LF", suffix: "\n", body: "{\"type\":\"message\"}\n"},
+			{name: "CRLF", suffix: "\r\n", body: "{\"type\":\"message\"}\r\n"},
+			{name: "no trailing newline", suffix: "", body: ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			recorded, envDir, base := mkworld(t)
+				sessionPath := filepath.Join(base, "s.jsonl")
+				writeRaw(t, sessionPath, marshalHeader(t, recorded)+tc.suffix, tc.body)
+				if err := os.RemoveAll(recorded); err != nil {
+					t.Fatalf("delete recorded: %v", err)
+				}
+				task := Task{PriorSessionID: sessionPath, PriorWorkDir: recorded}
+				taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+				if gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default()) {
+					t.Fatalf("%s: deleted recorded cwd kept", tc.name)
+				}
+				if task.PriorSessionID != "" {
+					t.Fatalf("%s: PriorSessionID = %q, want empty", tc.name, task.PriorSessionID)
+				}
+			})
+		}
+	})
+}
+
+// TestGH8082OmpAndOtherProvidersUnaffected: the missing-cwd check is
+// Pi-only, so OMP keeps a deleted-cwd session reachable (prior behaviour)
+// and cwd-keyed providers are untouched.
+func TestGH8082OmpAndOtherProvidersUnaffected(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	recorded := filepath.Join(base, "recorded")
+	if err := os.MkdirAll(recorded, 0o755); err != nil {
+		t.Fatalf("create recorded: %v", err)
+	}
+	envDir := filepath.Join(base, "fresh")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatalf("create env: %v", err)
+	}
+	sessionPath := filepath.Join(base, "s.jsonl")
+	writeGH8082Session(t, sessionPath, map[string]any{"cwd": recorded}, "")
+	if err := os.RemoveAll(recorded); err != nil {
+		t.Fatalf("delete recorded: %v", err)
+	}
+
+	t.Run("omp keeps prior session-file behaviour", func(t *testing.T) {
+		t.Parallel()
+		task := Task{PriorSessionID: sessionPath, PriorWorkDir: recorded}
+		taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+		if !gateResumeToReachableSession(&task, &taskCtx, "omp", envDir, true, slog.Default()) {
+			t.Fatal("omp resume narrowed without recorded-cwd refusal evidence")
+		}
+		if task.PriorSessionID != sessionPath {
+			t.Fatalf("PriorSessionID = %q, want %q", task.PriorSessionID, sessionPath)
+		}
+	})
+
+	t.Run("claude still keys on workdir", func(t *testing.T) {
+		t.Parallel()
+		task := Task{PriorSessionID: "sess-1", PriorWorkDir: recorded}
+		taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+		if gateResumeToReachableSession(&task, &taskCtx, "claude", envDir, true, slog.Default()) {
+			t.Fatal("claude gate changed unexpectedly")
+		}
+	})
+}
+
 func TestSessionHomeReachable(t *testing.T) {
 	t.Parallel()
 
