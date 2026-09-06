@@ -30,7 +30,8 @@ cat > %[2]q
 printf '%%s\n' '{"type":"agent_start"}'
 printf '%%s\n' '{"type":"turn_start"}'
 printf '%%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"ok"}}'
-printf '%%s\n' '{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}}'
+printf '%%s\n' '{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","model":"test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}}'
+printf '%%s\n' '{"type":"agent_end"}'
 `, argvPath, stdinPath)
 
 	fakePath := filepath.Join(dir, "pi")
@@ -115,7 +116,8 @@ func TestPiExecuteLargePromptDoesNotDeadlock(t *testing.T) {
 yes '{"type":"noise","pad":"0123456789012345678901234567890123456789"}' | head -n 8000
 cat > %[1]q
 printf '%%s\n' '{"type":"agent_start"}'
-printf '%%s\n' '{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}}'
+printf '%%s\n' '{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","model":"test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}}'
+printf '%%s\n' '{"type":"agent_end"}'
 `, stdinPath)
 	fakePath := filepath.Join(dir, "pi")
 	writeTestExecutable(t, fakePath, []byte(script))

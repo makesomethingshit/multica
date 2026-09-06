@@ -57,7 +57,8 @@ func TestPiShimHelperProcess(t *testing.T) {
 	}
 
 	fmt.Println(`{"type":"agent_start"}`)
-	fmt.Println(`{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}}`)
+	fmt.Println(`{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","model":"test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2}}}`)
+	fmt.Println(`{"type":"agent_end"}`)
 	os.Exit(0)
 }
 

@@ -44,7 +44,8 @@ func TestRunTaskPiBusyRetryDoesNotRetireHealthySession(t *testing.T) {
 cat > /dev/null
 printf '%s\n' '{"type":"agent_start"}'
 printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"done"}}'
-printf '%s\n' '{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":1,"output":1}}}'
+printf '%s\n' '{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","model":"test","usage":{"input":1,"output":1}}}'
+printf '%s\n' '{"type":"agent_end"}'
 `
 	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake pi: %v", err)

@@ -88,7 +88,8 @@ func TestOmpExecuteDefaultsToOmpBinary(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"cat > /dev/null\n" +
 		"printf '%s\\n' '{\"type\":\"agent_start\"}'\n" +
-		"printf '%s\\n' '{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",\"model\":\"test\",\"usage\":{\"input\":1,\"output\":1}}}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"model\":\"test\",\"usage\":{\"input\":1,\"output\":1}}}'\n" +
+		"printf '%s\\n' '{\"type\":\"agent_end\"}'\n" +
 		"exit 0\n"
 	writeTestExecutable(t, fakePath, []byte(script))
 
@@ -178,7 +179,8 @@ func TestOmpExecuteCompletesFromEventStream(t *testing.T) {
 		`{"type":"agent_start"}`,
 		`{"type":"turn_start"}`,
 		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello from omp"}}`,
-		`{"type":"turn_end","message":{"role":"assistant","model":"omp-test","usage":{"input":10,"output":5}}}`,
+		`{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","model":"omp-test","usage":{"input":10,"output":5}}}`,
+		`{"type":"agent_end"}`,
 	}
 	fakePath := filepath.Join(t.TempDir(), "omp")
 	writeTestExecutable(t, fakePath, []byte(piEventStreamScript(events)))

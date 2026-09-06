@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,6 +12,92 @@ import (
 	"testing"
 	"time"
 )
+
+// Re-execute the test binary as a fake Pi on every OS, without a provider CLI.
+func TestPiEventStreamHelperProcess(t *testing.T) {
+	path := os.Getenv("MULTICA_PI_EVENT_STREAM_FIXTURE")
+	if path == "" {
+		t.Skip("subprocess fixture")
+	}
+	if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
+		os.Exit(1)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		os.Exit(1)
+	}
+	_, err = io.Copy(os.Stdout, f)
+	_ = f.Close()
+	if err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestPiExecuteRequiresTerminalEvidence(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const start = "{\"type\":\"agent_start\"}\n{\"type\":\"turn_start\"}\n"
+	const progress = "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"Checking the remaining conditions.\"}}\n"
+	const end = "{\"type\":\"agent_end\",\"willRetry\":false}\n"
+	turn := func(reason string) string {
+		return fmt.Sprintf("{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",\"model\":\"fixture\",\"stopReason\":%q,\"errorMessage\":\"provider error\"}}\n", reason)
+	}
+	for _, provider := range []string{"pi", "omp"} {
+		t.Run(provider, func(t *testing.T) {
+			for _, tc := range []struct{ name, events, status, errorText, output string }{
+				{"normal_stop", start + progress + turn("stop") + end, "completed", "", "Checking the remaining conditions."},
+				{"tool_only_stop", start + turn("toolUse") + end, "completed", "", ""},
+				{"empty_stream", "", "failed", "terminal", ""},
+				{"missing_turn_end", start + progress + end, "failed", "terminal", "Checking the remaining conditions."},
+				{"missing_agent_end", start + progress + turn("stop"), "failed", "terminal", "Checking the remaining conditions."},
+				{"truncated_json", start + progress + "{\"type\":\"turn_end\",\"message\":", "failed", "terminal", "Checking the remaining conditions."},
+				{"length_limit", start + progress + turn("length") + end, "failed", "output token limit", "Checking the remaining conditions."},
+				{"aborted", start + turn("aborted") + end, "aborted", "aborted", ""},
+				{"unknown_reason", start + turn("unexpected") + end, "failed", "stop reason", ""},
+				{"missing_reason", start + turn("") + end, "failed", "stop reason", ""},
+				{"provider_error", start + turn("error") + end, "failed", "provider error", ""},
+				{"retry_succeeds", start + turn("error") + "{\"type\":\"agent_end\",\"willRetry\":true}\n{\"type\":\"auto_retry_start\"}\n" + start + progress + turn("stop") + end + "{\"type\":\"auto_retry_end\",\"success\":true}\n", "completed", "", "Checking the remaining conditions."},
+				{"length_continues", start + turn("length") + "{\"type\":\"turn_start\"}\n" + progress + turn("stop") + end, "completed", "", "Checking the remaining conditions."},
+				{"later_turn_incomplete", start + turn("stop") + end + "{\"type\":\"turn_start\"}\n" + progress, "failed", "terminal", "Checking the remaining conditions."},
+				{"later_end_incomplete", start + turn("stop") + end + turn("stop"), "failed", "terminal", ""},
+				{"retry_pending", start + turn("stop") + "{\"type\":\"agent_end\",\"willRetry\":true}\n", "failed", "terminal", ""},
+				{"oversized_frame", start + progress + strings.Repeat("x", agentStreamMaxLineBytes+1) + "\n", "failed", "stream read failed", "Checking the remaining conditions."},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					dir := t.TempDir()
+					fixture := filepath.Join(dir, "events.jsonl")
+					if err := os.WriteFile(fixture, []byte(tc.events), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					backend, err := ResolveBackend(provider, Config{
+						ExecutablePath: executable,
+						LaunchPrefix:   []string{"-test.run=^TestPiEventStreamHelperProcess$", "--"},
+						Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+						Env:            map[string]string{"MULTICA_PI_EVENT_STREAM_FIXTURE": fixture},
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					session, err := backend.Execute(t.Context(), "fixture prompt", ExecOptions{
+						Cwd: dir, ResumeSessionID: filepath.Join(dir, "session.jsonl"), Timeout: 10 * time.Second,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					for range session.Messages {
+					}
+					result := <-session.Result
+					if result.Status != tc.status || result.Output != tc.output || !strings.Contains(result.Error, tc.errorText) || (tc.errorText == "" && result.Error != "") {
+						t.Fatalf("status=%q error=%q output=%q; want %q, error containing %q, output %q", result.Status, result.Error, result.Output, tc.status, tc.errorText, tc.output)
+					}
+				})
+			}
+		})
+	}
+}
 
 func TestBuildPiArgsNoToolAllowlist(t *testing.T) {
 	// Extension tools registered via Pi's registerTool() must not be
@@ -234,7 +321,8 @@ func TestPiExecuteAttachesStdinPipe(t *testing.T) {
 		"  fifo|*pipe*)\n" +
 		"    if [ \"$payload\" = 'prompt-over-stdin' ]; then\n" +
 		"      printf '%s\\n' '{\"type\":\"agent_start\"}'\n" +
-		"      printf '%s\\n' '{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",\"model\":\"test\",\"usage\":{\"input\":1,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":2}}}'\n" +
+		"      printf '%s\\n' '{\"type\":\"turn_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"stop\",\"model\":\"test\",\"usage\":{\"input\":1,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":2}}}'\n" +
+		"      printf '%s\\n' '{\"type\":\"agent_end\"}'\n" +
 		"      exit 0\n" +
 		"    fi\n" +
 		"    ;;\n" +
@@ -327,12 +415,13 @@ func TestPiExecuteRetainsOnlyLastTurnOutput(t *testing.T) {
 		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"intermediate"}}`,
 		`{"type":"tool_execution_start","toolCallId":"call_1","toolName":"bash","args":{"command":"echo hi"}}`,
 		`{"type":"tool_execution_end","toolCallId":"call_1","toolName":"bash","result":{"content":[{"type":"text","text":"hi"}]},"isError":false}`,
-		`{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":1,"output":1}}}`,
+		`{"type":"turn_end","message":{"role":"assistant","stopReason":"toolUse","model":"test","usage":{"input":1,"output":1}}}`,
 		`{"type":"turn_start"}`,
 		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"final"}}`,
 		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":" "}}`,
 		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"answer"}}`,
-		`{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":2,"output":2}}}`,
+		`{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","model":"test","usage":{"input":2,"output":2}}}`,
+		`{"type":"agent_end"}`,
 	}
 	fakePath := filepath.Join(t.TempDir(), "pi")
 	writeTestExecutable(t, fakePath, []byte(piEventStreamScript(events)))
@@ -430,7 +519,8 @@ func TestPiExecuteSucceedsWhenRetryFollowsTurnError(t *testing.T) {
 		`{"type":"agent_start"}`,
 		`{"type":"turn_start"}`,
 		`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"recovered"}}`,
-		`{"type":"turn_end","message":{"role":"assistant","model":"test","usage":{"input":2,"output":2}}}`,
+		`{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","model":"test","usage":{"input":2,"output":2}}}`,
+		`{"type":"agent_end"}`,
 	}
 	fakePath := filepath.Join(t.TempDir(), "pi")
 	writeTestExecutable(t, fakePath, []byte(piEventStreamScript(events)))

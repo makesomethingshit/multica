@@ -312,6 +312,8 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		finalStatus := "completed"
 		var finalError string
 		var lastTurnError string
+		var lastStopReason string
+		var turnEnded, agentEnded bool
 		usage := make(map[string]TokenUsage)
 
 		// Pi message_update events can be large (they embed the full message
@@ -331,12 +333,16 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 
 			switch evt.Type {
 			case "agent_start":
+				turnEnded, agentEnded = false, false
+				lastStopReason = ""
 				trySend(msgCh, Message{Type: MessageStatus, Status: "running"})
 
 			case "turn_start":
 				output.Reset()
 				textBuffer.Reset()
 				lastTurnError = ""
+				lastStopReason = ""
+				turnEnded, agentEnded = false, false
 
 			case "message_update":
 				if evt.AssistantMessageEvent == nil {
@@ -374,10 +380,13 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 				})
 
 			case "turn_end":
+				turnEnded, agentEnded = false, false
 				msg := decodePiMessage(evt.Message)
-				if msg == nil {
+				if msg == nil || msg.Role != "assistant" {
 					continue
 				}
+				turnEnded = true
+				lastStopReason = msg.StopReason
 				if msg.Usage != nil {
 					model := msg.Model
 					if model == "" {
@@ -404,6 +413,15 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 					}
 				}
 
+			case "agent_end":
+				// A turn can finish before Pi retries or runs another tool turn.
+				// Only the last completed loop is terminal evidence at process EOF.
+				agentEnded = turnEnded && !evt.WillRetry
+
+			case "auto_retry_start":
+				turnEnded, agentEnded = false, false
+				lastStopReason = ""
+
 			case "error":
 				errText := decodePiString(evt.Message)
 				trySend(msgCh, Message{Type: MessageError, Content: errText})
@@ -423,6 +441,13 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 				}
 			}
 		}
+		streamErr := scanner.Err()
+		streamFailed := streamErr != nil && runCtx.Err() == nil
+		if streamFailed {
+			// Once stdout cannot be consumed, the child may block writing to it.
+			// Cancel this owned process tree before waiting for its exit.
+			cancel()
+		}
 		if d := flushPiTextBuffer(&textBuffer); d != "" {
 			output.WriteString(d)
 			trySend(msgCh, Message{Type: MessageText, Content: d})
@@ -436,7 +461,10 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 		// child exited has returned by now. The writer sends exactly once.
 		writeErr := <-writeErrCh
 
-		if runCtx.Err() == context.DeadlineExceeded {
+		if streamFailed {
+			finalStatus = "failed"
+			finalError = fmt.Sprintf("%s stream read failed: %v", label, streamErr)
+		} else if runCtx.Err() == context.DeadlineExceeded {
 			finalStatus = "timeout"
 			finalError = fmt.Sprintf("%s timed out after %s", label, timeout)
 		} else if runCtx.Err() == context.Canceled {
@@ -469,7 +497,26 @@ func (b *piBackend) Execute(ctx context.Context, prompt string, opts ExecOptions
 			finalError = lastTurnError
 		}
 
-		b.cfg.Logger.Info(label+" finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
+		if finalStatus == "completed" {
+			switch {
+			case lastStopReason == "length":
+				finalStatus = "failed"
+				finalError = label + " ended at its output token limit"
+			case lastStopReason == "aborted":
+				finalStatus = "aborted"
+				finalError = label + " aborted the turn"
+			case !turnEnded || !agentEnded:
+				finalStatus = "failed"
+				finalError = fmt.Sprintf("%s stream ended without terminal events (turn_end=%t, agent_end=%t, stop_reason=%q)", label, turnEnded, agentEnded, lastStopReason)
+			case lastStopReason != "stop" && lastStopReason != "toolUse":
+				finalStatus = "failed"
+				finalError = fmt.Sprintf("%s ended with unsupported stop reason %q", label, lastStopReason)
+			}
+		}
+
+		b.cfg.Logger.Info(label+" finished", "pid", cmd.Process.Pid, "status", finalStatus,
+			"duration", duration.Round(time.Millisecond).String(),
+			"stop_reason", lastStopReason, "turn_end", turnEnded, "agent_end", agentEnded)
 
 		// Publish the terminal result only after the transcript is available to
 		// a follow-up run. The result channel is buffered, so relying on a defer
@@ -511,6 +558,9 @@ func piSessionBusyResult(label, sessionPath string) *Session {
 // demand by the switch arms.
 type piStreamEvent struct {
 	Type string `json:"type"`
+
+	// agent_end can precede an automatic retry rather than process completion.
+	WillRetry bool `json:"willRetry,omitempty"`
 
 	// message_update
 	AssistantMessageEvent *piAssistantMessageEvent `json:"assistantMessageEvent,omitempty"`
