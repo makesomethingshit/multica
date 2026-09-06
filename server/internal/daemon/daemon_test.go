@@ -2363,6 +2363,20 @@ func TestGH8082UndecidableHeaderStaysResumable(t *testing.T) {
 					t.Fatalf("write malformed: %v", err)
 				}
 		},
+		"trailing garbage after session header": func(t *testing.T, path string) {
+			t.Helper()
+			// A valid session prefix with trailing non-whitespace is
+			// undecidable (not a drop reason), even when the parsed cwd
+			// is a deleted absolute path.
+			gone := filepath.Join(t.TempDir(), "deleted")
+			raw, err := json.Marshal(map[string]any{"type": "session", "cwd": gone})
+			if err != nil {
+				t.Fatalf("marshal header: %v", err)
+				}
+			if err := os.WriteFile(path, append(append(raw, ' ', '{', '}', ' '), '\n'), 0o644); err != nil {
+					t.Fatalf("write trailing-garbage header: %v", err)
+				}
+		},
 		"non-session first line": func(t *testing.T, path string) {
 			t.Helper()
 			if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {

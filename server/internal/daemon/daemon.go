@@ -6243,7 +6243,15 @@ func piSessionRecordedCwdMissing(sessionPath string) bool {
 	}
 	line = bytes.TrimSuffix(line, []byte("\r"))
 	var header piSessionHeader
-	if err := json.NewDecoder(bytes.NewReader(line)).Decode(&header); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	if err := dec.Decode(&header); err != nil {
+		return false
+	}
+	// The first line must be exactly one JSON value: a valid session
+	// prefix with trailing garbage is undecidable, never a drop reason.
+	// A second decode must hit EOF (trailing whitespace alone still
+	// yields EOF); anything else decoded means trailing non-whitespace.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return false
 	}
 	if header.Type != "session" {
