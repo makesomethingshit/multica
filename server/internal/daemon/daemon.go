@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -6125,8 +6127,19 @@ func sameExistingDir(a, b string) bool {
 
 func gateResumeToReachableSession(task *Task, taskCtx *execenv.TaskContextForEnv, provider, envWorkDir string, sessionHomeReachable bool, taskLog *slog.Logger) bool {
 	var reachable bool
+	reason := "session_store_unreachable"
 	if providerUsesPiSessionFile(provider) {
 		reachable = piSessionFilePresent(task.PriorSessionID)
+		// Pi refuses to start when the recorded cwd of the session file it
+		// is given no longer exists (GH #8082), so a present file alone
+		// must not count as resumable. Pi-only: OMP shares the session-file
+		// plumbing but has no such recorded-cwd refusal evidence, and #7760
+		// keeps Pi-family resumes independent of workdir equality — only a
+		// confirmed-missing recorded cwd narrows the verdict here.
+		if reachable && provider == "pi" && piSessionRecordedCwdMissing(task.PriorSessionID) {
+			reachable = false
+			reason = "recorded_cwd_missing"
+		}
 	} else {
 		// Compare the directories, not the spelling. Reuse runs in the canonical
 		// path it validated and locked, which need not be character-identical to
@@ -6138,6 +6151,7 @@ func gateResumeToReachableSession(task *Task, taskCtx *execenv.TaskContextForEnv
 	if !reachable && task.PriorSessionID != "" {
 		taskLog.Info("dropping prior session: session store not reachable from this run",
 			"provider", provider,
+			"reason", reason,
 			"session_id", task.PriorSessionID,
 			"prior_workdir", task.PriorWorkDir,
 			"workdir", envWorkDir,
@@ -6173,6 +6187,51 @@ func piSessionFilePresent(sessionID string) bool {
 	}
 	info, err := os.Stat(sessionID)
 	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+}
+
+// piSessionHeaderLimit caps how much of a Pi session file the resume gate
+// reads. It is a defensive read bound for this check, not Pi's official
+// header limit; anything larger is treated as undecidable, never as missing.
+const piSessionHeaderLimit = 64 * 1024
+
+// piSessionRecordedCwdMissing reports whether a Pi session file's recorded
+// working directory is confirmed absent (GH #8082). It answers only that:
+// true when the header's cwd is provably gone, false when it exists or when
+// the answer cannot be determined (unreadable file, oversized or malformed
+// header, missing/empty/non-string/relative cwd, non-session first line).
+// Undecidable stays resumable here so this check never invents new reasons
+// to discard a session beyond the one Pi itself refuses to start with.
+// The file is opened read-only and callers must preserve it; nothing here
+// creates, modifies, or recreates any path.
+func piSessionRecordedCwdMissing(sessionPath string) bool {
+	f, err := os.Open(sessionPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, piSessionHeaderLimit+1))
+	if err != nil || len(raw) > piSessionHeaderLimit {
+		return false
+	}
+	// The cwd lives in the first-line session header; the transcript body
+	// below it is never searched.
+	if i := bytes.IndexByte(raw, '\n'); i >= 0 {
+		raw = raw[:i]
+	}
+	raw = bytes.TrimSuffix(raw, []byte("\r"))
+	var header map[string]any
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return false
+	}
+	if header["type"] != "session" {
+		return false
+	}
+	cwd, ok := header["cwd"].(string)
+	if !ok || cwd == "" || !filepath.IsAbs(cwd) {
+		return false
+	}
+	_, err = os.Stat(cwd)
+	return err != nil && os.IsNotExist(err)
 }
 
 // sessionHomeReachable reports whether a session recorded by a prior task on
