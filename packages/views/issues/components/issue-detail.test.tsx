@@ -21,6 +21,12 @@ const mockViewport = vi.hoisted(() => ({ isMobile: false }));
 // Counts MockContentEditor mounts. This pins the description to exactly one
 // eager editor per issue and catches stale editor reuse across issue switches.
 const contentEditorMounts = vi.hoisted(() => ({ count: 0 }));
+// The real ContentEditor returns null until Tiptap has mounted. Hold that
+// transition so the detail suite can assert what stays visible meanwhile.
+const contentEditorReady = vi.hoisted(() => ({
+  defer: false,
+  resolve: null as (() => void) | null,
+}));
 // Stable empty-attachments reference: the real store returns a shared constant
 // so the `useCommentDraftStore(s => s.getAttachments(key))` selector keeps a
 // stable identity. A fresh `[]` per call would loop useSyncExternalStore.
@@ -183,13 +189,22 @@ vi.mock("../../editor", async () => ({
     const valueRef = useRef(initialValue);
     const baseRef = useRef(initialValue);
     const [editorValue, setEditorValue] = useState(initialValue);
+    const [ready, setReady] = useState(!contentEditorReady.defer);
     // Mirrors the real editor's dirty guard: once the user has typed, an
     // external `value` change is refused so it cannot clobber unsaved bytes.
     // Only the imperative adoptContent channel lands after that point.
     const dirtyRef = useRef(false);
     useEffect(() => {
       contentEditorMounts.count += 1;
-      onReady?.();
+      const markReady = () => {
+        setReady(true);
+        onReady?.();
+      };
+      if (contentEditorReady.defer) contentEditorReady.resolve = markReady;
+      else markReady();
+      return () => {
+        if (contentEditorReady.resolve === markReady) contentEditorReady.resolve = null;
+      };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
     useEffect(() => {
@@ -226,6 +241,7 @@ vi.mock("../../editor", async () => ({
       settleUploadPlaceholder: () => false,
       uploadFile: () => {},
     }));
+    if (!ready) return null;
     return (
       <textarea
         value={editorValue}
@@ -689,6 +705,8 @@ describe("IssueDetail (shared)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     contentEditorMounts.count = 0;
+    contentEditorReady.defer = false;
+    contentEditorReady.resolve = null;
     mockViewport.isMobile = false;
     // Default: issue loads successfully
     mockApiObj.getIssue.mockResolvedValue(mockIssue);
@@ -817,6 +835,39 @@ describe("IssueDetail (shared)", () => {
     expect(screen.queryByTestId("title-editor")).not.toBeInTheDocument();
     expect(screen.getAllByTestId("rich-text-editor")).toHaveLength(1);
     expect(contentEditorMounts.count).toBe(1);
+  });
+
+  it("keeps cached description visible while its editor initializes during a background refresh", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, gcTime: 0, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    queryClient.setQueryData(["issues", "ws-1", "detail", "issue-1"], mockIssue);
+    mockApiObj.getIssue.mockReturnValue(new Promise(() => {}));
+    contentEditorReady.defer = true;
+
+    render(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail issueId="issue-1" />
+        </QueryClientProvider>
+      </I18nProvider>,
+    );
+
+    const readonlyDescription = () =>
+      screen
+        .queryAllByTestId("readonly-content")
+        .filter((element) => element.textContent === "Add JWT auth to the backend");
+
+    await waitFor(() => expect(mockApiObj.getIssue).toHaveBeenCalledWith("issue-1"));
+    expect(readonlyDescription()).toHaveLength(1);
+    expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
+
+    act(() => contentEditorReady.resolve?.());
+    expect(await screen.findByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
+    expect(readonlyDescription()).toHaveLength(0);
   });
 
   it("reconciles a cached list snapshot so source context appears on first entry", async () => {
@@ -958,13 +1009,27 @@ describe("IssueDetail (shared)", () => {
 
     await screen.findByDisplayValue("Add JWT auth to the backend");
     const mountsBeforeSwitch = contentEditorMounts.count;
+    contentEditorReady.defer = true;
 
     rerender(ui("issue-2"));
 
-    expect(await screen.findByDisplayValue("Second description")).toBeInTheDocument();
+    expect(await screen.findByText("Second description")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Second description")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
     expect(screen.queryByTestId("title-editor")).not.toBeInTheDocument();
     expect(contentEditorMounts.count).toBe(mountsBeforeSwitch + 1);
+
+    act(() => contentEditorReady.resolve?.());
+    expect(await screen.findByDisplayValue("Second description")).toBeInTheDocument();
+
+    contentEditorReady.defer = true;
+    rerender(ui("issue-1"));
+
+    expect(await screen.findByText("Add JWT auth to the backend")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
+
+    act(() => contentEditorReady.resolve?.());
+    expect(await screen.findByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
   });
 
   it("renders the issue title leaf as a link to the issue detail page", async () => {
