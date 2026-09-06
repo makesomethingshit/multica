@@ -2247,21 +2247,24 @@ func TestGH8082MissingRecordedCwdDropsPiResume(t *testing.T) {
 		t.Fatalf("recorded dir was recreated by the gate: %v", err)
 	}
 	// §6H execution evidence lives in TestGH8082GateToBackendHandoff below:
-	// the cleared PriorSessionID feeds a real Pi backend Execute against a
-	// fake Pi CLI, which observes the fresh --session path and cwd.
+	// a stale-session task runs through production d.runTask against a
+	// fake Pi CLI, which observes the fresh --session path, cwd, and prompt.
 }
 
-// TestGH8082GateToBackendHandoff runs the §6H chain end to end at the
-// gate→backend boundary with production code throughout:
+// TestGH8082GateToBackendHandoff drives a stale-session task through the
+// production d.runTask glue end to end — no test-side gate call, no manual
+// ResumeSessionID injection:
 //
 //  1. stale session S with deleted recorded cwd A is prepared;
-//  2. the real gate drops the resume (PriorSessionID cleared, notice set);
-//  3. the cleared id is passed as ResumeSessionID into a real Pi backend
-//     Execute against a fake Pi CLI (OS-appropriate script) that records
-//     the argv it received and the cwd it ran in;
+//  2. the task enters production runTask with PriorSessionID=S; the in-run
+//     gate drops the resume, so the backend receives ResumeSessionID=""
+//     through the runTask→ExecOptions glue (daemon.go runTask);
+//  3. a fake Pi CLI (OS-appropriate script) records the argv, cwd, and
+//     stdin prompt it received, then emits one successful turn;
 //  4. the fake observes --session S2 (never the stale S), cwd B, and the
-//     backend returns SessionID S2 with a completed fake turn;
-//  5. BuildPrompt on the gated task still carries the continuity notice.
+//     runTask result carries SessionID S2;
+//  5. the stdin prompt the fake received carries the continuity notice, so
+//     the drop is disclosed in actual runTask output, not re-rendered here.
 //
 // A fake CLI success is a plumbing proof, not a real-Pi run: it shows the
 // stale path no longer reaches --session and the fresh path does.
@@ -2274,58 +2277,77 @@ func TestGH8082GateToBackendHandoff(t *testing.T) {
 	if err := os.MkdirAll(recorded, 0o755); err != nil {
 		t.Fatalf("create recorded dir: %v", err)
 	}
-	envDir := filepath.Join(base, "fresh-b")
-	if err := os.MkdirAll(envDir, 0o755); err != nil {
-		t.Fatalf("create env dir: %v", err)
-	}
 	sessionPath := filepath.Join(base, "pi-session.jsonl")
 	writeGH8082Session(t, sessionPath, map[string]any{"cwd": recorded}, "")
 	if err := os.RemoveAll(recorded); err != nil {
 		t.Fatalf("delete recorded dir: %v", err)
 	}
 
-	// Step 2: the production gate.
-	task := Task{PriorSessionID: sessionPath, PriorWorkDir: recorded}
-	taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
-	if gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default()) {
-		t.Fatal("reachable = true for a Pi session whose recorded cwd is gone")
-	}
-	if task.PriorSessionID != "" {
-		t.Fatalf("PriorSessionID = %q, want empty for the backend call", task.PriorSessionID)
-	}
-
-	// Step 3: fake Pi CLI recording argv and cwd. keep HOME/USERPROFILE
-	// inside temp so the backend's fresh session path cannot touch a real
-	// profile.
+	// Fake Pi CLI recording argv, cwd, and the stdin prompt. HOME/USERPROFILE
+	// stay inside temp so the fresh session path cannot touch a real profile.
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	argvFile := filepath.Join(base, "observed-argv.txt")
 	cwdFile := filepath.Join(base, "observed-cwd.txt")
+	stdinFile := filepath.Join(base, "observed-stdin.txt")
 	t.Setenv("GH8082_OBSERVE_ARGV", argvFile)
 	t.Setenv("GH8082_OBSERVE_CWD", cwdFile)
-	execPath := writeGH8082FakePi(t, base)
+	t.Setenv("GH8082_OBSERVE_STDIN", stdinFile)
+	fakeBin := writeGH8082FakePi(t, base)
 
-	backend, err := agent.New("pi", agent.Config{ExecutablePath: execPath, Logger: slog.Default()})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	d := &Daemon{
+		client:         NewClient(srv.URL),
+		logger:         logger,
+		workspaces:     make(map[string]*workspaceState),
+		runtimeIndex:   map[string]Runtime{"rt-pi": {ID: "rt-pi", Provider: "pi"}},
+		activeEnvRoots: make(map[string]int),
+		resolvedPaths:  make(map[string]healedAgent),
+		agentVersions:  make(map[string]string),
+		cfg: Config{
+			WorkspacesRoot: t.TempDir(),
+			AgentTimeout:   60 * time.Second,
+			ServerBaseURL:  srv.URL,
+			Agents: map[string]AgentEntry{
+				"pi": {Path: fakeBin},
+			},
+		},
+	}
+	// PriorWorkDir names the deleted recorded dir: reuse refuses it and
+	// runTask prepares a fresh B, matching the real GH8082 shape.
+	task := Task{
+		ID:             "task-gh8082-handoff",
+		WorkspaceID:    "ws-gh8082",
+		RuntimeID:      "rt-pi",
+		IssueID:        "issue-gh8082",
+		AgentID:        "agent-gh8082",
+		AuthToken:      "mat_gh8082_handoff",
+		PriorSessionID: sessionPath,
+		PriorWorkDir:   recorded,
+		Agent: &AgentData{
+			ID:   "agent-gh8082",
+			Name: "gh8082-agent",
+		},
+	}
+
+	result, err := d.runTask(context.Background(), task, "pi", 0, logger)
 	if err != nil {
-		t.Fatalf("agent.New(pi): %v", err)
+		t.Fatalf("runTask: %v", err)
 	}
-	session, err := backend.Execute(t.Context(), "follow-up prompt", agent.ExecOptions{
-		Cwd:             envDir,
-		ResumeSessionID: task.PriorSessionID, // empty after the gate drop
-		Timeout:         60 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("backend Execute: %v", err)
-	}
-	for range session.Messages {
-	}
-	result, ok := <-session.Result
-	if !ok {
-		t.Fatal("result channel closed without a value")
-	}
-	if result.Status != "completed" {
+	if result.Status != "completed" || result.Comment != "done" {
 		t.Fatalf("result = %+v, want completed fake turn", result)
+	}
+	if result.SessionID == "" || result.SessionID == sessionPath {
+		t.Fatalf("SessionID = %q, want a fresh path, never the stale %q", result.SessionID, sessionPath)
+	}
+	if result.RetiredSessionID != "" {
+		t.Fatalf("RetiredSessionID = %q, want empty: the gate drops the resume before launch, no retry needed", result.RetiredSessionID)
 	}
 
 	// Step 4: what the fake CLI observed.
@@ -2355,24 +2377,30 @@ func TestGH8082GateToBackendHandoff(t *testing.T) {
 	if result.SessionID != observed {
 		t.Fatalf("SessionID = %q, want the observed fresh --session %q", result.SessionID, observed)
 	}
-	if strings.TrimSpace(strings.TrimPrefix(string(gotCwd), "\ufeff")) != envDir {
-		t.Fatalf("cli cwd = %q, want prepared workdir %q", strings.TrimSpace(string(gotCwd)), envDir)
+	if got, want := strings.TrimSpace(strings.TrimPrefix(string(gotCwd), "\ufeff")), result.WorkDir; got != want {
+		t.Fatalf("cli cwd = %q, want prepared workdir %q", got, want)
+	}
+	if result.WorkDir == recorded {
+		t.Fatalf("WorkDir = %q, want a fresh dir, never the deleted recorded %q", result.WorkDir, recorded)
 	}
 
-	// Step 5: the drop is still disclosed, not silently restarted.
-	if !taskCtx.PriorSessionResumeUnavailable || !task.PriorSessionResumeUnavailable {
-		t.Fatal("resume-unavailable notice missing on task or taskCtx")
+	// The drop is disclosed in the actual runTask prompt the fake received
+	// on stdin — not re-rendered here.
+	stdinRaw, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatalf("fake Pi never recorded stdin: %v", err)
 	}
-	if prompt := BuildPrompt(task, "pi"); !strings.Contains(prompt, sessionContinuityNoticeFor(task)) {
-		t.Fatal("BuildPrompt lost the continuity notice after the gate drop")
+	if !strings.Contains(string(stdinRaw), execenv.SessionContinuityNoticeIssue) {
+		t.Fatal("runTask prompt lost the continuity notice after the gate drop")
 	}
 }
 
 // writeGH8082FakePi installs an OS-appropriate fake Pi CLI: on Unix a shell
 // script, on Windows a pi.cmd + sibling pi.ps1 pair routed through the real
-// PowerShell invocation path. Both record argv and cwd to the files named by
-// GH8082_OBSERVE_ARGV / GH8082_OBSERVE_CWD, drain stdin, and emit one
-// successful turn. Returns the ExecutablePath for agent.New.
+// PowerShell invocation path. Both record argv, cwd, and the stdin prompt to
+// the files named by GH8082_OBSERVE_ARGV / GH8082_OBSERVE_CWD /
+// GH8082_OBSERVE_STDIN, then emit one successful turn. Returns the
+// ExecutablePath for the daemon's pi agent entry.
 func writeGH8082FakePi(t *testing.T, base string) string {
 	t.Helper()
 
@@ -2386,7 +2414,13 @@ func writeGH8082FakePi(t *testing.T, base string) string {
 		}
 		// events lines are already single-quoted; the JSON inside uses
 		// only double quotes, so no escaping is needed.
-		ps1 := "$null = $input\r\n" +
+		// Copy the raw stdin bytes, not text: the backend routes through a
+		// powershell -Command wrapper, under which script-scope $input does
+		// not see the piped prompt, and [Console]::In decodes through the
+		// console codepage, mangling non-ASCII (em-dash in the notice).
+		ps1 := "$stdinOut = [IO.File]::OpenWrite($env:GH8082_OBSERVE_STDIN)\r\n" +
+			"[Console]::OpenStandardInput().CopyTo($stdinOut)\r\n" +
+			"$stdinOut.Close()\r\n" +
 			"$args | Out-File -FilePath $env:GH8082_OBSERVE_ARGV -Encoding utf8\r\n" +
 			"(Get-Location).Path | Out-File -FilePath $env:GH8082_OBSERVE_CWD -Encoding utf8\r\n" +
 			strings.ReplaceAll(events, "\n", "\r\n") + "\r\n"
@@ -2397,9 +2431,9 @@ func writeGH8082FakePi(t *testing.T, base string) string {
 	}
 	fakeBin := filepath.Join(base, "pi")
 	script := "#!/bin/sh\n" +
+		"cat > \"${GH8082_OBSERVE_STDIN:-/dev/null}\"\n" +
 		"printf '%s\\n' \"$@\" > \"${GH8082_OBSERVE_ARGV}\"\n" +
 		"pwd > \"${GH8082_OBSERVE_CWD}\"\n" +
-		"cat > /dev/null\n" +
 		"printf '%s\\n' " + events + "\n"
 	if err := os.WriteFile(fakeBin, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake pi: %v", err)
