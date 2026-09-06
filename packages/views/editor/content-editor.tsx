@@ -223,10 +223,9 @@ interface ContentEditorBaseProps {
    */
   flushPendingOnUnmount?: boolean;
   /**
-   * Called once when the Tiptap instance exists and its initial content is
-   * set (creation is deferred past first paint by `immediatelyRender: false`).
-   * Readonly-first hosts such as comment and reply composers use this as the
-   * signal to swap their static shell for the live editor.
+   * Called once the initial content has reached the editor DOM (creation is
+   * deferred past first paint by `immediatelyRender: false`). Readonly-first
+   * hosts use this to swap their static shell for the live editor.
    */
   onReady?: () => void;
 }
@@ -558,6 +557,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     // Large markdown is parsed in chunks to dodge marked's O(n²) tokenizer (see
     // parseMarkdownChunked). Small docs stay on the single-parse fast path.
     const mountChunked = initialContent.length > MARKDOWN_CHUNK_THRESHOLD;
+    const [initialContentReady, setInitialContentReady] = useState(false);
 
     const editor = useEditor({
       immediatelyRender: false,
@@ -591,6 +591,10 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
           focusOnReadyRef.current = false;
           ed.commands.focus("end");
         }
+        // `setContent` above updates the ProseMirror DOM synchronously. Signal
+        // hosts from the following effect so a static fallback never swaps to
+        // the empty chunked editor document.
+        setInitialContentReady(true);
       },
       content: mountChunked ? "" : initialContent,
       contentType: mountChunked
@@ -684,15 +688,13 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       },
     });
 
-    // Signal hosts that the deferred editor instance now exists. Fired from a
-    // passive effect (not `onCreate`) so it runs after the commit in which
-    // <EditorContent> attached the editor DOM — callers can measure/focus it.
+    // Signal hosts only after onCreate has populated the initial document.
     const readyFiredRef = useRef(false);
     useEffect(() => {
-      if (!editor || readyFiredRef.current) return;
+      if (!initialContentReady || readyFiredRef.current) return;
       readyFiredRef.current = true;
       onReadyRef.current?.();
-    }, [editor]);
+    }, [initialContentReady]);
 
     // Publish upload-queue transitions to the host so it can gate submit.
     //
