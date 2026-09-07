@@ -1,367 +1,122 @@
-import { describe, expect, it, vi } from "vitest";
-import { render, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, render, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { createRef, useLayoutEffect, useState } from "react";
+import { createRef, Profiler, StrictMode, type ReactNode } from "react";
+import type { Editor } from "@tiptap/react";
+import { MarkdownManager } from "@tiptap/markdown";
 import { ContentEditor, type ContentEditorRef } from "./content-editor";
-import { ReadonlyContent } from "./readonly-content";
 import { MARKDOWN_CHUNK_THRESHOLD } from "./utils/parse-markdown-chunked";
 
-vi.mock("../i18n", () => ({
-  useT: () => ({ t: () => "" }),
-}));
+vi.mock("../i18n", () => ({ useT: () => ({ t: () => "" }) }));
 
-const chunkedDescriptionParagraphCount = 500;
-const chunkedDescription = Array.from(
-  { length: chunkedDescriptionParagraphCount },
-  (_, index) => `Chunked description paragraph ${index}.`,
-).join("\n\n");
-const shortDescription = "Short description.";
-const mixedDescription = [
-  "# Actual renderer heading",
-  "",
-  "- First list item",
-  "- Second list item",
-  "",
-  "| Name | Value |",
-  "| --- | --- |",
-  "| renderer | ready |",
-  "",
-  "```ts",
-  "const ready = true;",
-  "```",
-].join("\n");
-const imageDescription = "![Actual renderer image](https://example.test/issue-description.png)";
+const long = Array.from({ length: 500 }, (_, i) => `Paragraph ${i}. Long cached description.`).join("\n\n");
+const cases = [
+  { name: "empty", markdown: "", selector: "p", count: 1, first: "", last: "" },
+  { name: "short", markdown: "Short description.", selector: "p", count: 1, first: "Short description.", last: "Short description." },
+  { name: "chunked", markdown: long, selector: "p", count: 500, first: "Paragraph 0.", last: "Paragraph 499." },
+  { name: "mixed", markdown: "# Heading\n\nParagraph.\n\n- First\n- Second\n\n```ts\nconst ready = true;\n```", selector: "h1, li, pre", count: 4, first: "Heading", last: "const ready = true;" },
+  { name: "image", markdown: "Before image.\n\n![Image](https://example.test/image.png)\n\nAfter image.", selector: "img", count: 1, first: "Before image.", last: "After image." },
+];
 
-function ActualRendererTransitionHost({
-  issueId,
-  value,
-  onReady,
-}: {
-  issueId: string;
-  value: string;
-  onReady?: (issueId: string) => void;
-}) {
-  const [ready, setReady] = useState(false);
-
-  useLayoutEffect(() => {
-    setReady(false);
-  }, [issueId]);
-
-  return (
-    <div data-testid="actual-renderer-transition">
-      {!ready && (
-        <ReadonlyContent content={value} className="actual-renderer-transition-fallback" />
-      )}
-      <div className={ready ? undefined : "hidden"}>
-        <ContentEditor
-          key={issueId}
-          value={value}
-          onReady={() => {
-            onReady?.(issueId);
-            setReady(true);
-          }}
-        />
-      </div>
-    </div>
-  );
+function host(children: ReactNode) {
+  return <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>{children}</QueryClientProvider>;
 }
 
-describe("ContentEditor initial readiness (real editor)", () => {
-  it("signals once and leaves an empty editor usable", async () => {
-    const onReady = vi.fn();
+function mountedEditor(): Editor {
+  return (document.querySelector(".ProseMirror") as HTMLElement & { editor: Editor }).editor;
+}
+
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+describe("ContentEditor initial document (real Tiptap)", () => {
+  // The content matrix belongs here. Paint/geometry are covered by Playwright,
+  // not JSDOM; IssueDetail only tests eager wiring and issue identity.
+  it.each(cases)("commits $name content before create and reports connected, usable DOM once", async ({ markdown, selector, count, first, last }) => {
+    vi.useFakeTimers();
+    const parse = vi.spyOn(MarkdownManager.prototype, "parse");
+    const snapshots: string[] = [];
     const ref = createRef<ContentEditorRef>();
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
-
-    render(
-      <QueryClientProvider client={queryClient}>
-        <ContentEditor ref={ref} value="" onReady={onReady} />
-      </QueryClientProvider>,
-    );
-
-    await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1));
-    expect(ref.current).not.toBeNull();
-    expect(ref.current!.getMarkdown()).toBe("");
-    expect(document.querySelector(".ProseMirror")).toHaveAttribute("contenteditable", "true");
-    expect(() => ref.current!.focus()).not.toThrow();
-  });
-
-  it("signals once after short initial content reaches the editor DOM", async () => {
-    const onReadyDomContents: string[] = [];
     const onReady = vi.fn(() => {
-      onReadyDomContents.push(document.querySelector(".ProseMirror")?.textContent ?? "");
+      const dom = document.querySelector(".ProseMirror")!;
+      expect(dom.isConnected).toBe(true);
+      expect(dom).toHaveAttribute("contenteditable", "true");
+      snapshots.push(dom.innerHTML);
+      expect(ref.current).not.toBeNull();
     });
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
-
-    expect(shortDescription.length).toBeLessThan(MARKDOWN_CHUNK_THRESHOLD);
-
-    render(
-      <QueryClientProvider client={queryClient}>
-        <ContentEditor value={shortDescription} onReady={onReady} />
-      </QueryClientProvider>,
-    );
-
-    await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1));
-    expect(onReadyDomContents).toEqual([shortDescription]);
-  });
-
-  it("does not remove its fallback until a chunked initial body reaches the editor DOM", async () => {
-    const fallbackRemovalSnapshots: Array<{
-      textLength: number;
-      paragraphCount: number;
-      firstParagraph: string;
-      lastParagraph: string;
-    }> = [];
-    const onReady = vi.fn();
-    const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
-
-    function Host() {
-      const [ready, setReady] = useState(false);
-
-      useLayoutEffect(() => {
-        if (ready) {
-          const editor = document.querySelector(".ProseMirror");
-          const paragraphs = Array.from(editor?.querySelectorAll("p") ?? []);
-          fallbackRemovalSnapshots.push({
-            textLength: editor?.textContent?.length ?? 0,
-            paragraphCount: paragraphs.length,
-            firstParagraph: paragraphs[0]?.textContent ?? "",
-            lastParagraph: paragraphs.at(-1)?.textContent ?? "",
-          });
-        }
-      }, [ready]);
-
-      return (
-        <>
-          {!ready && <div>Cached long description</div>}
-          <div className={ready ? undefined : "hidden"}>
-            <ContentEditor
-              value={chunkedDescription}
-              onReady={() => {
-                onReady();
-                setReady(true);
-              }}
-            />
-          </div>
-        </>
-      );
-    }
-
-    expect(chunkedDescription.length).toBeGreaterThan(MARKDOWN_CHUNK_THRESHOLD);
-
-    render(
-      <QueryClientProvider client={queryClient}>
-        <Host />
-      </QueryClientProvider>,
-    );
-
-    await waitFor(
-      () => expect(fallbackRemovalSnapshots).toHaveLength(1),
-      { timeout: 5_000 },
-    );
+    render(host(<StrictMode><ContentEditor ref={ref} value={markdown} onReady={onReady} showBubbleMenu={false} /></StrictMode>));
+    await act(async () => {});
+    const dom = document.querySelector(".ProseMirror")!;
+    expect(dom.textContent).toContain(first);
+    expect(dom.textContent).toContain(last);
+    expect(dom.querySelectorAll(selector)).toHaveLength(count);
+    expect(onReady).not.toHaveBeenCalled();
+    const beforeCreate = dom.innerHTML;
+    await act(() => vi.advanceTimersByTimeAsync(1));
     expect(onReady).toHaveBeenCalledTimes(1);
-    expect(fallbackRemovalSnapshots[0]).toEqual({
-      textLength: expect.any(Number),
-      paragraphCount: chunkedDescriptionParagraphCount,
-      firstParagraph: "Chunked description paragraph 0.",
-      lastParagraph: "Chunked description paragraph 499.",
-    });
-    expect(fallbackRemovalSnapshots[0]?.textLength).toBeGreaterThan(0);
+    expect(snapshots).toEqual([beforeCreate]);
+    expect(mountedEditor().isInitialized).toBe(true);
+    expect(long.length).toBeGreaterThan(MARKDOWN_CHUNK_THRESHOLD);
+    if (markdown === long) {
+      expect(parse).toHaveBeenCalled();
+      expect(parse.mock.calls.every(([chunk]) => chunk.length < MARKDOWN_CHUNK_THRESHOLD)).toBe(true);
+    }
   });
 
-  describe("actual ReadonlyContent to ContentEditor transitions", () => {
-    const transitionCases = [
-      {
-        name: "short body",
-        value: shortDescription,
-        assertReadonly: (host: HTMLElement) => {
-          const fallback = host.querySelector("[data-rich-content]");
-          expect(fallback?.querySelector("p")?.textContent).toBe(shortDescription);
-        },
-        assertEditor: (host: HTMLElement) => {
-          expect(host.querySelector(".ProseMirror p")?.textContent).toBe(shortDescription);
-        },
-      },
-      {
-        name: "long body",
-        value: chunkedDescription,
-        assertReadonly: (host: HTMLElement) => {
-          const paragraphs = Array.from(
-            host.querySelectorAll("[data-rich-content] p"),
-          );
-          expect(paragraphs).toHaveLength(chunkedDescriptionParagraphCount);
-          expect(paragraphs[0]?.textContent).toBe("Chunked description paragraph 0.");
-          expect(paragraphs.at(-1)?.textContent).toBe("Chunked description paragraph 499.");
-        },
-        assertEditor: (host: HTMLElement) => {
-          const paragraphs = Array.from(host.querySelectorAll(".ProseMirror p"));
-          expect(paragraphs).toHaveLength(chunkedDescriptionParagraphCount);
-          expect(paragraphs[0]?.textContent).toBe("Chunked description paragraph 0.");
-          expect(paragraphs.at(-1)?.textContent).toBe("Chunked description paragraph 499.");
-        },
-      },
-      {
-        name: "heading, list, table, and code body",
-        value: mixedDescription,
-        assertReadonly: (host: HTMLElement) => {
-          const fallback = host.querySelector("[data-rich-content]");
-          expect(fallback?.querySelector("h1")?.textContent).toBe("Actual renderer heading");
-          expect(fallback?.querySelectorAll("ul > li")).toHaveLength(2);
-          expect(fallback?.querySelector(".tableWrapper table")).not.toBeNull();
-          expect(fallback?.querySelector("pre code")?.textContent).toContain(
-            "const ready = true;",
-          );
-        },
-        assertEditor: (host: HTMLElement) => {
-          const editor = host.querySelector(".ProseMirror");
-          expect(editor?.querySelector("h1")?.textContent).toBe("Actual renderer heading");
-          expect(editor?.querySelectorAll("ul > li")).toHaveLength(2);
-          expect(editor?.querySelector("table")).not.toBeNull();
-          expect(editor?.querySelector("pre code")?.textContent).toContain(
-            "const ready = true;",
-          );
-        },
-      },
-      {
-        name: "image body",
-        value: imageDescription,
-        assertReadonly: (host: HTMLElement) => {
-          const image = host.querySelector<HTMLImageElement>(
-            "[data-rich-content] img.image-content",
-          );
-          expect(image?.alt).toBe("Actual renderer image");
-          expect(image?.src).toBe("https://example.test/issue-description.png");
-        },
-        assertEditor: (host: HTMLElement) => {
-          const image = host.querySelector<HTMLImageElement>(".ProseMirror img.image-content");
-          expect(image?.alt).toBe("Actual renderer image");
-          expect(image?.src).toBe("https://example.test/issue-description.png");
-        },
-      },
-    ];
+  it("retains and flushes the first edit made before create", async () => {
+    vi.useFakeTimers();
+    const onUpdate = vi.fn();
+    const view = render(host(<ContentEditor value={long} onUpdate={onUpdate} flushPendingOnUnmount debounceMs={1500} showBubbleMenu={false} />));
+    expect(mountedEditor().isInitialized).toBe(false);
+    act(() => { mountedEditor().commands.insertContent("FIRSTEDIT "); });
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(mountedEditor().getMarkdown()).toContain("FIRSTEDIT");
+    view.unmount();
+    expect(onUpdate).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("FIRSTEDIT"), long);
+  });
 
-    it.each(transitionCases)(
-      "keeps actual renderer DOM through the $name handoff",
-      async ({ value, assertReadonly, assertEditor }) => {
-        const onReady = vi.fn(() => {
-          const host = document.querySelector<HTMLElement>(
-            '[data-testid="actual-renderer-transition"]',
-          );
-          expect(host).not.toBeNull();
-          assertReadonly(host!);
-        });
-        const queryClient = new QueryClient({
-          defaultOptions: { queries: { retry: false } },
-        });
+  it("retains the first upload inserted before create", async () => {
+    vi.useFakeTimers();
+    const ref = createRef<ContentEditorRef>();
+    const file = new File(["first"], "first-drop.txt", { type: "text/plain" });
+    const upload = vi.fn(async () => ({
+      id: "upload-1", workspace_id: "ws-1", issue_id: null, comment_id: null,
+      chat_session_id: null, chat_message_id: null, uploader_type: "member", uploader_id: "user-1",
+      filename: file.name, content_type: file.type, size_bytes: file.size, created_at: "2026-09-01T00:00:00Z",
+      url: "/file.txt", download_url: "/file.txt", markdown_url: "/file.txt", link: "/file.txt", markdownLink: "/file.txt",
+    }));
+    render(host(<ContentEditor ref={ref} value={long} onUploadFile={upload} showBubbleMenu={false} />));
+    expect(mountedEditor().isInitialized).toBe(false);
+    await act(async () => { ref.current!.uploadFile(file); });
+    await act(() => vi.advanceTimersByTimeAsync(20));
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(mountedEditor().getMarkdown()).toContain("first-drop.txt");
+    expect(mountedEditor().getMarkdown()).toContain("Paragraph 499.");
+  });
 
-        render(
-          <QueryClientProvider client={queryClient}>
-            <ActualRendererTransitionHost issueId="issue-a" value={value} onReady={onReady} />
-          </QueryClientProvider>,
-        );
+  it("does not add a readiness render for a consumer without onReady", async () => {
+    vi.useFakeTimers();
+    const commit = vi.fn();
+    render(host(<Profiler id="editor" onRender={commit}><ContentEditor value="Short." showBubbleMenu={false} /></Profiler>));
+    commit.mockClear();
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(mountedEditor().isInitialized).toBe(true);
+    expect(commit).not.toHaveBeenCalled();
+  });
 
-        await waitFor(
-          () => {
-            expect(onReady).toHaveBeenCalledTimes(1);
-            expect(
-              document.querySelector('[data-testid="actual-renderer-transition"] [data-rich-content]'),
-            ).toBeNull();
-          },
-          { timeout: 5_000 },
-        );
-
-        const host = document.querySelector<HTMLElement>(
-          '[data-testid="actual-renderer-transition"]',
-        );
-        expect(host).not.toBeNull();
-        assertEditor(host!);
-      },
-    );
-
-    it("uses the current body when the same issue re-enters", async () => {
-      const onReady = vi.fn(() => {
-        const host = document.querySelector<HTMLElement>(
-          '[data-testid="actual-renderer-transition"]',
-        );
-        expect(host?.querySelector("[data-rich-content] p")?.textContent).toBe(shortDescription);
-      });
-      const queryClient = new QueryClient({
-        defaultOptions: { queries: { retry: false } },
-      });
-      const renderHost = (visible: boolean) => (
-        <QueryClientProvider client={queryClient}>
-          {visible && (
-            <ActualRendererTransitionHost
-              issueId="issue-a"
-              value={shortDescription}
-              onReady={onReady}
-            />
-          )}
-        </QueryClientProvider>
-      );
-
-      const { rerender } = render(renderHost(true));
-      await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1));
-      rerender(renderHost(false));
-      rerender(renderHost(true));
-
-      await waitFor(() => expect(onReady).toHaveBeenCalledTimes(2));
-      const host = document.querySelector<HTMLElement>(
-        '[data-testid="actual-renderer-transition"]',
-      );
-      expect(host?.querySelector("[data-rich-content]")).toBeNull();
-      expect(host?.querySelector(".ProseMirror p")?.textContent).toBe(shortDescription);
+  it("adopts the client editor when hydrating a null server snapshot", async () => {
+    const { hydrateRoot } = await import("react-dom/client");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const onReady = vi.fn();
+    const recoverable = vi.fn();
+    let root: ReturnType<typeof hydrateRoot>;
+    await act(async () => {
+      root = hydrateRoot(container, host(<ContentEditor value={long} onReady={onReady} showBubbleMenu={false} />), { onRecoverableError: recoverable });
     });
-
-    it("uses A, B, then A content across issue changes", async () => {
-      const issueBodies = {
-        "issue-a": "Issue A actual renderer body.",
-        "issue-b": "Issue B actual renderer body.",
-      };
-      const readyBodies: Array<{ issueId: string; body: string }> = [];
-      const onReady = vi.fn((issueId: string) => {
-        const host = document.querySelector<HTMLElement>(
-          '[data-testid="actual-renderer-transition"]',
-        );
-        const body = host?.querySelector("[data-rich-content] p")?.textContent ?? "";
-        readyBodies.push({ issueId, body });
-        expect(body).toBe(issueBodies[issueId as keyof typeof issueBodies]);
-      });
-      const queryClient = new QueryClient({
-        defaultOptions: { queries: { retry: false } },
-      });
-      const renderHost = (issueId: keyof typeof issueBodies) => (
-        <QueryClientProvider client={queryClient}>
-          <ActualRendererTransitionHost
-            issueId={issueId}
-            value={issueBodies[issueId]}
-            onReady={onReady}
-          />
-        </QueryClientProvider>
-      );
-
-      const { rerender } = render(renderHost("issue-a"));
-      await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1));
-      rerender(renderHost("issue-b"));
-      await waitFor(() => expect(onReady).toHaveBeenCalledTimes(2));
-      rerender(renderHost("issue-a"));
-      await waitFor(() => expect(onReady).toHaveBeenCalledTimes(3));
-
-      expect(readyBodies).toEqual([
-        { issueId: "issue-a", body: issueBodies["issue-a"] },
-        { issueId: "issue-b", body: issueBodies["issue-b"] },
-        { issueId: "issue-a", body: issueBodies["issue-a"] },
-      ]);
-      const host = document.querySelector<HTMLElement>(
-        '[data-testid="actual-renderer-transition"]',
-      );
-      expect(host?.querySelector("[data-rich-content]")).toBeNull();
-      expect(host?.querySelector(".ProseMirror p")?.textContent).toBe(issueBodies["issue-a"]);
-    });
+    await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1));
+    expect(container.querySelector(".ProseMirror")?.textContent).toContain("Paragraph 499.");
+    expect(recoverable).not.toHaveBeenCalled();
+    act(() => root!.unmount());
+    container.remove();
   });
 });

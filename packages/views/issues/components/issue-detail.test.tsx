@@ -21,12 +21,6 @@ const mockViewport = vi.hoisted(() => ({ isMobile: false }));
 // Counts MockContentEditor mounts. This pins the description to exactly one
 // eager editor per issue and catches stale editor reuse across issue switches.
 const contentEditorMounts = vi.hoisted(() => ({ count: 0 }));
-// The real ContentEditor returns null until Tiptap has mounted. Hold that
-// transition so the detail suite can assert what stays visible meanwhile.
-const contentEditorReady = vi.hoisted(() => ({
-  defer: false,
-  resolve: null as (() => void) | null,
-}));
 // Stable empty-attachments reference: the real store returns a shared constant
 // so the `useCommentDraftStore(s => s.getAttachments(key))` selector keeps a
 // stable identity. A fresh `[]` per call would loop useSyncExternalStore.
@@ -189,22 +183,13 @@ vi.mock("../../editor", async () => ({
     const valueRef = useRef(initialValue);
     const baseRef = useRef(initialValue);
     const [editorValue, setEditorValue] = useState(initialValue);
-    const [ready, setReady] = useState(!contentEditorReady.defer);
     // Mirrors the real editor's dirty guard: once the user has typed, an
     // external `value` change is refused so it cannot clobber unsaved bytes.
     // Only the imperative adoptContent channel lands after that point.
     const dirtyRef = useRef(false);
     useEffect(() => {
       contentEditorMounts.count += 1;
-      const markReady = () => {
-        setReady(true);
-        onReady?.();
-      };
-      if (contentEditorReady.defer) contentEditorReady.resolve = markReady;
-      else markReady();
-      return () => {
-        if (contentEditorReady.resolve === markReady) contentEditorReady.resolve = null;
-      };
+      onReady?.();
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
     useEffect(() => {
@@ -241,7 +226,6 @@ vi.mock("../../editor", async () => ({
       settleUploadPlaceholder: () => false,
       uploadFile: () => {},
     }));
-    if (!ready) return null;
     return (
       <textarea
         value={editorValue}
@@ -581,33 +565,6 @@ const mockIssue: Issue = {
   revision: 3,
 };
 
-const longTransitionDescription = Array.from(
-  { length: 500 },
-  (_, index) => `Deferred paragraph ${index}.`,
-).join("\n\n");
-const mixedTransitionDescription = [
-  "# Heading",
-  "",
-  "- first item",
-  "- second item",
-  "",
-  "| A | B |",
-  "| --- | --- |",
-  "| 1 | 2 |",
-  "",
-  "```ts",
-  "const ready = true;",
-  "```",
-].join("\n");
-const imageTransitionDescription =
-  "![Example image](https://example.test/description.png)\n\nImage caption.";
-const descriptionTransitionCases = [
-  ["short markdown", "Short cached description."],
-  ["long markdown", longTransitionDescription],
-  ["heading, list, table, and code markdown", mixedTransitionDescription],
-  ["image markdown", imageTransitionDescription],
-] as const;
-
 const mockTimeline: TimelineEntry[] = [
   {
     type: "comment",
@@ -732,8 +689,6 @@ describe("IssueDetail (shared)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     contentEditorMounts.count = 0;
-    contentEditorReady.defer = false;
-    contentEditorReady.resolve = null;
     mockViewport.isMobile = false;
     // Default: issue loads successfully
     mockApiObj.getIssue.mockResolvedValue(mockIssue);
@@ -864,62 +819,6 @@ describe("IssueDetail (shared)", () => {
     expect(contentEditorMounts.count).toBe(1);
   });
 
-  it.each(descriptionTransitionCases)(
-    "keeps cached %s visible through the editor DOM handoff",
-    async (_name, description) => {
-      const queryClient = new QueryClient({
-        defaultOptions: {
-          queries: { retry: false, gcTime: 0, staleTime: Infinity },
-          mutations: { retry: false },
-        },
-      });
-      queryClient.setQueryData(
-        ["issues", "ws-1", "detail", "issue-1"],
-        { ...mockIssue, description },
-      );
-      mockApiObj.getIssue.mockReturnValue(new Promise(() => {}));
-      contentEditorReady.defer = true;
-
-      const { container } = render(
-        <I18nProvider locale="en" resources={TEST_RESOURCES}>
-          <QueryClientProvider client={queryClient}>
-            <IssueDetail issueId="issue-1" />
-          </QueryClientProvider>
-        </I18nProvider>,
-      );
-
-      const readonlyDescription = () =>
-        screen
-          .queryAllByTestId("readonly-content")
-          .filter((element) => element.textContent === description);
-
-      await waitFor(() => expect(mockApiObj.getIssue).toHaveBeenCalledWith("issue-1"));
-      await screen.findByText("Started working on this");
-      expect(readonlyDescription()).toHaveLength(1);
-      expect(screen.queryByDisplayValue(description)).not.toBeInTheDocument();
-
-      const readonlyContent = readonlyDescription()[0];
-      const editorShell = readonlyContent?.nextElementSibling;
-      const followingContent = editorShell?.nextElementSibling;
-      const scrollContainer = container.querySelector<HTMLElement>(
-        '[data-tab-scroll-root="main:issue-1"]',
-      );
-
-      expect(editorShell).not.toBeNull();
-      expect(followingContent).not.toBeNull();
-      expect(scrollContainer).not.toBeNull();
-      scrollContainer!.scrollTop = 37;
-
-      act(() => contentEditorReady.resolve?.());
-      const editor = await screen.findByTestId("rich-text-editor");
-      expect(editor).toHaveValue(description);
-      expect(readonlyDescription()).toHaveLength(0);
-      expect(editor.parentElement).toBe(editorShell);
-      expect(editor.parentElement?.nextElementSibling).toBe(followingContent);
-      expect(scrollContainer!.scrollTop).toBe(37);
-    },
-  );
-
   it("reconciles a cached list snapshot so source context appears on first entry", async () => {
     const sourceContext: NonNullable<Issue["source_context"]> = {
       id: "context-1",
@@ -1029,48 +928,7 @@ describe("IssueDetail (shared)", () => {
     expect(description).toHaveAttribute("data-flush-on-unmount", "true");
   });
 
-  it("shows the cached description again when the same issue re-enters", async () => {
-    const description = "Same issue re-entry description.";
-    const queryClient = new QueryClient({
-      defaultOptions: {
-        queries: { retry: false, gcTime: 0, staleTime: Infinity },
-        mutations: { retry: false },
-      },
-    });
-    queryClient.setQueryData(
-      ["issues", "ws-1", "detail", "issue-1"],
-      { ...mockIssue, description },
-    );
-    mockApiObj.getIssue.mockReturnValue(new Promise(() => {}));
-    contentEditorReady.defer = true;
-    const ui = (show: boolean) => (
-      <I18nProvider locale="en" resources={TEST_RESOURCES}>
-        <QueryClientProvider client={queryClient}>
-          {show && <IssueDetail issueId="issue-1" />}
-        </QueryClientProvider>
-      </I18nProvider>
-    );
-    const readonlyDescription = () =>
-      screen
-        .queryAllByTestId("readonly-content")
-        .filter((element) => element.textContent === description);
-    const { rerender } = render(ui(true));
-
-    await waitFor(() => expect(readonlyDescription()).toHaveLength(1));
-    act(() => contentEditorReady.resolve?.());
-    expect(await screen.findByDisplayValue(description)).toBeInTheDocument();
-
-    rerender(ui(false));
-    rerender(ui(true));
-
-    await waitFor(() => expect(readonlyDescription()).toHaveLength(1));
-    expect(screen.queryByDisplayValue(description)).not.toBeInTheDocument();
-    act(() => contentEditorReady.resolve?.());
-    expect(await screen.findByDisplayValue(description)).toBeInTheDocument();
-    expect(contentEditorMounts.count).toBe(2);
-  });
-
-  it("supports A → B → A description handoffs without carrying stale content", async () => {
+  it("remounts the eager description on issue switch without carrying stale content", async () => {
     // The web route reuses IssueDetail across issues. The keyed description
     // editor must remount atomically for the new issue while the title remains
     // on its cheap stand-in.
@@ -1096,40 +954,17 @@ describe("IssueDetail (shared)", () => {
         </QueryClientProvider>
       </I18nProvider>
     );
-    const readonlyDescription = (description: string) =>
-      screen
-        .queryAllByTestId("readonly-content")
-        .filter((element) => element.textContent === description);
     const { rerender } = render(ui("issue-1"));
 
     await screen.findByDisplayValue("Add JWT auth to the backend");
     const mountsBeforeSwitch = contentEditorMounts.count;
-    contentEditorReady.defer = true;
 
     rerender(ui("issue-2"));
 
-    expect(await screen.findByText("Second description")).toBeInTheDocument();
-    expect(readonlyDescription("Second description")).toHaveLength(1);
-    expect(screen.queryByDisplayValue("Second description")).not.toBeInTheDocument();
+    expect(await screen.findByDisplayValue("Second description")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
     expect(screen.queryByTestId("title-editor")).not.toBeInTheDocument();
     expect(contentEditorMounts.count).toBe(mountsBeforeSwitch + 1);
-
-    act(() => contentEditorReady.resolve?.());
-    expect(await screen.findByDisplayValue("Second description")).toBeInTheDocument();
-    expect(readonlyDescription("Second description")).toHaveLength(0);
-
-    contentEditorReady.defer = true;
-    rerender(ui("issue-1"));
-
-    expect(await screen.findByText("Add JWT auth to the backend")).toBeInTheDocument();
-    expect(readonlyDescription("Add JWT auth to the backend")).toHaveLength(1);
-    expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
-
-    act(() => contentEditorReady.resolve?.());
-    expect(await screen.findByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
-    expect(readonlyDescription("Add JWT auth to the backend")).toHaveLength(0);
-    expect(screen.queryByDisplayValue("Second description")).not.toBeInTheDocument();
   });
 
   it("renders the issue title leaf as a link to the issue detail page", async () => {

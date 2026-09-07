@@ -95,6 +95,7 @@ const latestEditorOptions = vi.hoisted<{
 
 vi.mock("@tiptap/react", () => ({
   useEditor: (options: {
+    onMount?: (args: { editor: unknown }) => void;
     onCreate?: (args: { editor: unknown }) => void;
     onUpdate?: (args: { editor: unknown }) => void;
   }) => {
@@ -142,6 +143,7 @@ vi.mock("@tiptap/react", () => ({
     }
     if (!onCreateFired.value) {
       onCreateFired.value = true;
+      options?.onMount?.({ editor: editorRef.current });
       options?.onCreate?.({ editor: editorRef.current });
     }
     return editorRef.current;
@@ -309,7 +311,7 @@ describe("ContentEditor", () => {
     const { rerender } = render(<ContentEditor value="old content" />);
 
     // User is typing — focused AND dirty (markdown diverges from
-    // lastEmittedRef, which was seeded with "old content" by onCreate).
+    // lastEmittedRef, which was seeded with "old content" by onMount).
     editorState.isFocused = true;
     editorState.markdown = "user-typed-content";
 
