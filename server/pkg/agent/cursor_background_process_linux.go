@@ -37,8 +37,7 @@ func captureCursorUnixGroup(pgid int) (*cursorUnixGroupHandle, error) {
 func (g *cursorUnixGroupHandle) signal(sig syscall.Signal) error {
 	return unix.PidfdSendSignal(g.fd, unix.Signal(sig), nil, cursorPidfdSignalProcessGroup)
 }
-func (g *cursorUnixGroupHandle) anchorPID() int { return 0 }
-func (g *cursorUnixGroupHandle) close()         { _ = unix.Close(g.fd) }
+func (g *cursorUnixGroupHandle) close() { _ = unix.Close(g.fd) }
 
 func readCursorUnixProcessInfo(pid int) (cursorUnixProcessInfo, error) {
 	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
@@ -91,4 +90,24 @@ func listCursorUnixProcessInfos() ([]cursorUnixProcessInfo, error) {
 		}
 	}
 	return infos, nil
+}
+
+func cursorUnixIsDescendant(pid int, root cursorUnixProcessInfo) bool {
+	seen := make(map[int]struct{}, 8)
+	for pid > 1 {
+		if pid == root.pid {
+			info, err := readCursorUnixProcessInfo(pid)
+			return err == nil && info.pid == root.pid && info.start == root.start
+		}
+		if _, ok := seen[pid]; ok {
+			return false
+		}
+		seen[pid] = struct{}{}
+		info, err := readCursorUnixProcessInfo(pid)
+		if err != nil {
+			return false
+		}
+		pid = info.ppid
+	}
+	return false
 }

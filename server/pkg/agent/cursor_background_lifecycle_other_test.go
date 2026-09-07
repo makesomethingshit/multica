@@ -2,7 +2,12 @@
 
 package agent
 
-import "testing"
+import (
+	"os/exec"
+	"testing"
+)
+
+func configureCursorTestBackgroundProcess(cmd *exec.Cmd) { configureProcessGroup(cmd) }
 
 func assertCursorTestProcessGone(t *testing.T, _ int) {
 	t.Helper()

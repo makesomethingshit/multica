@@ -3,71 +3,172 @@
 package agent
 
 import (
-	"os"
-	"os/exec"
+	"errors"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 type cursorUnixGroupHandle struct {
-	anchor *exec.Cmd
-	input  *os.File
-	pgid   int
-	start  uint64
+	pgid  int
+	known map[uint64]struct{}
 }
 
 func captureCursorUnixGroup(pgid int) (*cursorUnixGroupHandle, error) {
-	reader, writer, err := os.Pipe()
+	// Probe with a positive PID beyond XNU's PID_MAX (99999). PID zero is
+	// rejected as EINVAL on some kernels, indistinguishable from a missing API.
+	// Unsupported kernels fail closed; numeric kill is not a safe fallback.
+	if err := signalCursorDarwinIdentity(1<<31-1, 0, syscall.SIGKILL); err != syscall.ESRCH {
+		return nil, errors.Join(errors.New("Cursor background identity signalling is unavailable on this macOS kernel"), err)
+	}
+	identity, err := readCursorDarwinIdentity(pgid)
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
-	// A private pipe keeps this native utility blocked without a timer. Join
-	// before revalidating the shell identity. Cross-session groups cannot be
-	// joined, so capture fails closed rather than claiming a numeric PGID.
-	anchor := exec.Command("/bin/cat")
-	anchor.Env = []string{}
-	anchor.Stdin = reader
-	anchor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
-	if err := anchor.Start(); err != nil {
-		_ = writer.Close()
+	g := &cursorUnixGroupHandle{pgid: pgid, known: map[uint64]struct{}{identity.unique: {}}}
+	if err := g.signal(0); err != nil {
 		return nil, err
 	}
-	g := &cursorUnixGroupHandle{anchor: anchor, input: writer, pgid: pgid}
-	info, err := readCursorUnixProcessInfo(anchor.Process.Pid)
-	if err != nil || info.pgid != pgid {
-		g.close()
-		return nil, errCursorBackgroundProcessIdentity
-	}
-	g.start = info.start
 	return g, nil
 }
 
 func (g *cursorUnixGroupHandle) signal(sig syscall.Signal) error {
-	// We exclusively own Wait. Even if killed, the unreaped direct child
-	// retains its PID/group lifetime until close, preventing PGID reuse in
-	// the interval between this check and the group signal.
-	// getpgid excludes zombies on Darwin; sysctl includes our unreaped child
-	// after a group kill, while its start identity and group remain retained.
-	info, err := readCursorUnixProcessInfo(g.anchor.Process.Pid)
-	if err != nil || info.pgid != g.pgid || info.start != g.start {
+	all, err := listCursorUnixProcessInfos()
+	if err != nil {
+		return err
+	}
+	candidates := make(map[int]cursorDarwinIdentity)
+	for _, info := range all {
+		if info.pgid != g.pgid || info.zombie {
+			continue
+		}
+		identity, err := readCursorDarwinIdentity(info.pid)
+		if err != nil {
+			if err == syscall.ESRCH {
+				continue
+			}
+			return err
+		}
+		current, err := readCursorUnixProcessInfo(info.pid)
+		if err != nil || current.zombie || current.start != info.start || current.pgid != g.pgid {
+			continue
+		}
+		candidates[info.pid] = identity
+	}
+	if len(candidates) == 0 {
+		remaining, err := listCursorUnixProcessGroup(g.pgid)
+		if err != nil {
+			return err
+		}
+		if len(remaining) != 0 {
+			return errCursorBackgroundProcessIdentity
+		}
+		return syscall.ESRCH
+	}
+	// Retain observed birth identities after exit. Parent unique IDs survive
+	// reparenting, allowing a late direct child to prove its origin even after
+	// its leader exits. An entirely unseen intermediate generation is a limit:
+	// never infer ownership just because an unknown process has this PGID.
+	for changed := true; changed; {
+		changed = false
+		for _, identity := range candidates {
+			if _, known := g.known[identity.unique]; known {
+				continue
+			}
+			if _, parentKnown := g.known[identity.parentUnique]; parentKnown {
+				g.known[identity.unique] = struct{}{}
+				changed = true
+			}
+		}
+	}
+	owned := 0
+	var signalErr error
+	for pid, identity := range candidates {
+		if _, known := g.known[identity.unique]; !known {
+			continue
+		}
+		owned++
+		if sig != 0 {
+			// The kernel checks pidversion and holds the exact process reference
+			// while signalling. PID reuse or exec after this snapshot is rejected.
+			err := signalCursorDarwinIdentity(pid, identity.version, sig)
+			if err != nil && err != syscall.ESRCH {
+				signalErr = errors.Join(signalErr, err)
+			}
+		}
+	}
+	if owned == 0 {
 		return errCursorBackgroundProcessIdentity
 	}
-	if sig == 0 {
-		// The anchor already proves identity. Darwin's killpg(0) reports
-		// EPERM when only zombies remain; that is not an ownership failure.
-		return nil
-	}
-	return syscall.Kill(-g.pgid, sig)
+	return signalErr
 }
-func (g *cursorUnixGroupHandle) anchorPID() int { return g.anchor.Process.Pid }
-func (g *cursorUnixGroupHandle) close() {
-	_ = g.input.Close()
-	// Only our unreaped direct child is targeted here, including on capture
-	// failure; closing a failed claim must never signal the shell's group.
-	_ = g.anchor.Process.Kill()
-	_ = g.anchor.Wait()
+func (g *cursorUnixGroupHandle) close() { g.known = nil }
+
+func cursorUnixIsDescendant(pid int, root cursorUnixProcessInfo) bool {
+	rootIdentity, err := readCursorDarwinIdentity(root.pid)
+	if err != nil {
+		return false
+	}
+	currentRoot, err := readCursorUnixProcessInfo(root.pid)
+	if err != nil || currentRoot.start != root.start {
+		return false
+	}
+	// Cursor may already be an unreaped zombie while we drain its last output.
+	// Original parent identities still prove ancestry after reparenting to init.
+	var expected uint64
+	seen := make(map[uint64]bool)
+	for pid > 1 {
+		identity, err := readCursorDarwinIdentity(pid)
+		if err != nil || (expected != 0 && identity.unique != expected) || seen[identity.unique] {
+			return false
+		}
+		if identity.unique == rootIdentity.unique || identity.parentUnique == rootIdentity.unique {
+			return true
+		}
+		seen[identity.unique] = true
+		info, err := readCursorUnixProcessInfo(pid)
+		if err != nil {
+			return false
+		}
+		expected, pid = identity.parentUnique, info.ppid
+	}
+	return false
+}
+
+// XNU bsd/sys/proc_info_private.h defines this 56-byte ABI. Only the kernel's
+// unique birth ID and PID version are used; no Mach port or cgo is required.
+type cursorDarwinIdentity struct {
+	uuid                   [16]byte
+	unique, parentUnique   uint64
+	version, parentVersion uint32
+	reserved               [2]uint64
+}
+
+func readCursorDarwinIdentity(pid int) (cursorDarwinIdentity, error) {
+	var identity cursorDarwinIdentity
+	// arg=1 includes unreaped zombies, needed to identify a root that exited
+	// while its final stream events were buffered. Executable-work scans filter them.
+	n, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, 2, uintptr(pid), 17, 1, uintptr(unsafe.Pointer(&identity)), unsafe.Sizeof(identity))
+	if errno != 0 {
+		return identity, errno
+	}
+	if n != 56 || identity.unique == 0 {
+		return identity, errCursorBackgroundProcessIdentity
+	}
+	return identity, nil
+}
+
+func signalCursorDarwinIdentity(pid int, version uint32, sig syscall.Signal) error {
+	// proc_signal_with_audittoken consumes PID and pidversion from the token;
+	// permissions still come from the caller's real credentials.
+	var token [8]uint32
+	token[5], token[7] = uint32(pid), version
+	_, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, 0x11, 0, uintptr(sig), 0, uintptr(unsafe.Pointer(&token)), unsafe.Sizeof(token))
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // Darwin's proc state constants are defined in <sys/proc.h>; x/sys/unix does

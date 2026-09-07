@@ -12,6 +12,8 @@ import (
 	"testing"
 )
 
+func configureCursorTestBackgroundProcess(cmd *exec.Cmd) { configureProcessGroup(cmd) }
+
 func TestCaptureCursorBackgroundProcessRejectsForeignJob(t *testing.T) {
 	spawn := func() *exec.Cmd {
 		cmd := exec.Command(os.Args[0])

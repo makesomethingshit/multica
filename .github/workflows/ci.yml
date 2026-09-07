@@ -33,6 +33,14 @@ jobs:
         run: |
           go test -race ./pkg/agent -v -run 'TestCursorBackground|TestCaptureCursorBackground' -count=1
           go test -race ./internal/daemon -v -run 'Test.*Background.*Watchdog|Test.*IdleWatchdog' -count=1
+      - name: Repeat macOS finalization and check agent package contention
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: server
+        run: |
+          go test ./pkg/agent -run '^TestCursorBackgroundLifecycle/finish$' -count=5
+          go test -race ./pkg/agent -run '^TestCursorBackgroundLifecycle/finish$' -count=5
+          go test -race ./pkg/agent -count=1
       - name: Prove both regressions fail on reviewed head
         if: runner.os != 'Windows' && github.event.pull_request.number == 8050
         shell: bash
@@ -44,8 +52,12 @@ jobs:
           # Use the complete baseline module: swapping an old daemon.go into
           # the PR merge checkout mixes unrelated main-branch API changes.
           git archive "$baseline" server | tar -x -C "$baseline_dir"
+          # Keep the original reproduction fixtures independent of later
+          # platform test helpers added by subsequent reviews.
+          reproduction=96915a2ca6dd4dfb697cce4298727cc91805babf
+          git fetch --no-tags --depth=1 origin "$reproduction"
           for file in server/pkg/agent/cursor_background_late_child_test.go server/pkg/agent/cursor_liveness_test.go server/internal/daemon/cursor_background_watchdog_test.go; do
-            cp "$file" "$baseline_dir/$file"
+            git show "$reproduction:$file" > "$baseline_dir/$file"
           done
           cd "$baseline_dir/server"
           if go test ./pkg/agent -v -run '^TestCaptureCursorBackgroundLateDescendant$' -count=1 > "$RUNNER_TEMP/cursor-baseline.log" 2>&1; then
@@ -62,6 +74,34 @@ jobs:
           fi
           cat "$RUNNER_TEMP/watchdog-baseline.log"
           grep -F 'fresh native activity lost: refreshed=true fired=true' "$RUNNER_TEMP/watchdog-baseline.log"
+      - name: Reproduce round 2 defects on reviewed head
+        if: runner.os != 'Windows' && github.event.pull_request.number == 8050
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=96915a2ca6dd4dfb697cce4298727cc91805babf
+          git fetch --no-tags --depth=1 origin "$baseline"
+          baseline_dir=$(mktemp -d "$RUNNER_TEMP/cursor-round2.XXXXXX")
+          git archive "$baseline" server | tar -x -C "$baseline_dir"
+          cp server/internal/daemon/cursor_uncaptured_watchdog_test.go "$baseline_dir/server/internal/daemon/"
+          cp server/pkg/agent/cursor_background_process_darwin_test.go "$baseline_dir/server/pkg/agent/"
+          cd "$baseline_dir/server"
+          if go test ./internal/daemon -v -run '^TestCursorBackgroundUncapturedDisabledToolWatchdog$' -count=1 > "$RUNNER_TEMP/cursor-round2-watchdog.log" 2>&1; then
+            cat "$RUNNER_TEMP/cursor-round2-watchdog.log"
+            echo 'Uncaptured background regression did not fail on baseline' >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/cursor-round2-watchdog.log"
+          grep -F 'uncaptured background escaped idle budget:' "$RUNNER_TEMP/cursor-round2-watchdog.log"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            if go test ./pkg/agent -v -run '^TestCaptureCursorBackgroundDetachedSession$' -count=1 > "$RUNNER_TEMP/cursor-round2-darwin.log" 2>&1; then
+              cat "$RUNNER_TEMP/cursor-round2-darwin.log"
+              echo 'Detached session regression did not fail on baseline' >&2
+              exit 1
+            fi
+            cat "$RUNNER_TEMP/cursor-round2-darwin.log"
+            grep -F 'capture detached Cursor shell:' "$RUNNER_TEMP/cursor-round2-darwin.log"
+          fi
 
   # Decides whether the heavy frontend validation jobs, the backend Go jobs
   # and sqlc verification have anything to do.

@@ -21,6 +21,7 @@ const cursorFakeModeEnv = "CURSOR_FAKE_MODE"
 type cursorCleanupRetryProcess struct {
 	checks, stops, closes int
 	stopped               bool
+	stopFailures          int
 }
 
 func (p *cursorCleanupRetryProcess) alive() (bool, error) {
@@ -32,8 +33,41 @@ func (p *cursorCleanupRetryProcess) alive() (bool, error) {
 }
 func (p *cursorCleanupRetryProcess) terminate() error {
 	p.stops++
+	if p.stops <= p.stopFailures {
+		return errors.New("temporary termination failure")
+	}
 	p.stopped = true
 	return nil
+}
+
+func TestCursorBackgroundCloseRetriesTermination(t *testing.T) {
+	for _, failures := range []int{1, 2} {
+		t.Run(strconv.Itoa(failures), func(t *testing.T) {
+			messages := make(chan Message, 4)
+			tracker := newCursorBackgroundTools(context.Background(), nil, messages, slog.Default())
+			defer tracker.Close()
+			p := &cursorCleanupRetryProcess{checks: 1, stopFailures: failures}
+			tracker.Send(Message{Type: MessageToolUse, Tool: "shell", CallID: "retry"})
+			tracker.mu.Lock()
+			tracker.tools = append(tracker.tools, cursorBackgroundTool{
+				call:    cursorToolCall{Name: "shell", CallID: "retry", Result: "raw launch"},
+				process: &cursorBackgroundProcess{platform: p},
+			})
+			tracker.mu.Unlock()
+			tracker.Close()
+			wantCount := int32(0)
+			if failures == 2 {
+				wantCount = 1
+			}
+			if count, _ := tracker.Activity(); count != wantCount || p.stops != 2 || p.closes != 1 {
+				t.Fatalf("termination retry: count=%d stops=%d closes=%d", count, p.stops, p.closes)
+			}
+			<-messages
+			if msg := <-messages; msg.Output != "raw launch" || len(messages) != 0 || tracker.Interrupt() {
+				t.Fatalf("incorrect final result or repeated recovery: %+v", msg)
+			}
+		})
+	}
 }
 func (p *cursorCleanupRetryProcess) close() { p.closes++ }
 
@@ -116,7 +150,7 @@ func runFakeCursorStream(mode string) {
 		pidFile := filepath.Join(os.Getenv("CURSOR_FAKE_DIR"), strconv.Itoa(i)+".json")
 		child.Env = append(os.Environ(), cursorFakeModeEnv+"=shell", "CURSOR_FAKE_PIDS="+pidFile)
 		hideAgentWindow(child)
-		configureProcessGroup(child)
+		configureCursorTestBackgroundProcess(child)
 		if err := child.Start(); err != nil {
 			panic(err)
 		}
@@ -181,7 +215,6 @@ func TestCursorBackgroundLifecycle(t *testing.T) {
 	}
 	for _, mode := range []string{"natural", "budget", "multiple", "finish", "cancel"} {
 		t.Run(mode, func(t *testing.T) {
-			t.Parallel()
 			self, err := os.Executable()
 			if err != nil {
 				t.Fatal(err)
@@ -192,7 +225,7 @@ func TestCursorBackgroundLifecycle(t *testing.T) {
 				duration = "800ms"
 			}
 			backend, err := New("cursor", Config{ExecutablePath: self, Logger: slog.Default(), Env: map[string]string{
-				cursorFakeModeEnv: mode, "CURSOR_FAKE_DIR": dir, "CURSOR_FAKE_DURATION": duration,
+				cursorFakeModeEnv: mode, "CURSOR_FAKE_DIR": dir, "CURSOR_FAKE_DURATION": duration, "CURSOR_FAKE_SETSID": "1",
 			}})
 			if err != nil {
 				t.Fatal(err)
@@ -291,29 +324,29 @@ func TestCursorBackgroundLifecycle(t *testing.T) {
 	}
 }
 
-func TestCursorBackgroundUnverifiedPIDKeepsToolInFlight(t *testing.T) {
+func TestCursorBackgroundUnverifiedPIDReturnsToIdleBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	messages := make(chan Message, 1)
 	tracker := newCursorBackgroundTools(ctx, nil, messages, slog.Default())
+	defer tracker.Close()
 	tracker.Send(Message{Type: MessageToolUse, Tool: "shell", CallID: "unverified"})
 	<-messages
 	call := cursorToolCall{Name: "shell", CallID: "unverified", Background: true, PID: -1, Result: `{"isBackground":true}`}
 	tracker.Add(call)
 	tracker.Reap()
-	if tracker.Interrupt() || len(messages) != 0 {
-		t.Fatal("unverified PID was reported cleaned up")
+	if tracker.Interrupt() {
+		t.Fatal("unverified PID granted a cleanup recovery window")
 	}
-	tracker.Close()
-	if count, _ := tracker.Activity(); count != 1 {
-		t.Fatalf("unconfirmed cleanup decremented native tool count: %d", count)
+	if count, _ := tracker.Activity(); count != 0 || len(messages) != 1 {
+		t.Fatalf("uncaptured launch did not release its result: count=%d messages=%d", count, len(messages))
 	}
 	if msg := <-messages; msg.Output != call.Result {
 		t.Fatalf("raw launch result lost: %+v", msg)
 	}
 	tracker.Close()
-	if tracker.Interrupt() {
-		t.Fatal("closed tracker granted recovery")
+	if tracker.Interrupt() || len(messages) != 0 {
+		t.Fatal("closed tracker granted recovery or duplicated the launch result")
 	}
 }
 

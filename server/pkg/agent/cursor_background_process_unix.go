@@ -24,6 +24,10 @@ type cursorUnixBackgroundProcess struct {
 }
 
 func captureCursorBackgroundProcess(cmd *exec.Cmd, pid int) (*cursorBackgroundProcess, error) {
+	return captureCursorUnixBackgroundProcess(cmd, pid, captureCursorUnixGroup)
+}
+
+func captureCursorUnixBackgroundProcess(cmd *exec.Cmd, pid int, retainGroup func(int) (*cursorUnixGroupHandle, error)) (*cursorBackgroundProcess, error) {
 	if cmd == nil || cmd.Process == nil || pid <= 0 || pid == cmd.Process.Pid {
 		return nil, errCursorBackgroundProcessInvalid
 	}
@@ -38,23 +42,22 @@ func captureCursorBackgroundProcess(cmd *exec.Cmd, pid int) (*cursorBackgroundPr
 	if target.pgid != target.pid || target.pgid == root.pgid {
 		return nil, errCursorBackgroundProcessInvalid
 	}
-	if !cursorUnixIsDescendant(pid, root.pid) {
+	if !cursorUnixIsDescendant(pid, root) {
 		return nil, errCursorBackgroundProcessInvalid
 	}
 	leader, err := readCursorUnixProcessInfo(target.pgid)
 	if err != nil || leader.pid != target.pgid || leader.pgid != target.pgid || leader.start != target.start {
 		return nil, errCursorBackgroundProcessInvalid
 	}
-	group, err := captureCursorUnixGroup(target.pgid)
+	group, err := retainGroup(target.pgid)
 	if err != nil {
 		return nil, fmt.Errorf("retain Cursor shell process group: %w", err)
 	}
-	// Capture can race leader exit/reuse. Accept the durable reference only
-	// while the same leader and root still prove the original ancestry.
+	// The ancestry above proves where this process came from. The Cursor root
+	// may now exit and reparent it; retain the claim while the target identity
+	// is unchanged, without requiring its original parent to remain alive.
 	leader, err = readCursorUnixProcessInfo(pid)
-	currentRoot, rootErr := readCursorUnixProcessInfo(root.pid)
-	if err != nil || rootErr != nil || leader.start != target.start || leader.zombie ||
-		leader.pgid != target.pgid || currentRoot.start != root.start || !cursorUnixIsDescendant(pid, root.pid) {
+	if err != nil || leader.pid != target.pid || leader.start != target.start || leader.zombie || leader.pgid != target.pgid {
 		group.close()
 		return nil, errCursorBackgroundProcessInvalid
 	}
@@ -74,13 +77,6 @@ func (p *cursorUnixBackgroundProcess) alive() (bool, error) {
 }
 
 func (p *cursorUnixBackgroundProcess) terminate() error {
-	owned, err := p.groupOwned()
-	if err != nil || !owned {
-		return err
-	}
-	if err := p.group.signal(syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-		return err
-	}
 	deadline := time.Now().Add(time.Second)
 	for {
 		owned, err := p.groupOwned()
@@ -89,6 +85,11 @@ func (p *cursorUnixBackgroundProcess) terminate() error {
 		}
 		if !owned {
 			return nil
+		}
+		// A shell can fork during cleanup. Revalidate and stop newly proven
+		// members within this existing cleanup bound, without a liveness timer.
+		if err := p.group.signal(syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("Cursor background process group %d still active after %s", p.pgid, time.Second)
@@ -106,9 +107,8 @@ func (p *cursorUnixBackgroundProcess) groupOwned() (bool, error) {
 			return false, errCursorBackgroundProcessIdentity
 		}
 	}
-	// The retained kernel reference (Linux) or unreaped group anchor (Darwin)
-	// proves identity even when every originally observed member has exited.
-	// Never replace this with a numeric PGID existence check.
+	// Linux retains a kernel group reference; Darwin verifies individual birth
+	// identities and lineage. Neither signals an unverified numeric PGID.
 	if err := p.group.signal(0); err != nil {
 		if err == syscall.ESRCH {
 			return false, nil
@@ -119,28 +119,7 @@ func (p *cursorUnixBackgroundProcess) groupOwned() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// Anchors and zombies pin identity but are not executable background work.
-	delete(members, p.group.anchorPID())
 	return len(members) > 0, nil
-}
-
-func cursorUnixIsDescendant(pid, root int) bool {
-	seen := make(map[int]struct{}, 8)
-	for pid > 1 {
-		if pid == root {
-			return true
-		}
-		if _, ok := seen[pid]; ok {
-			return false
-		}
-		seen[pid] = struct{}{}
-		info, err := readCursorUnixProcessInfo(pid)
-		if err != nil {
-			return false
-		}
-		pid = info.ppid
-	}
-	return pid == root
 }
 
 func listCursorUnixProcessGroup(pgid int) (map[int]uint64, error) {

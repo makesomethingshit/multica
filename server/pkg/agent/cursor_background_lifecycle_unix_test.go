@@ -3,9 +3,20 @@
 package agent
 
 import (
+	"os"
+	"os/exec"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func configureCursorTestBackgroundProcess(cmd *exec.Cmd) {
+	if os.Getenv("CURSOR_FAKE_SETSID") == "1" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		return
+	}
+	configureProcessGroup(cmd)
+}
 
 func assertCursorTestProcessGone(t *testing.T, pid int) {
 	t.Helper()

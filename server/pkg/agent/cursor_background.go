@@ -99,10 +99,12 @@ func (b *cursorBackgroundTools) Add(call cursorToolCall) {
 	}
 	p, err := captureCursorBackgroundProcess(b.cmd, call.PID)
 	if err != nil {
-		// Keep the tool in flight even if the payload cannot be safely acted on.
-		// At timeout the ordinary watchdog remains the fallback; never signal an
-		// unverified PID or treat unverifiable cleanup as success.
-		b.logger.Warn("cannot own Cursor background shell; tool watchdog will use normal cancellation", "error", err)
+		// No work was claimed. Preserve Cursor's launch completion so the idle
+		// watchdog remains available even when the tool watchdog is disabled.
+		// This grants no cleanup recovery window and never signals the PID.
+		b.logger.Warn("cannot own Cursor background shell; returning launch result for idle watchdog fallback", "error", err)
+		b.SendResult(call)
+		return
 	}
 	b.tools = append(b.tools, cursorBackgroundTool{call: call, process: p})
 }
@@ -163,6 +165,11 @@ func (b *cursorBackgroundTools) Close() {
 		b.mu.Lock()
 		b.closed = true
 		b.finish(true)
+		if len(b.tools) > 0 {
+			// Retry a transient lookup/termination failure before releasing the
+			// final claim. Persistent errors remain explicitly unconfirmed.
+			b.finish(true)
+		}
 		for _, tool := range b.tools {
 			// The stream is closing, so preserve even unverifiable launch
 			// payloads without pretending cleanup succeeded in native accounting.
