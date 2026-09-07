@@ -54,6 +54,11 @@ func (g *cursorUnixGroupHandle) signal(sig syscall.Signal) error {
 	if err != nil || info.pgid != g.pgid || info.start != g.start {
 		return errCursorBackgroundProcessIdentity
 	}
+	if sig == 0 {
+		// The anchor already proves identity. Darwin's killpg(0) reports
+		// EPERM when only zombies remain; that is not an ownership failure.
+		return nil
+	}
 	return syscall.Kill(-g.pgid, sig)
 }
 func (g *cursorUnixGroupHandle) anchorPID() int { return g.anchor.Process.Pid }
