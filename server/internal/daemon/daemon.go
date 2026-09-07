@@ -6193,17 +6193,10 @@ func piSessionFilePresent(sessionID string) bool {
 // piSessionHeaderLimit caps how much of a Pi session file's FIRST LINE the
 // resume gate reads. It is a defensive read bound for this check, not Pi's
 // official header limit; a first line beyond it is undecidable, never
-// missing. Bytes past the first newline are never read, so a long
-// transcript body cannot push a healthy header over the bound (GH #8082).
+// missing. Bytes past the first newline are never parsed or consulted, so
+// a long transcript body cannot push a healthy header over the bound
+// (GH #8082).
 const piSessionHeaderLimit = 64 * 1024
-
-// piSessionHeader carries only the fields the resume gate needs. Unknown
-// extra fields are ignored by the decoder; no constraints are placed on
-// version/id/timestamp shapes.
-type piSessionHeader struct {
-	Type string `json:"type"`
-	Cwd  string `json:"cwd"`
-}
 
 // piSessionRecordedCwdMissing reports whether a Pi session file's recorded
 // working directory is confirmed absent (GH #8082). It answers only that:
@@ -6220,12 +6213,16 @@ func piSessionRecordedCwdMissing(sessionPath string) bool {
 		return false
 	}
 	defer f.Close()
-	// Bounded first-line read: stop at the newline so the transcript body
-	// is never consumed. Handles LF, CRLF, and a missing trailing newline.
-	// The buffered cap admits at most piSessionHeaderLimit content bytes
-	// plus the newline delimiter, so the delimiter itself never counts
-	// toward the bound: a first line of exactly the limit stays decidable,
-	// while limit+1 is undecidable however the line is terminated.
+	// Bounded first-line read: only the first line is ever parsed or
+	// consulted, so the transcript body cannot affect the verdict.
+	// Handles LF, CRLF, and a missing trailing newline. The buffered
+	// reader may read ahead past the newline, but those bytes stay
+	// buffered and unused: reads from the file and memory use stay
+	// capped at piSessionHeaderLimit+2 regardless of file size. The +2
+	// slack admits piSessionHeaderLimit content bytes plus the newline
+	// delimiter, so the LF itself never counts toward the bound while a
+	// limit+1 first line still exceeds it however it is terminated; a
+	// capped read is length-checked below, never mistaken for clean EOF.
 	raw, rerr := bufio.NewReader(io.LimitReader(f, int64(piSessionHeaderLimit)+2)).ReadBytes('\n')
 	if rerr != nil && rerr != io.EOF {
 		return false
@@ -6235,9 +6232,15 @@ func piSessionRecordedCwdMissing(sessionPath string) bool {
 		return false
 	}
 	line = bytes.TrimSuffix(line, []byte("\r"))
-	var header piSessionHeader
+	// Exact-key header decode: only "type" and "cwd" decide (GH #8082).
+	// encoding/json struct matching is case-insensitive, so decode into
+	// a raw map and look the keys up exactly instead: an uppercase "CWD"
+	// neither overrides nor substitutes "cwd", and a duplicate "cwd"
+	// resolves to its last value. Extra fields stay ignored; the first
+	// line must still be exactly one JSON value.
+	var fields map[string]json.RawMessage
 	dec := json.NewDecoder(bytes.NewReader(line))
-	if err := dec.Decode(&header); err != nil {
+	if err := dec.Decode(&fields); err != nil {
 		return false
 	}
 	// The first line must be exactly one JSON value: a valid session
@@ -6247,15 +6250,31 @@ func piSessionRecordedCwdMissing(sessionPath string) bool {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return false
 	}
-	if header.Type != "session" {
+	var typ string
+	if rawType, ok := fields["type"]; ok {
+		if err := json.Unmarshal(rawType, &typ); err != nil {
+			return false
+		}
+	}
+	if typ != "session" {
 		return false
 	}
-	// A non-string cwd fails to decode into the struct as a type error,
-	// which Decode reports — same undecidable outcome as before.
-	if header.Cwd == "" || !filepath.IsAbs(header.Cwd) {
+	// "cwd" is read by exact key only: an uppercase "CWD" never
+	// substitutes for it, and a duplicate "cwd" resolves to the last
+	// value the same way encoding/json does for repeated keys. A
+	// missing, null, or non-string cwd is undecidable, never a drop.
+	rawCwd, ok := fields["cwd"]
+	if !ok {
 		return false
 	}
-	_, err = os.Stat(header.Cwd)
+	var cwd string
+	if err := json.Unmarshal(rawCwd, &cwd); err != nil {
+		return false
+	}
+	if cwd == "" || !filepath.IsAbs(cwd) {
+		return false
+	}
+	_, err = os.Stat(cwd)
 	return err != nil && os.IsNotExist(err)
 }
 

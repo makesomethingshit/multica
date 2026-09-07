@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2830,6 +2831,77 @@ func TestGH8082HeaderLimitBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGH8082HeaderExactKeyMatch: only the exact lowercase "cwd" key
+// decides (GH #8082). encoding/json struct matching is case-insensitive,
+// so an uppercase "CWD" must neither override nor substitute "cwd".
+func TestGH8082HeaderExactKeyMatch(t *testing.T) {
+	t.Parallel()
+
+	setup := func(t *testing.T) (base, kept, gone, envDir string) {
+		t.Helper()
+		base = t.TempDir()
+		kept = filepath.Join(base, "kept")
+		gone = filepath.Join(base, "gone")
+		envDir = filepath.Join(base, "fresh")
+		for _, dir := range []string{kept, gone, envDir} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatalf("create %s: %v", dir, err)
+			}
+		}
+		if err := os.RemoveAll(gone); err != nil {
+			t.Fatalf("delete gone: %v", err)
+		}
+		return base, kept, gone, envDir
+	}
+	writeLine := func(t *testing.T, path, line string) {
+		t.Helper()
+		if err := os.WriteFile(path, append([]byte(line), '\n'), 0o644); err != nil {
+			t.Fatalf("write session: %v", err)
+		}
+	}
+	check := func(t *testing.T, sessionPath, priorWorkDir, envDir string, wantReach bool, name string) {
+		t.Helper()
+		task := Task{PriorSessionID: sessionPath, PriorWorkDir: priorWorkDir}
+		taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+		reachable := gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default())
+		if reachable != wantReach {
+			t.Fatalf("%s: reachable = %v, want %v", name, reachable, wantReach)
+		}
+	}
+
+	t.Run("valid cwd with deleted CWD stays resumable", func(t *testing.T) {
+		t.Parallel()
+		base, kept, gone, envDir := setup(t)
+		sessionPath := filepath.Join(base, "s.jsonl")
+		writeLine(t, sessionPath, `{"type":"session","cwd":`+strconv.Quote(kept)+`,"CWD":`+strconv.Quote(gone)+`}`)
+		check(t, sessionPath, kept, envDir, true, "valid cwd + deleted CWD")
+	})
+
+	t.Run("deleted cwd with valid CWD drops", func(t *testing.T) {
+		t.Parallel()
+		base, kept, gone, envDir := setup(t)
+		sessionPath := filepath.Join(base, "s.jsonl")
+		writeLine(t, sessionPath, `{"type":"session","cwd":`+strconv.Quote(gone)+`,"CWD":`+strconv.Quote(kept)+`}`)
+		check(t, sessionPath, gone, envDir, false, "deleted cwd + valid CWD")
+	})
+
+	t.Run("CWD only stays resumable", func(t *testing.T) {
+		t.Parallel()
+		base, kept, _, envDir := setup(t)
+		sessionPath := filepath.Join(base, "s.jsonl")
+		writeLine(t, sessionPath, `{"type":"session","CWD":`+strconv.Quote(kept)+`}`)
+		check(t, sessionPath, kept, envDir, true, "CWD only")
+	})
+
+	t.Run("duplicate cwd ending in null stays resumable", func(t *testing.T) {
+		t.Parallel()
+		base, kept, gone, envDir := setup(t)
+		sessionPath := filepath.Join(base, "s.jsonl")
+		writeLine(t, sessionPath, `{"type":"session","cwd":`+strconv.Quote(gone)+`,"cwd":null}`)
+		check(t, sessionPath, kept, envDir, true, "duplicate cwd ending null")
+	})
 }
 
 // TestGH8082OmpAndOtherProvidersUnaffected: the missing-cwd check is
