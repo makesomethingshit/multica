@@ -14,6 +14,7 @@ type cursorUnixGroupHandle struct {
 	anchor *exec.Cmd
 	input  *os.File
 	pgid   int
+	start  uint64
 }
 
 func captureCursorUnixGroup(pgid int) (*cursorUnixGroupHandle, error) {
@@ -33,15 +34,24 @@ func captureCursorUnixGroup(pgid int) (*cursorUnixGroupHandle, error) {
 		_ = writer.Close()
 		return nil, err
 	}
-	return &cursorUnixGroupHandle{anchor: anchor, input: writer, pgid: pgid}, nil
+	g := &cursorUnixGroupHandle{anchor: anchor, input: writer, pgid: pgid}
+	info, err := readCursorUnixProcessInfo(anchor.Process.Pid)
+	if err != nil || info.pgid != pgid {
+		g.close()
+		return nil, errCursorBackgroundProcessIdentity
+	}
+	g.start = info.start
+	return g, nil
 }
 
 func (g *cursorUnixGroupHandle) signal(sig syscall.Signal) error {
 	// We exclusively own Wait. Even if killed, the unreaped direct child
 	// retains its PID/group lifetime until close, preventing PGID reuse in
 	// the interval between this check and the group signal.
-	pgid, err := syscall.Getpgid(g.anchor.Process.Pid)
-	if err != nil || pgid != g.pgid {
+	// getpgid excludes zombies on Darwin; sysctl includes our unreaped child
+	// after a group kill, while its start identity and group remain retained.
+	info, err := readCursorUnixProcessInfo(g.anchor.Process.Pid)
+	if err != nil || info.pgid != g.pgid || info.start != g.start {
 		return errCursorBackgroundProcessIdentity
 	}
 	return syscall.Kill(-g.pgid, sig)
