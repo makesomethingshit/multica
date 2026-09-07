@@ -26,6 +26,7 @@ jobs:
           go-version: "1.26.x"
           cache-dependency-path: server/go.sum
       - name: Verify Cursor background lifecycle and watchdog races
+        shell: bash
         working-directory: server
         # Explicit, verbose selection prevents the Unix regression from silently
         # disappearing behind a build tag or the ordinary Windows test subset.
