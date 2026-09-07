@@ -33,7 +33,7 @@ jobs:
         run: |
           go test -race ./pkg/agent -v -run 'TestCursorBackground|TestCaptureCursorBackground' -count=1
           go test -race ./internal/daemon -v -run 'Test.*Background.*Watchdog|Test.*IdleWatchdog' -count=1
-      - name: Repeat macOS finalization and check agent package contention
+      - name: Repeat macOS finalization and verify cgo-free ownership
         if: runner.os == 'macOS'
         shell: bash
         working-directory: server
@@ -41,7 +41,6 @@ jobs:
           go test ./pkg/agent -run '^TestCursorBackgroundLifecycle/finish$' -count=5
           go test -race ./pkg/agent -run '^TestCursorBackgroundLifecycle/finish$' -count=5
           CGO_ENABLED=0 go test ./pkg/agent -run '^TestCaptureCursorBackground(KernelRejectsStaleIdentity|DetachedSession|LateDescendant)$' -count=1
-          bash ../scripts/go-test-with-agent-cli-guard.sh -- go test -race -p 2 -parallel 2 ./pkg/agent -count=1
       - name: Prove both regressions fail on reviewed head
         if: runner.os != 'Windows' && github.event.pull_request.number == 8050
         shell: bash
@@ -103,6 +102,24 @@ jobs:
             cat "$RUNNER_TEMP/cursor-round2-darwin.log"
             grep -F 'capture detached Cursor shell:' "$RUNNER_TEMP/cursor-round2-darwin.log"
           fi
+
+      - name: Compare existing macOS timing tests on reviewed head
+        if: runner.os == 'macOS' && github.event.pull_request.number == 8050
+        shell: bash
+        run: |
+          baseline=96915a2ca6dd4dfb697cce4298727cc91805babf
+          baseline_dir=$(mktemp -d "$RUNNER_TEMP/cursor-timing-baseline.XXXXXX")
+          git archive "$baseline" server scripts | tar -x -C "$baseline_dir"
+          cd "$baseline_dir/server"
+          # Diagnostic only: the current-head full suite below remains gating.
+          status=0
+          bash ../scripts/go-test-with-agent-cli-guard.sh -- go test -race -p 2 -parallel 2 ./pkg/agent -run '^TestCodexExecute(SemanticInactivityAllowsContinuousDeltaProgress|LegacyFirstTurnMessageSatisfiesProgress|SemanticInactivityAllowsContinuousMessages)$' -count=1 || status=$?
+          echo "Reviewed-head timing test status: $status"
+      - name: Check full macOS agent package contention
+        if: runner.os == 'macOS'
+        shell: bash
+        working-directory: server
+        run: bash ../scripts/go-test-with-agent-cli-guard.sh -- go test -race -p 2 -parallel 2 ./pkg/agent -count=1
 
   # Decides whether the heavy frontend validation jobs, the backend Go jobs
   # and sqlc verification have anything to do.
