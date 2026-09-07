@@ -8916,8 +8916,23 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	}
 	var idleWatchdogThreshold atomic.Int64
 	idleWatchdogThreshold.Store(int64(idleWindow))
+	watchdogToolCount := inFlightTools.Load
+	if session.ToolActivity != nil {
+		watchdogToolCount = func() int32 {
+			count, at := session.ToolActivity()
+			for {
+				previous := lastActivityAt.Load()
+				if at.UnixNano() <= previous || lastActivityAt.CompareAndSwap(previous, at.UnixNano()) {
+					break
+				}
+			}
+			return count
+		}
+	}
+	watchdogCtx, stopWatchdog := context.WithCancel(agentCtx)
+	defer stopWatchdog()
 	if idleWindow > 0 {
-		go d.runIdleWatchdog(agentCtx, idleWindow, d.cfg.AgentToolWatchdog, &lastActivityAt, &inFlightTools, &idleWatchdogFired, &idleWatchdogThreshold, agentCancel, session.Messages, taskLog)
+		go d.runIdleWatchdog(watchdogCtx, idleWindow, d.cfg.AgentToolWatchdog, &lastActivityAt, watchdogToolCount, &idleWatchdogFired, &idleWatchdogThreshold, agentCancel, session.Messages, session.InterruptBackgroundTools, taskLog)
 	}
 
 	// drainFinished closes after the drain goroutine has flushed the last
@@ -9155,6 +9170,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 
 	select {
 	case result := <-session.Result:
+		stopWatchdog()
 		waitForDrain()
 		if idleWatchdogFired.Load() {
 			// The backend's wait goroutine (e.g. claude.go) translates the
@@ -9254,8 +9270,13 @@ func idleWatchdogTickInterval(window time.Duration) time.Duration {
 //
 // Polling rate comes from idleWatchdogTickInterval, so a run is force-stopped
 // somewhere between its budget and budget + tick, never earlier.
-func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow time.Duration, lastActivityAt *atomic.Int64, inFlightTools *atomic.Int32, fired *atomic.Bool, firedThreshold *atomic.Int64, cancel context.CancelFunc, messages <-chan agent.Message, taskLog *slog.Logger) {
-	ticker := time.NewTicker(idleWatchdogTickInterval(window))
+func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow time.Duration, lastActivityAt *atomic.Int64, inFlightTools func() int32, fired *atomic.Bool, firedThreshold *atomic.Int64, cancel context.CancelFunc, messages <-chan agent.Message, interruptBackground func() bool, taskLog *slog.Logger) {
+	// ponytail: fixed shortest-budget cadence; use an adaptive timer if subsecond production budgets are needed.
+	tickWindow := window
+	if toolWindow > 0 && toolWindow < tickWindow {
+		tickWindow = toolWindow
+	}
+	ticker := time.NewTicker(idleWatchdogTickInterval(tickWindow))
 	defer ticker.Stop()
 	for {
 		select {
@@ -9267,7 +9288,7 @@ func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow ti
 			// tool_use and tool_result), so it gets the larger toolWindow;
 			// toolWindow <= 0 disables the in-flight bound entirely.
 			threshold := window
-			toolInFlight := inFlightTools.Load() > 0
+			toolInFlight := inFlightTools() > 0
 			if toolInFlight {
 				if toolWindow <= 0 {
 					continue
@@ -9283,6 +9304,25 @@ func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow ti
 			// behind, not the backend. Wait one more tick rather than
 			// killing a backend that is still producing output.
 			if len(messages) > 0 {
+				continue
+			}
+			// Cursor can stop its owned background tools without aborting the
+			// agent. The same watchdog owns both the budget and this recovery,
+			// so no competing timer can cancel Cursor while it reports a result.
+			if agentCtx.Err() != nil {
+				return
+			}
+			if toolInFlight && interruptBackground != nil && interruptBackground() {
+				lastActivityAt.Store(time.Now().UnixNano())
+				taskLog.Info("tool watchdog stopped background tools; waiting for agent result")
+				continue
+			}
+			// A natural tool completion may race the callback or the tick.
+			if agentCtx.Err() != nil {
+				return
+			}
+			if lastActivityAt.Load() != last.UnixNano() ||
+				(inFlightTools() > 0) != toolInFlight || len(messages) > 0 {
 				continue
 			}
 			// No "task" field here: taskLog already carries the full id.

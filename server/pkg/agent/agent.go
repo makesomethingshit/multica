@@ -147,6 +147,17 @@ func runContext(ctx context.Context, timeout time.Duration) (context.Context, co
 
 // Session represents a running agent execution.
 type Session struct {
+	// ToolActivity optionally reports backend-owned tool accounting and its last
+	// transition time, independent of the best-effort transcript. Nil uses the
+	// daemon's message-based accounting. The timestamp gives completed tools a
+	// fresh idle budget even when their transcript message has not drained yet.
+	ToolActivity func() (int32, time.Time)
+	// InterruptBackgroundTools stops owned background tools at the daemon's
+	// tool watchdog boundary without cancelling the agent. True means at least
+	// one tool completed/was stopped and released from accounting; the watchdog
+	// gives the agent a fresh budget to report its authoritative result.
+	// Implementations must be concurrency-safe and return false after cleanup.
+	InterruptBackgroundTools func() bool
 	// Messages streams events as the agent works. The channel is closed
 	// when the agent finishes (before Result is sent).
 	Messages <-chan Message
