@@ -40,7 +40,8 @@ jobs:
         run: |
           go test ./pkg/agent -run '^TestCursorBackgroundLifecycle/finish$' -count=5
           go test -race ./pkg/agent -run '^TestCursorBackgroundLifecycle/finish$' -count=5
-          go test -race ./pkg/agent -count=1
+          CGO_ENABLED=0 go test ./pkg/agent -run '^TestCaptureCursorBackground(KernelRejectsStaleIdentity|DetachedSession|LateDescendant)$' -count=1
+          bash ../scripts/go-test-with-agent-cli-guard.sh -- go test -race -p 2 -parallel 2 ./pkg/agent -count=1
       - name: Prove both regressions fail on reviewed head
         if: runner.os != 'Windows' && github.event.pull_request.number == 8050
         shell: bash
