@@ -38,16 +38,15 @@ jobs:
         run: |
           set -euo pipefail
           baseline=c5cc30e288b8f41001f4d09880b0c4bd81453426
-          repo_root="$PWD"
           git fetch --no-tags --depth=1 origin "$baseline"
-          files=(server/internal/daemon/daemon.go server/pkg/agent/cursor_background_process_unix.go server/pkg/agent/cursor_background_process_linux.go server/pkg/agent/cursor_background_process_darwin.go)
-          # Keep today's real-subprocess fixture/tests; swap only production
-          # implementations. Restore them even when a regression is not caught.
-          trap 'cd "$repo_root"; git restore -- "${files[@]}"' EXIT
-          for file in "${files[@]}"; do
-            git show "$baseline:$file" > "$file"
+          baseline_dir=$(mktemp -d "$RUNNER_TEMP/cursor-baseline.XXXXXX")
+          # Use the complete baseline module: swapping an old daemon.go into
+          # the PR merge checkout mixes unrelated main-branch API changes.
+          git archive "$baseline" server | tar -x -C "$baseline_dir"
+          for file in server/pkg/agent/cursor_background_late_child_test.go server/pkg/agent/cursor_liveness_test.go server/internal/daemon/cursor_background_watchdog_test.go; do
+            cp "$file" "$baseline_dir/$file"
           done
-          cd server
+          cd "$baseline_dir/server"
           if go test ./pkg/agent -v -run '^TestCaptureCursorBackgroundLateDescendant$' -count=1 > "$RUNNER_TEMP/cursor-baseline.log" 2>&1; then
             cat "$RUNNER_TEMP/cursor-baseline.log"
             echo 'Late-descendant regression did not fail on baseline' >&2
@@ -62,7 +61,6 @@ jobs:
           fi
           cat "$RUNNER_TEMP/watchdog-baseline.log"
           grep -F 'fresh native activity lost: refreshed=true fired=true' "$RUNNER_TEMP/watchdog-baseline.log"
-          cd ..
 
   # Decides whether the heavy frontend validation jobs, the backend Go jobs
   # and sqlc verification have anything to do.
