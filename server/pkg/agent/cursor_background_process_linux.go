@@ -8,7 +8,37 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+
+	"golang.org/x/sys/unix"
 )
+
+// Linux 6.9's UAPI flag is not yet exported by x/sys/unix. It targets the
+// pidfd's retained struct pid as a group, including children after leader exit.
+const cursorPidfdSignalProcessGroup = 1 << 2
+
+type cursorUnixGroupHandle struct{ fd int }
+
+func captureCursorUnixGroup(pgid int) (*cursorUnixGroupHandle, error) {
+	fd, err := unix.PidfdOpen(pgid, 0)
+	if err != nil {
+		return nil, err
+	}
+	g := &cursorUnixGroupHandle{fd: fd}
+	// Probe support without sending a signal. Older kernels fail closed;
+	// silently falling back to kill(-pgid) would lose durable ownership.
+	if err := g.signal(0); err != nil {
+		g.close()
+		return nil, err
+	}
+	return g, nil
+}
+
+func (g *cursorUnixGroupHandle) signal(sig syscall.Signal) error {
+	return unix.PidfdSendSignal(g.fd, unix.Signal(sig), nil, cursorPidfdSignalProcessGroup)
+}
+func (g *cursorUnixGroupHandle) anchorPID() int { return 0 }
+func (g *cursorUnixGroupHandle) close()         { _ = unix.Close(g.fd) }
 
 func readCursorUnixProcessInfo(pid int) (cursorUnixProcessInfo, error) {
 	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))

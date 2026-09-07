@@ -2,7 +2,58 @@
 
 package agent
 
-import "golang.org/x/sys/unix"
+import (
+	"os"
+	"os/exec"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
+
+type cursorUnixGroupHandle struct {
+	anchor *exec.Cmd
+	input  *os.File
+	pgid   int
+}
+
+func captureCursorUnixGroup(pgid int) (*cursorUnixGroupHandle, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	// A private pipe keeps this native utility blocked without a timer. Join
+	// before revalidating the shell identity. Cross-session groups cannot be
+	// joined, so capture fails closed rather than claiming a numeric PGID.
+	anchor := exec.Command("/bin/cat")
+	anchor.Env = []string{}
+	anchor.Stdin = reader
+	anchor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
+	if err := anchor.Start(); err != nil {
+		_ = writer.Close()
+		return nil, err
+	}
+	return &cursorUnixGroupHandle{anchor: anchor, input: writer, pgid: pgid}, nil
+}
+
+func (g *cursorUnixGroupHandle) signal(sig syscall.Signal) error {
+	// We exclusively own Wait. Even if killed, the unreaped direct child
+	// retains its PID/group lifetime until close, preventing PGID reuse in
+	// the interval between this check and the group signal.
+	pgid, err := syscall.Getpgid(g.anchor.Process.Pid)
+	if err != nil || pgid != g.pgid {
+		return errCursorBackgroundProcessIdentity
+	}
+	return syscall.Kill(-g.pgid, sig)
+}
+func (g *cursorUnixGroupHandle) anchorPID() int { return g.anchor.Process.Pid }
+func (g *cursorUnixGroupHandle) close() {
+	_ = g.input.Close()
+	// Only our unreaped direct child is targeted here, including on capture
+	// failure; closing a failed claim must never signal the shell's group.
+	_ = g.anchor.Process.Kill()
+	_ = g.anchor.Wait()
+}
 
 // Darwin's proc state constants are defined in <sys/proc.h>; x/sys/unix does
 // not export SZOMB on all supported Darwin architectures.

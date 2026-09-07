@@ -256,6 +256,8 @@ MULTICA_CLAUDE_PATH=/opt/bin/claude
 MULTICA_CLAUDE_ARGS=--max-turns 40
 ```
 
+Cursor's verified background cleanup requires Linux 6.9 or newer (process-group pidfds), a joinable process group in the daemon's session on macOS, or a successfully assigned nested Job Object on Windows. Unsupported or unclaimable groups use the ordinary run-cancellation fallback; the daemon never signals a numeric process group after losing ownership proof.
+
 Precedence is command-line flag → environment variable → `~/.multica/config.json` → built-in default. For watchdog behavior, see [Daemon and runtimes](/daemon-runtimes).
 
 ### Persisting daemon configuration

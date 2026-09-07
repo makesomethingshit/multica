@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,55 @@ import (
 
 const cursorFakeModeEnv = "CURSOR_FAKE_MODE"
 
+type cursorCleanupRetryProcess struct {
+	checks, stops, closes int
+	stopped               bool
+}
+
+func (p *cursorCleanupRetryProcess) alive() (bool, error) {
+	p.checks++
+	if p.checks == 1 {
+		return false, errors.New("temporary ownership lookup failure")
+	}
+	return !p.stopped, nil
+}
+func (p *cursorCleanupRetryProcess) terminate() error {
+	p.stops++
+	p.stopped = true
+	return nil
+}
+func (p *cursorCleanupRetryProcess) close() { p.closes++ }
+
+func TestCursorBackgroundCloseRetriesUnconfirmedCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	messages := make(chan Message, 4)
+	tracker := newCursorBackgroundTools(ctx, nil, messages, slog.Default())
+	p := &cursorCleanupRetryProcess{}
+	tracker.Send(Message{Type: MessageToolUse, Tool: "shell", CallID: "retry"})
+	tracker.mu.Lock()
+	tracker.tools = append(tracker.tools, cursorBackgroundTool{
+		call:    cursorToolCall{Name: "shell", CallID: "retry", Result: "raw launch"},
+		process: &cursorBackgroundProcess{platform: p},
+	})
+	tracker.mu.Unlock()
+	if tracker.Interrupt() {
+		t.Fatal("failed ownership lookup granted recovery")
+	}
+	if count, _ := tracker.Activity(); count != 1 || len(messages) != 1 {
+		t.Fatal("failed cleanup released its tool result")
+	}
+	tracker.Close()
+	tracker.Close()
+	if count, _ := tracker.Activity(); count != 0 || p.stops != 1 || p.closes != 1 || tracker.Interrupt() {
+		t.Fatalf("cleanup lifecycle: count=%d stops=%d closes=%d", count, p.stops, p.closes)
+	}
+	<-messages
+	if msg := <-messages; msg.CallID != "retry" || msg.Output != "raw launch" || len(messages) != 0 {
+		t.Fatalf("missing or repeated matching result: %+v", msg)
+	}
+}
+
 // The fake shell has its own group and an already-running child before Cursor
 // reports success.pid, matching the process relationships observed in #8050.
 func runFakeCursorStream(mode string) {
@@ -26,6 +76,14 @@ func runFakeCursorStream(mode string) {
 		return
 	}
 	if mode == "shell" {
+		if gate := os.Getenv("CURSOR_FAKE_FORK_GATE"); gate != "" {
+			for {
+				if _, err := os.Stat(gate); err == nil {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
 		child := exec.Command(os.Args[0])
 		child.Env = append(os.Environ(), cursorFakeModeEnv+"=leaf")
 		hideAgentWindow(child)
@@ -63,7 +121,13 @@ func runFakeCursorStream(mode string) {
 			panic(err)
 		}
 		children = append(children, child)
-		for {
+		if mode == "late" {
+			data, _ := json.Marshal([]int{child.Process.Pid})
+			if err := os.WriteFile(pidFile, data, 0600); err != nil {
+				panic(err)
+			}
+		}
+		for mode != "late" {
 			var pids []int
 			data, _ := os.ReadFile(pidFile)
 			if json.Unmarshal(data, &pids) == nil && len(pids) == 2 {
@@ -232,6 +296,8 @@ func TestCursorBackgroundUnverifiedPIDKeepsToolInFlight(t *testing.T) {
 	defer cancel()
 	messages := make(chan Message, 1)
 	tracker := newCursorBackgroundTools(ctx, nil, messages, slog.Default())
+	tracker.Send(Message{Type: MessageToolUse, Tool: "shell", CallID: "unverified"})
+	<-messages
 	call := cursorToolCall{Name: "shell", CallID: "unverified", Background: true, PID: -1, Result: `{"isBackground":true}`}
 	tracker.Add(call)
 	tracker.Reap()
@@ -239,6 +305,9 @@ func TestCursorBackgroundUnverifiedPIDKeepsToolInFlight(t *testing.T) {
 		t.Fatal("unverified PID was reported cleaned up")
 	}
 	tracker.Close()
+	if count, _ := tracker.Activity(); count != 1 {
+		t.Fatalf("unconfirmed cleanup decremented native tool count: %d", count)
+	}
 	if msg := <-messages; msg.Output != call.Result {
 		t.Fatalf("raw launch result lost: %+v", msg)
 	}

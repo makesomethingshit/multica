@@ -167,6 +167,46 @@ func TestBackgroundToolWatchdogNaturalExitRace(t *testing.T) {
 	})
 }
 
+func TestBackgroundToolWatchdogFreshActivityDuringRevalidation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var last, threshold atomic.Int64
+		var fired atomic.Bool
+		last.Store(time.Now().UnixNano())
+		refreshAtBoundary, refreshed := false, false
+		// Match Session.ToolActivity's production callback: refreshing native
+		// activity publishes a timestamp even when the tool count stays positive.
+		toolState := func() int32 {
+			if refreshAtBoundary && !refreshed {
+				last.Store(time.Now().UnixNano())
+				refreshed = true
+			}
+			return 1
+		}
+		go new(Daemon).runIdleWatchdog(ctx, time.Minute, time.Minute, &last, toolState, &fired, &threshold, cancel, make(chan agent.Message), func() bool {
+			refreshAtBoundary = true
+			return false
+		}, slog.Default())
+		synctest.Wait()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if !refreshed || fired.Load() || ctx.Err() != nil {
+			t.Fatalf("fresh native activity lost: refreshed=%v fired=%v err=%v", refreshed, fired.Load(), ctx.Err())
+		}
+		time.Sleep(59 * time.Second)
+		synctest.Wait()
+		if fired.Load() || ctx.Err() != nil {
+			t.Fatal("watchdog did not grant the renewed tool budget")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if !fired.Load() || ctx.Err() == nil {
+			t.Fatal("genuine inactivity after the renewed budget did not fire")
+		}
+	})
+}
+
 func TestExecuteAndDrain_BackgroundNativeCountSurvivesDroppedTranscript(t *testing.T) {
 	d := newTestDaemon(t)
 	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond

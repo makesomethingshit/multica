@@ -165,8 +165,9 @@ func (b *cursorBackgroundTools) Close() {
 		b.finish(true)
 		for _, tool := range b.tools {
 			// The stream is closing, so preserve even unverifiable launch
-			// payloads in the transcript without granting watchdog recovery.
-			b.SendResult(tool.call)
+			// payloads without pretending cleanup succeeded in native accounting.
+			b.logger.Warn("Cursor background cleanup unconfirmed at close", "call_id", tool.call.CallID)
+			trySend(b.messages, Message{Type: MessageToolResult, Tool: tool.call.Name, CallID: tool.call.CallID, Output: tool.call.Result})
 			tool.process.Close()
 		}
 		b.tools = nil

@@ -9321,9 +9321,16 @@ func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow ti
 			if agentCtx.Err() != nil {
 				return
 			}
-			if lastActivityAt.Load() != last.UnixNano() ||
-				(inFlightTools() > 0) != toolInFlight || len(messages) > 0 {
+			// Refresh native tool activity BEFORE reading its timestamp. The
+			// callback may publish newer activity without changing the count.
+			currentToolInFlight := inFlightTools() > 0
+			currentActivity := lastActivityAt.Load()
+			if currentActivity != last.UnixNano() ||
+				currentToolInFlight != toolInFlight || len(messages) > 0 {
 				continue
+			}
+			if agentCtx.Err() != nil {
+				return
 			}
 			// No "task" field here: taskLog already carries the full id.
 			taskLog.Warn("idle watchdog firing: no agent activity, force-stopping run",
