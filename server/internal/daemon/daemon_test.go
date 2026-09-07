@@ -2758,6 +2758,80 @@ func TestGH8082LongTranscriptStillDrops(t *testing.T) {
 	}
 }
 
+// TestGH8082HeaderLimitBoundary pins the off-by-one semantics of
+// piSessionHeaderLimit: the bound counts first-line header bytes only, the
+// newline delimiter itself never counts toward it. A first line of exactly
+// the limit stays decidable, while limit+1 is undecidable however the line
+// is terminated.
+func TestGH8082HeaderLimitBoundary(t *testing.T) {
+	t.Parallel()
+
+	// buildHeaderOfLen returns a valid session header JSON of exactly n
+	// bytes whose cwd is the (already deleted) gone path.
+	buildHeaderOfLen := func(t *testing.T, gone string, n int) []byte {
+		t.Helper()
+		base, err := json.Marshal(map[string]any{"type": "session", "cwd": gone})
+		if err != nil {
+			t.Fatalf("marshal base header: %v", err)
+		}
+		// New header: base minus "}" plus `,"pad":"<pad>"}`.
+		const padOverhead = len(`,"pad":""}`)
+		padLen := n - (len(base) - 1) - padOverhead
+		if padLen < 0 {
+			t.Fatalf("target length %d below minimal header length %d", n, len(base))
+		}
+		out := append(base[:len(base)-1], `,"pad":"`...)
+		out = append(out, strings.Repeat("x", padLen)...)
+		out = append(out, `"}`...)
+		if len(out) != n {
+			t.Fatalf("built header length = %d, want %d", len(out), n)
+		}
+		return out
+	}
+
+	cases := []struct {
+		name      string
+		lineLen   int
+		suffix    string
+		wantReach bool
+	}{
+		{name: "exact limit LF drops", lineLen: piSessionHeaderLimit, suffix: "\n", wantReach: false},
+		{name: "exact limit no newline drops", lineLen: piSessionHeaderLimit, suffix: "", wantReach: false},
+		{name: "limit+1 LF stays resumable", lineLen: piSessionHeaderLimit + 1, suffix: "\n", wantReach: true},
+		{name: "limit+1 no newline stays resumable", lineLen: piSessionHeaderLimit + 1, suffix: "", wantReach: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := t.TempDir()
+			gone := filepath.Join(base, "recorded")
+			if err := os.MkdirAll(gone, 0o755); err != nil {
+				t.Fatalf("create recorded: %v", err)
+			}
+		envDir := filepath.Join(base, "fresh")
+			if err := os.MkdirAll(envDir, 0o755); err != nil {
+				t.Fatalf("create env: %v", err)
+			}
+			if err := os.RemoveAll(gone); err != nil {
+				t.Fatalf("delete recorded: %v", err)
+			}
+			header := buildHeaderOfLen(t, gone, tc.lineLen)
+			sessionPath := filepath.Join(base, "s.jsonl")
+			content := append(append([]byte{}, header...), tc.suffix...)
+			if err := os.WriteFile(sessionPath, content, 0o644); err != nil {
+				t.Fatalf("write session: %v", err)
+			}
+			task := Task{PriorSessionID: sessionPath, PriorWorkDir: gone}
+			taskCtx := execenv.TaskContextForEnv{PriorSessionResumed: true}
+			reachable := gateResumeToReachableSession(&task, &taskCtx, "pi", envDir, true, slog.Default())
+			if reachable != tc.wantReach {
+				t.Fatalf("reachable = %v, want %v (first-line len %d)", reachable, tc.wantReach, tc.lineLen)
+			}
+		})
+	}
+}
+
 // TestGH8082OmpAndOtherProvidersUnaffected: the missing-cwd check is
 // Pi-only, so OMP keeps a deleted-cwd session reachable (prior behaviour)
 // and cwd-keyed providers are untouched.

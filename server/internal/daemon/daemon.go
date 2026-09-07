@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -6221,23 +6222,15 @@ func piSessionRecordedCwdMissing(sessionPath string) bool {
 	defer f.Close()
 	// Bounded first-line read: stop at the newline so the transcript body
 	// is never consumed. Handles LF, CRLF, and a missing trailing newline.
-	var line []byte
-	one := make([]byte, 1)
-	for len(line) <= piSessionHeaderLimit {
-		n, rerr := f.Read(one)
-		if n > 0 {
-			if one[0] == '\n' {
-				break
-			}
-			line = append(line, one[0])
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			return false
-		}
+	// The buffered cap admits at most piSessionHeaderLimit content bytes
+	// plus the newline delimiter, so the delimiter itself never counts
+	// toward the bound: a first line of exactly the limit stays decidable,
+	// while limit+1 is undecidable however the line is terminated.
+	raw, rerr := bufio.NewReader(io.LimitReader(f, int64(piSessionHeaderLimit)+2)).ReadBytes('\n')
+	if rerr != nil && rerr != io.EOF {
+		return false
 	}
+	line := bytes.TrimSuffix(raw, []byte("\n"))
 	if len(line) > piSessionHeaderLimit {
 		return false
 	}
