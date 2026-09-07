@@ -581,6 +581,33 @@ const mockIssue: Issue = {
   revision: 3,
 };
 
+const longTransitionDescription = Array.from(
+  { length: 500 },
+  (_, index) => `Deferred paragraph ${index}.`,
+).join("\n\n");
+const mixedTransitionDescription = [
+  "# Heading",
+  "",
+  "- first item",
+  "- second item",
+  "",
+  "| A | B |",
+  "| --- | --- |",
+  "| 1 | 2 |",
+  "",
+  "```ts",
+  "const ready = true;",
+  "```",
+].join("\n");
+const imageTransitionDescription =
+  "![Example image](https://example.test/description.png)\n\nImage caption.";
+const descriptionTransitionCases = [
+  ["short markdown", "Short cached description."],
+  ["long markdown", longTransitionDescription],
+  ["heading, list, table, and code markdown", mixedTransitionDescription],
+  ["image markdown", imageTransitionDescription],
+] as const;
+
 const mockTimeline: TimelineEntry[] = [
   {
     type: "comment",
@@ -837,38 +864,61 @@ describe("IssueDetail (shared)", () => {
     expect(contentEditorMounts.count).toBe(1);
   });
 
-  it("keeps cached description visible while its editor initializes during a background refresh", async () => {
-    const queryClient = new QueryClient({
-      defaultOptions: {
-        queries: { retry: false, gcTime: 0, staleTime: Infinity },
-        mutations: { retry: false },
-      },
-    });
-    queryClient.setQueryData(["issues", "ws-1", "detail", "issue-1"], mockIssue);
-    mockApiObj.getIssue.mockReturnValue(new Promise(() => {}));
-    contentEditorReady.defer = true;
+  it.each(descriptionTransitionCases)(
+    "keeps cached %s visible through the editor DOM handoff",
+    async (_name, description) => {
+      const queryClient = new QueryClient({
+        defaultOptions: {
+          queries: { retry: false, gcTime: 0, staleTime: Infinity },
+          mutations: { retry: false },
+        },
+      });
+      queryClient.setQueryData(
+        ["issues", "ws-1", "detail", "issue-1"],
+        { ...mockIssue, description },
+      );
+      mockApiObj.getIssue.mockReturnValue(new Promise(() => {}));
+      contentEditorReady.defer = true;
 
-    render(
-      <I18nProvider locale="en" resources={TEST_RESOURCES}>
-        <QueryClientProvider client={queryClient}>
-          <IssueDetail issueId="issue-1" />
-        </QueryClientProvider>
-      </I18nProvider>,
-    );
+      const { container } = render(
+        <I18nProvider locale="en" resources={TEST_RESOURCES}>
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail issueId="issue-1" />
+          </QueryClientProvider>
+        </I18nProvider>,
+      );
 
-    const readonlyDescription = () =>
-      screen
-        .queryAllByTestId("readonly-content")
-        .filter((element) => element.textContent === "Add JWT auth to the backend");
+      const readonlyDescription = () =>
+        screen
+          .queryAllByTestId("readonly-content")
+          .filter((element) => element.textContent === description);
 
-    await waitFor(() => expect(mockApiObj.getIssue).toHaveBeenCalledWith("issue-1"));
-    expect(readonlyDescription()).toHaveLength(1);
-    expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
+      await waitFor(() => expect(mockApiObj.getIssue).toHaveBeenCalledWith("issue-1"));
+      await screen.findByText("Started working on this");
+      expect(readonlyDescription()).toHaveLength(1);
+      expect(screen.queryByDisplayValue(description)).not.toBeInTheDocument();
 
-    act(() => contentEditorReady.resolve?.());
-    expect(await screen.findByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
-    expect(readonlyDescription()).toHaveLength(0);
-  });
+      const readonlyContent = readonlyDescription()[0];
+      const editorShell = readonlyContent?.nextElementSibling;
+      const followingContent = editorShell?.nextElementSibling;
+      const scrollContainer = container.querySelector<HTMLElement>(
+        '[data-tab-scroll-root="main:issue-1"]',
+      );
+
+      expect(editorShell).not.toBeNull();
+      expect(followingContent).not.toBeNull();
+      expect(scrollContainer).not.toBeNull();
+      scrollContainer!.scrollTop = 37;
+
+      act(() => contentEditorReady.resolve?.());
+      const editor = await screen.findByTestId("rich-text-editor");
+      expect(editor).toHaveValue(description);
+      expect(readonlyDescription()).toHaveLength(0);
+      expect(editor.parentElement).toBe(editorShell);
+      expect(editor.parentElement?.nextElementSibling).toBe(followingContent);
+      expect(scrollContainer!.scrollTop).toBe(37);
+    },
+  );
 
   it("reconciles a cached list snapshot so source context appears on first entry", async () => {
     const sourceContext: NonNullable<Issue["source_context"]> = {
@@ -979,7 +1029,48 @@ describe("IssueDetail (shared)", () => {
     expect(description).toHaveAttribute("data-flush-on-unmount", "true");
   });
 
-  it("remounts the eager description on issue switch without carrying stale content", async () => {
+  it("shows the cached description again when the same issue re-enters", async () => {
+    const description = "Same issue re-entry description.";
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, gcTime: 0, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    queryClient.setQueryData(
+      ["issues", "ws-1", "detail", "issue-1"],
+      { ...mockIssue, description },
+    );
+    mockApiObj.getIssue.mockReturnValue(new Promise(() => {}));
+    contentEditorReady.defer = true;
+    const ui = (show: boolean) => (
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={queryClient}>
+          {show && <IssueDetail issueId="issue-1" />}
+        </QueryClientProvider>
+      </I18nProvider>
+    );
+    const readonlyDescription = () =>
+      screen
+        .queryAllByTestId("readonly-content")
+        .filter((element) => element.textContent === description);
+    const { rerender } = render(ui(true));
+
+    await waitFor(() => expect(readonlyDescription()).toHaveLength(1));
+    act(() => contentEditorReady.resolve?.());
+    expect(await screen.findByDisplayValue(description)).toBeInTheDocument();
+
+    rerender(ui(false));
+    rerender(ui(true));
+
+    await waitFor(() => expect(readonlyDescription()).toHaveLength(1));
+    expect(screen.queryByDisplayValue(description)).not.toBeInTheDocument();
+    act(() => contentEditorReady.resolve?.());
+    expect(await screen.findByDisplayValue(description)).toBeInTheDocument();
+    expect(contentEditorMounts.count).toBe(2);
+  });
+
+  it("supports A → B → A description handoffs without carrying stale content", async () => {
     // The web route reuses IssueDetail across issues. The keyed description
     // editor must remount atomically for the new issue while the title remains
     // on its cheap stand-in.
@@ -1005,6 +1096,10 @@ describe("IssueDetail (shared)", () => {
         </QueryClientProvider>
       </I18nProvider>
     );
+    const readonlyDescription = (description: string) =>
+      screen
+        .queryAllByTestId("readonly-content")
+        .filter((element) => element.textContent === description);
     const { rerender } = render(ui("issue-1"));
 
     await screen.findByDisplayValue("Add JWT auth to the backend");
@@ -1014,6 +1109,7 @@ describe("IssueDetail (shared)", () => {
     rerender(ui("issue-2"));
 
     expect(await screen.findByText("Second description")).toBeInTheDocument();
+    expect(readonlyDescription("Second description")).toHaveLength(1);
     expect(screen.queryByDisplayValue("Second description")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
     expect(screen.queryByTestId("title-editor")).not.toBeInTheDocument();
@@ -1021,15 +1117,19 @@ describe("IssueDetail (shared)", () => {
 
     act(() => contentEditorReady.resolve?.());
     expect(await screen.findByDisplayValue("Second description")).toBeInTheDocument();
+    expect(readonlyDescription("Second description")).toHaveLength(0);
 
     contentEditorReady.defer = true;
     rerender(ui("issue-1"));
 
     expect(await screen.findByText("Add JWT auth to the backend")).toBeInTheDocument();
+    expect(readonlyDescription("Add JWT auth to the backend")).toHaveLength(1);
     expect(screen.queryByDisplayValue("Add JWT auth to the backend")).not.toBeInTheDocument();
 
     act(() => contentEditorReady.resolve?.());
     expect(await screen.findByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
+    expect(readonlyDescription("Add JWT auth to the backend")).toHaveLength(0);
+    expect(screen.queryByDisplayValue("Second description")).not.toBeInTheDocument();
   });
 
   it("renders the issue title leaf as a link to the issue detail page", async () => {

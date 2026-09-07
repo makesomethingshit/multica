@@ -9,8 +9,9 @@ vi.mock("../i18n", () => ({
   useT: () => ({ t: () => "" }),
 }));
 
+const chunkedDescriptionParagraphCount = 500;
 const chunkedDescription = Array.from(
-  { length: 500 },
+  { length: chunkedDescriptionParagraphCount },
   (_, index) => `Chunked description paragraph ${index}.`,
 ).join("\n\n");
 const shortDescription = "Short description.";
@@ -58,7 +59,12 @@ describe("ContentEditor initial readiness (real editor)", () => {
   });
 
   it("does not remove its fallback until a chunked initial body reaches the editor DOM", async () => {
-    const fallbackRemovalDomLengths: number[] = [];
+    const fallbackRemovalSnapshots: Array<{
+      textLength: number;
+      paragraphCount: number;
+      firstParagraph: string;
+      lastParagraph: string;
+    }> = [];
     const onReady = vi.fn();
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -69,9 +75,14 @@ describe("ContentEditor initial readiness (real editor)", () => {
 
       useLayoutEffect(() => {
         if (ready) {
-          fallbackRemovalDomLengths.push(
-            document.querySelector(".ProseMirror")?.textContent?.length ?? 0,
-          );
+          const editor = document.querySelector(".ProseMirror");
+          const paragraphs = Array.from(editor?.querySelectorAll("p") ?? []);
+          fallbackRemovalSnapshots.push({
+            textLength: editor?.textContent?.length ?? 0,
+            paragraphCount: paragraphs.length,
+            firstParagraph: paragraphs[0]?.textContent ?? "",
+            lastParagraph: paragraphs.at(-1)?.textContent ?? "",
+          });
         }
       }, [ready]);
 
@@ -100,10 +111,16 @@ describe("ContentEditor initial readiness (real editor)", () => {
     );
 
     await waitFor(
-      () => expect(fallbackRemovalDomLengths).toHaveLength(1),
+      () => expect(fallbackRemovalSnapshots).toHaveLength(1),
       { timeout: 5_000 },
     );
     expect(onReady).toHaveBeenCalledTimes(1);
-    expect(fallbackRemovalDomLengths[0]).toBeGreaterThan(0);
+    expect(fallbackRemovalSnapshots[0]).toEqual({
+      textLength: expect.any(Number),
+      paragraphCount: chunkedDescriptionParagraphCount,
+      firstParagraph: "Chunked description paragraph 0.",
+      lastParagraph: "Chunked description paragraph 499.",
+    });
+    expect(fallbackRemovalSnapshots[0]?.textLength).toBeGreaterThan(0);
   });
 });
