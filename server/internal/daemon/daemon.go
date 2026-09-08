@@ -9200,6 +9200,25 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		// hand back (and let runTask fail-and-broadcast) a still-flushing
 		// transcript either.
 		waitForDrain()
+		// A decided outcome outranks every classifier below, this branch
+		// included. The watchdog reads terminalObserved and only then writes
+		// fired/cancel, so the terminal result can be published in between; the
+		// cancellation that follows lands here rather than on the Result arm,
+		// because the backend is still finalizing and cannot deliver Result
+		// yet. Classifying here without re-checking is what turned a completed
+		// run into idle_watchdog. The backend bounds its own finalization, so
+		// this wait is bounded too — and if it somehow is not, falling through
+		// keeps the old (bounded, if misclassified) behaviour rather than
+		// hanging the run.
+		if terminalObserved() {
+			select {
+			case result := <-session.Result:
+				return result, toolCount.Load(), nil
+			case <-time.After(terminalResultHandoffBudget):
+				taskLog.Warn("terminal result was observed but the backend did not finalize in time; classifying by liveness instead",
+					"budget", terminalResultHandoffBudget.String())
+			}
+		}
 		// Idle watchdog cancels via agentCancel(), which propagates here as
 		// context.Canceled. Check this BEFORE the generic cancelled/timeout
 		// classifiers so a watchdog-induced stop isn't misreported as
@@ -9227,6 +9246,13 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		}, toolCount.Load(), nil
 	}
 }
+
+// terminalResultHandoffBudget is how long executeAndDrain waits for a backend
+// that has already observed its terminal result to hand that result over. It is
+// a backstop, not the real bound: the backend caps its own finalization, and
+// this only decides how long we believe it before falling back to liveness
+// classification.
+const terminalResultHandoffBudget = 30 * time.Second
 
 // idleWatchdogReason formats the human-facing explanation surfaced on
 // idle_watchdog dispositions. Centralised so the result-arrival branch and the

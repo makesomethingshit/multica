@@ -141,3 +141,82 @@ func TestExecuteAndDrainKeepsTerminalResultObservedDuringCleanup(t *testing.T) {
 		t.Fatalf("Cursor's authoritative result was rewritten: %+v", result)
 	}
 }
+
+// lateTerminalBackend closes the remaining window: the terminal result is
+// published in the instant AFTER the watchdog's final gate read it and BEFORE
+// the watchdog writes fired/cancel. The run then reaches executeAndDrain
+// through drainCtx.Done() rather than the Result arm, because the backend
+// cannot deliver Result until its own finalization is done.
+type lateTerminalBackend struct {
+	terminal atomic.Bool
+	reads    atomic.Int32
+	cancels  atomic.Int32
+}
+
+// TerminalObserved answers the caller with the value it had when the read
+// started, then publishes. The reader that triggers the flip still sees false —
+// which is exactly the watchdog's final gate losing the race by one instant.
+func (b *lateTerminalBackend) TerminalObserved() bool {
+	if b.terminal.Load() {
+		return true
+	}
+	if b.reads.Add(1) >= 2 {
+		b.terminal.Store(true)
+	}
+	return false
+}
+
+func (b *lateTerminalBackend) Execute(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	messages := make(chan agent.Message, 4)
+	results := make(chan agent.Result, 1)
+	var nativeCount atomic.Int32
+	var nativeActivity atomic.Int64
+	nativeCount.Store(1)
+	nativeActivity.Store(time.Now().UnixNano())
+	messages <- agent.Message{Type: agent.MessageToolUse, Tool: "shell", CallID: "bg"}
+
+	go func() {
+		defer close(messages)
+		defer close(results)
+		<-ctx.Done()
+		b.cancels.Add(1)
+		// Cursor had already read its authoritative result, so the cancellation
+		// it is finishing under does not change the outcome — the same thing
+		// cursor.go does once resultSeen is true.
+		results <- agent.Result{Status: "completed", Output: "Cursor terminal result"}
+	}()
+
+	return &agent.Session{
+		Messages:         messages,
+		Result:           results,
+		ToolActivity:     func() (int32, time.Time) { return nativeCount.Load(), time.Unix(0, nativeActivity.Load()) },
+		TerminalObserved: b.TerminalObserved,
+		// Nothing can be released: cleanup could not confirm ownership.
+		InterruptBackgroundTools: func() bool { return false },
+	}, nil
+}
+
+// TestExecuteAndDrainKeepsTerminalResultPublishedAfterTheFinalGate is the case
+// the previous regression test did not reach: there the watchdog returned at
+// its final gate, so it never fired and the drain-timeout classifier never ran.
+// Here it does fire, and the decided outcome still has to survive.
+func TestExecuteAndDrainKeepsTerminalResultPublishedAfterTheFinalGate(t *testing.T) {
+	d := newTestDaemon(t)
+	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
+	d.cfg.AgentToolWatchdog = 50 * time.Millisecond
+
+	backend := &lateTerminalBackend{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, _, err := d.executeAndDrain(ctx, backend, "test", agent.ExecOptions{}, slog.Default(), "late-terminal", "", new(atomic.Int32))
+	if err != nil {
+		t.Fatalf("executeAndDrain: %v", err)
+	}
+	if backend.cancels.Load() == 0 {
+		t.Fatal("the watchdog never cancelled; this test did not exercise the fired path")
+	}
+	if result.Status != "completed" || result.Output != "Cursor terminal result" {
+		t.Fatalf("a decided outcome was reclassified after the final gate: %+v", result)
+	}
+}
