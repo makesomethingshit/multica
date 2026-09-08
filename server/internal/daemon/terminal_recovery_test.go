@@ -23,6 +23,7 @@ type terminalRecoveryServer struct {
 	status       string // authoritative task status answered by /status
 	notFound     bool   // /status answers 404 task not found
 	statusBroken bool   // /status answers 502
+	statusCode   int    // /status answer override (0 → default behavior)
 	completeCode int    // POST /complete answer (0 → 200)
 	failCode     int    // POST /fail answer (0 → 200)
 	// onStatus, when set, runs inside the /status handler — test seam for
@@ -51,11 +52,15 @@ func (s *terminalRecoveryServer) handler() http.Handler {
 				s.onStatus()
 			}
 			s.mu.Lock()
-			notFound, broken, status := s.notFound, s.statusBroken, s.status
+			notFound, broken, status, statusCode := s.notFound, s.statusBroken, s.status, s.statusCode
 			s.mu.Unlock()
 			if notFound {
 				w.WriteHeader(http.StatusNotFound)
-				_, _ = w.Write([]byte("task not found"))
+			_, _ = w.Write([]byte("task not found"))
+				return
+			}
+			if statusCode != 0 {
+				w.WriteHeader(statusCode)
 				return
 			}
 			if broken {
@@ -525,5 +530,142 @@ func TestPendingTerminalReportReenqueueDuringRecoveryKeepsLatest(t *testing.T) {
 	}
 	if got := srvState.completeCalls.Load(); got != 1 {
 		t.Fatalf("complete calls after follow-up pass = %d, want 1 (no second mutation)", got)
+	}
+}
+
+// Fail-recovery scope expansion (#8157 follow-up): fail reports replay while
+// the server row is still dispatched, because pre-execution failures settle
+// the task before provider execution ever starts.
+func TestTerminalReportRecovery_DispatchedFailRecoveryDelivers(t *testing.T) {
+	srvState := &terminalRecoveryServer{status: "dispatched"}
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:         terminalTaskReportFail,
+		taskID:       "task-dispatched-fail",
+		errorMessage: "runtime went offline before the task started",
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.failCalls.Load(); got != 1 {
+		t.Fatalf("fail calls = %d, want 1 (fail may settle a pre-running task)", got)
+	}
+	if got := srvState.completeCalls.Load(); got != 0 {
+		t.Fatalf("complete calls = %d, want 0 (only the fail callback replays)", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0", got)
+	}
+	srvState.mu.Lock()
+	defer srvState.mu.Unlock()
+	if srvState.status != "failed" {
+		t.Fatalf("server state = %q, want failed", srvState.status)
+	}
+}
+
+// Fail reports also replay while the row waits on a local-directory lock:
+// lock-wait failures settle before execution starts, same as dispatched.
+func TestTerminalReportRecovery_WaitingLocalDirectoryFailRecoveryDelivers(t *testing.T) {
+	srvState := &terminalRecoveryServer{status: "waiting_local_directory"}
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:         terminalTaskReportFail,
+		taskID:       "task-waiting-fail",
+		errorMessage: "local_directory wait cancelled: context canceled",
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.failCalls.Load(); got != 1 {
+		t.Fatalf("fail calls = %d, want 1", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0", got)
+	}
+	srvState.mu.Lock()
+	defer srvState.mu.Unlock()
+	if srvState.status != "failed" {
+		t.Fatalf("server state = %q, want failed", srvState.status)
+	}
+}
+
+// Completion asymmetry guard: a completion meeting a dispatched row must
+// never replay — CompleteTask may only be recovered after execution reached
+// running. The report stays queued, untouched, for a later running pass.
+func TestTerminalReportRecovery_DispatchedCompleteNotReplayed(t *testing.T) {
+	srvState := &terminalRecoveryServer{status: "dispatched"}
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	queuedCompleteReport(d, "task-dispatched-complete")
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.completeCalls.Load(); got != 0 {
+		t.Fatalf("complete calls = %d, want 0 (completion must not settle a pre-running row)", got)
+	}
+	if got := srvState.failCalls.Load(); got != 0 {
+		t.Fatalf("fail calls = %d, want 0 (no mutation at all)", got)
+	}
+	pending := d.pendingTerminalReportSnapshot()
+	if len(pending) != 1 {
+		t.Fatalf("pending reports = %d, want 1 (kept for a later running pass)", len(pending))
+	}
+	if got := pending["task-dispatched-complete"].output; got != "provider finished" {
+		t.Fatalf("surviving report output = %q, want the original report untouched", got)
+	}
+}
+
+// Status-lookup hardening: a permanent 4xx (e.g. 400) drops the pending
+// report instead of polling a dead row every 30 seconds forever. No terminal
+// mutation happens on this path.
+func TestTerminalReportRecovery_PermanentStatusLookupDropsPending(t *testing.T) {
+	srvState := &terminalRecoveryServer{status: "running", statusCode: http.StatusBadRequest}
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	queuedCompleteReport(d, "task-dead-row")
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0 (permanent lookup rejection drops)", got)
+	}
+	if got := srvState.completeCalls.Load(); got != 0 {
+		t.Fatalf("complete calls = %d, want 0 (no terminal mutation on lookup failure)", got)
+	}
+	if got := srvState.failCalls.Load(); got != 0 {
+		t.Fatalf("fail calls = %d, want 0", got)
+	}
+}
+
+// A deleted row drops the pending report without any mutation — the lost-row
+// complement to the lost-success-response test.
+func TestPendingTerminalReportNotFoundDropsPending(t *testing.T) {
+	srvState := &terminalRecoveryServer{notFound: true}
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	queuedCompleteReport(d, "task-gone")
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0 (nothing left to settle)", got)
+	}
+	if got := srvState.completeCalls.Load(); got != 0 {
+		t.Fatalf("complete calls = %d, want 0", got)
+	}
+	if got := srvState.failCalls.Load(); got != 0 {
+		t.Fatalf("fail calls = %d, want 0", got)
 	}
 }

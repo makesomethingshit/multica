@@ -147,20 +147,47 @@ func (d *Daemon) recoverPendingTerminalReports(ctx context.Context) {
 	}
 }
 
+// terminalReportCanReplay reports whether a pending terminal report may be
+// replayed against the authoritative server status (fail-recovery scope
+// expansion, #8157 follow-up). The kind asymmetry is deliberate and is the
+// core invariant of this fix:
+//
+//	FailTask may settle a task before provider execution reaches running.
+//	CompleteTask may only be recovered after execution reached running.
+//
+// Pre-execution failures (runtime-untracked claims, local-directory
+// validation or lock failures) legitimately settle the task while the server
+// row is still dispatched or waiting_local_directory, so fail reports replay
+// there. Replaying a completion before the row ran would settle work the
+// server may still dispatch, so complete reports replay only while running.
+func terminalReportCanReplay(status string, kind terminalTaskReportKind) bool {
+	if status == "running" {
+		return true
+	}
+	if kind == terminalTaskReportFail {
+		return status == "dispatched" || status == "waiting_local_directory"
+	}
+	return false
+}
+
 // recoverOneTerminalReport settles one pending report against the
 // authoritative server state. The state machine is intentionally total:
 //
-//	running                  → one delivery attempt; success removes the
-//	                           report, transient failure keeps it, permanent
-//	                           rejection drops it
-//	completed                → drop (another delivery path won, or a lost
-//	                           success response already committed)
-//	failed                   → drop; never reclaim, never rewrite the parent
-//	                           (#4579 split-brain stays closed)
-//	cancelled                → drop; user cancellation is authoritative
-//	404 task not found       → drop; nothing left to settle
-//	transient lookup error   → keep; retry on a later pass
-//	unexpected non-terminal  → keep; log the state, never mutate it
+//	running + any kind              → one delivery attempt; success removes the
+//	                               report, transient failure keeps it, permanent
+//	                               rejection drops it
+//	dispatched /                    → one delivery attempt (fail reports only)
+//	waiting_local_directory + fail
+//	dispatched /                    → keep; never replay a completion before the
+//	waiting_local_directory +
+//	complete                       row ran
+//	completed / failed /
+//	cancelled                       → drop; never overwrite a terminal state
+//	404 task not found              → drop; nothing left to settle
+//	transient lookup error          → keep; retry on a later pass
+//	permanent (4xx) lookup error    → drop + error log; never poll a dead row
+//	                                forever
+//	other non-terminal states       → keep; log the state, never mutate it
 func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTaskReport) {
 	taskLog := d.logger.With("task_id", report.taskID, "terminal_kind", report.kind.String())
 
@@ -171,12 +198,22 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 			taskLog.Info("dropping pending terminal report; server task not found")
 			return
 		}
+		if !isTransientError(err) {
+			// Permanent lookup rejection (e.g. 400/401/403): the status
+			// endpoint refuses this row for good. Drop the report with an
+			// error log instead of polling a dead row every 30 seconds
+			// forever. 404s are handled above; anything reaching here is a
+			// non-404 permanent 4xx.
+			d.removePendingTerminalReport(report.taskID, report)
+			taskLog.Error("terminal recovery status lookup permanently rejected; dropping pending report", "error", err)
+			return
+		}
 		taskLog.Warn("terminal recovery status lookup failed; keeping pending report", "error", err)
 		return
 	}
 
 	switch {
-	case status == "running":
+	case terminalReportCanReplay(status, report.kind):
 		// Single delivery attempt — the loop is the retry mechanism. Do not
 		// stack defaultTerminalRetrySchedule inside background passes; that
 		// would serialize a 124-second stall into every tick.
