@@ -29,6 +29,9 @@ type cursorBackgroundTools struct {
 	once             sync.Once
 	inFlight         atomic.Int32
 	lastToolActivity atomic.Int64
+	// closeBudget overrides cursorCloseBudget for this tracker. Zero — the value
+	// every production construction path leaves it at — means the constant.
+	closeBudget time.Duration
 	// terminal is set the moment Cursor's authoritative result is read, before
 	// Close() takes mu. Cleanup can block on that lock behind an in-progress
 	// Interrupt and can legitimately fail, so it cannot be the signal that the
@@ -121,11 +124,22 @@ func (b *cursorBackgroundTools) Add(call cursorToolCall) {
 	b.tools = append(b.tools, cursorBackgroundTool{call: call, process: p})
 }
 
+// cursorCloseBudget bounds the WHOLE of Close(), not each process in it.
+// Per-process termination is already bounded, but the number of background
+// shells one run may launch is not, so "bounded per process" is not a bound on
+// finalization. It has to be one, because Close() runs after the terminal
+// result has been observed — the point at which the daemon's watchdog has
+// deliberately stopped supervising this run, and MULTICA_AGENT_TIMEOUT is 0 by
+// default. Work still unconfirmed when the budget runs out takes the existing
+// unconfirmed-at-close path: its result is preserved and its cleanup is logged
+// as unconfirmed, never reported as successful.
+const cursorCloseBudget = 10 * time.Second
+
 func (b *cursorBackgroundTools) Reap() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.closed {
-		b.finish(false)
+		b.finish(false, time.Time{})
 	}
 }
 
@@ -137,16 +151,24 @@ func (b *cursorBackgroundTools) Interrupt() bool {
 	if b.closed || b.ctx.Err() != nil {
 		return false
 	}
-	return b.finish(true)
+	return b.finish(true, time.Time{})
 }
 
 // finish is called with mu held. A failed ownership check or cleanup never
 // decrements the tool count; only confirmed process exit releases its result.
-func (b *cursorBackgroundTools) finish(interrupt bool) bool {
+//
+// A non-zero deadline caps the whole pass rather than each process: once it has
+// passed, the remaining tools are left untouched and unconfirmed instead of
+// each adding its own termination wait.
+func (b *cursorBackgroundTools) finish(interrupt bool, deadline time.Time) bool {
 	completed := false
 	remaining := b.tools[:0]
 	for _, tool := range b.tools {
 		if tool.process == nil {
+			remaining = append(remaining, tool)
+			continue
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			remaining = append(remaining, tool)
 			continue
 		}
@@ -174,13 +196,18 @@ func (b *cursorBackgroundTools) finish(interrupt bool) bool {
 
 func (b *cursorBackgroundTools) Close() {
 	b.once.Do(func() {
+		budget := b.closeBudget
+		if budget <= 0 {
+			budget = cursorCloseBudget
+		}
+		deadline := time.Now().Add(budget)
 		b.mu.Lock()
 		b.closed = true
-		b.finish(true)
+		b.finish(true, deadline)
 		if len(b.tools) > 0 {
 			// Retry a transient lookup/termination failure before releasing the
 			// final claim. Persistent errors remain explicitly unconfirmed.
-			b.finish(true)
+			b.finish(true, deadline)
 		}
 		for _, tool := range b.tools {
 			// The stream is closing, so preserve even unverifiable launch
