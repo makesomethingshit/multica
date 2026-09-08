@@ -169,6 +169,11 @@ type Session struct {
 	// to finish cleaning up. Backends must publish this before any cleanup that
 	// can block or fail, otherwise a completed run can still be re-tagged as a
 	// hang. Nil means the backend offers no such boundary.
+	//
+	// It must also be published before the backend sends on Result. The daemon
+	// reads it only after a result is in hand, so that ordering is what makes
+	// the read reliable instead of a race: delivering the result establishes
+	// the happens-before, and no flag read has to win a timing window.
 	TerminalObserved func() bool
 	// Messages streams events as the agent works. The channel is closed
 	// when the agent finishes (before Result is sent).

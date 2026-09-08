@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -142,28 +144,40 @@ func TestExecuteAndDrainKeepsTerminalResultObservedDuringCleanup(t *testing.T) {
 	}
 }
 
-// lateTerminalBackend closes the remaining window: the terminal result is
-// published in the instant AFTER the watchdog's final gate read it and BEFORE
-// the watchdog writes fired/cancel. The run then reaches executeAndDrain
-// through drainCtx.Done() rather than the Result arm, because the backend
-// cannot deliver Result until its own finalization is done.
-type lateTerminalBackend struct {
-	terminal atomic.Bool
-	reads    atomic.Int32
-	cancels  atomic.Int32
+// handoffProbe both proves and sequences the branch under test. The daemon logs
+// once, on entering the post-force-stop hand-off, and that record is the only
+// externally visible evidence of which arm executeAndDrain took. Closing the
+// gate from the handler is what keeps Result unavailable until then, so the
+// outer select provably cannot satisfy itself on the Result arm instead.
+type handoffProbe struct {
+	slog.Handler
+	gate   chan struct{}
+	once   sync.Once
+	seen   atomic.Bool
+	prefix string
 }
 
-// TerminalObserved answers the caller with the value it had when the read
-// started, then publishes. The reader that triggers the flip still sees false —
-// which is exactly the watchdog's final gate losing the race by one instant.
-func (b *lateTerminalBackend) TerminalObserved() bool {
-	if b.terminal.Load() {
-		return true
+func (h *handoffProbe) Handle(ctx context.Context, r slog.Record) error {
+	if strings.HasPrefix(r.Message, h.prefix) {
+		h.seen.Store(true)
+		h.once.Do(func() { close(h.gate) })
 	}
-	if b.reads.Add(1) >= 2 {
-		b.terminal.Store(true)
-	}
-	return false
+	return nil
+}
+
+func (h *handoffProbe) Enabled(context.Context, slog.Level) bool { return true }
+func (h *handoffProbe) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *handoffProbe) WithGroup(string) slog.Handler            { return h }
+
+// lateTerminalBackend hands its result over only once the daemon has entered
+// the hand-off, which is the ordering the previous version of this test could
+// not guarantee: there the backend sent immediately on cancellation, so the
+// outer select could take the Result arm and the drain-timeout classifier was
+// never exercised at all.
+type lateTerminalBackend struct {
+	terminal atomic.Bool
+	cancels  atomic.Int32
+	gate     <-chan struct{}
 }
 
 func (b *lateTerminalBackend) Execute(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
@@ -176,13 +190,17 @@ func (b *lateTerminalBackend) Execute(ctx context.Context, _ string, _ agent.Exe
 	messages <- agent.Message{Type: agent.MessageToolUse, Tool: "shell", CallID: "bg"}
 
 	go func() {
-		defer close(messages)
 		defer close(results)
 		<-ctx.Done()
 		b.cancels.Add(1)
-		// Cursor had already read its authoritative result, so the cancellation
-		// it is finishing under does not change the outcome — the same thing
-		// cursor.go does once resultSeen is true.
+		// Let waitForDrain complete so the hand-off is reached, then stay silent
+		// until it is: this is the backend still finalizing, which is why the
+		// cancellation surfaces on the drain arm rather than the Result arm.
+		close(messages)
+		<-b.gate
+		// The contract: publish the observation before sending Result, so the
+		// daemon's read after delivery cannot lose a race.
+		b.terminal.Store(true)
 		results <- agent.Result{Status: "completed", Output: "Cursor terminal result"}
 	}()
 
@@ -190,33 +208,38 @@ func (b *lateTerminalBackend) Execute(ctx context.Context, _ string, _ agent.Exe
 		Messages:         messages,
 		Result:           results,
 		ToolActivity:     func() (int32, time.Time) { return nativeCount.Load(), time.Unix(0, nativeActivity.Load()) },
-		TerminalObserved: b.TerminalObserved,
+		TerminalObserved: b.terminal.Load,
 		// Nothing can be released: cleanup could not confirm ownership.
 		InterruptBackgroundTools: func() bool { return false },
 	}, nil
 }
 
-// TestExecuteAndDrainKeepsTerminalResultPublishedAfterTheFinalGate is the case
-// the previous regression test did not reach: there the watchdog returned at
-// its final gate, so it never fired and the drain-timeout classifier never ran.
-// Here it does fire, and the decided outcome still has to survive.
-func TestExecuteAndDrainKeepsTerminalResultPublishedAfterTheFinalGate(t *testing.T) {
+// TestExecuteAndDrainKeepsTerminalResultHandedOverAfterForceStop pins the arm
+// that kept losing: the watchdog fires with the terminal result not yet
+// published, so the run reaches the drain-timeout classifier rather than the
+// Result arm, and the decided outcome still has to survive. The probe asserts
+// that branch really ran instead of inferring it from a passing status.
+func TestExecuteAndDrainKeepsTerminalResultHandedOverAfterForceStop(t *testing.T) {
+	probe := &handoffProbe{gate: make(chan struct{}), prefix: "idle watchdog fired; waiting"}
 	d := newTestDaemon(t)
 	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
 	d.cfg.AgentToolWatchdog = 50 * time.Millisecond
 
-	backend := &lateTerminalBackend{}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	backend := &lateTerminalBackend{gate: probe.gate}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, _, err := d.executeAndDrain(ctx, backend, "test", agent.ExecOptions{}, slog.Default(), "late-terminal", "", new(atomic.Int32))
+	result, _, err := d.executeAndDrain(ctx, backend, "test", agent.ExecOptions{}, slog.New(probe), "late-terminal", "", new(atomic.Int32))
 	if err != nil {
 		t.Fatalf("executeAndDrain: %v", err)
 	}
 	if backend.cancels.Load() == 0 {
 		t.Fatal("the watchdog never cancelled; this test did not exercise the fired path")
 	}
+	if !probe.seen.Load() {
+		t.Fatal("the post-force-stop hand-off never ran; the drain arm was not exercised")
+	}
 	if result.Status != "completed" || result.Output != "Cursor terminal result" {
-		t.Fatalf("a decided outcome was reclassified after the final gate: %+v", result)
+		t.Fatalf("a decided outcome was reclassified after the force stop: %+v", result)
 	}
 }

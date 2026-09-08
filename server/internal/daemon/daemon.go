@@ -9200,30 +9200,45 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		// hand back (and let runTask fail-and-broadcast) a still-flushing
 		// transcript either.
 		waitForDrain()
-		// A decided outcome outranks every classifier below, this branch
-		// included. The watchdog reads terminalObserved and only then writes
-		// fired/cancel, so the terminal result can be published in between; the
-		// cancellation that follows lands here rather than on the Result arm,
-		// because the backend is still finalizing and cannot deliver Result
-		// yet. Classifying here without re-checking is what turned a completed
-		// run into idle_watchdog. The backend bounds its own finalization, so
-		// this wait is bounded too — and if it somehow is not, falling through
-		// keeps the old (bounded, if misclassified) behaviour rather than
-		// hanging the run.
-		if terminalObserved() {
-			select {
-			case result := <-session.Result:
-				return result, toolCount.Load(), nil
-			case <-time.After(terminalResultHandoffBudget):
-				taskLog.Warn("terminal result was observed but the backend did not finalize in time; classifying by liveness instead",
-					"budget", terminalResultHandoffBudget.String())
-			}
-		}
 		// Idle watchdog cancels via agentCancel(), which propagates here as
 		// context.Canceled. Check this BEFORE the generic cancelled/timeout
 		// classifiers so a watchdog-induced stop isn't misreported as
 		// "task cancelled by server".
 		if idleWatchdogFired.Load() {
+			// Enter the hand-off unconditionally rather than asking
+			// terminalObserved first. Reading a flag and then acting on it is
+			// exactly the window this branch kept losing: the backend can
+			// publish its terminal result between the read and the classifier
+			// below. Waiting for the result instead makes the result's arrival
+			// the linearization point, and the backend contract (publish the
+			// observation before sending Result) is what then makes the check
+			// after it reliable rather than lucky.
+			taskLog.Info("idle watchdog fired; waiting for the backend to hand over its result",
+				"budget", terminalResultHandoffBudget.String())
+			select {
+			case result := <-session.Result:
+				if terminalObserved() {
+					// The backend had already read its authoritative result, so
+					// this is the real outcome of the run, not a hang.
+					return result, toolCount.Load(), nil
+				}
+				// The backend's wait goroutine (e.g. claude.go) translates the
+				// SIGKILL we delivered via agentCancel into Status="aborted".
+				// Re-tag it as "idle_watchdog" so runTask routes the
+				// disposition through a dedicated failure_reason, not the
+				// generic "agent_error" bucket the aborted path falls into.
+				result.Status = "idle_watchdog"
+				if result.Error == "" {
+					result.Error = idleWatchdogReason(time.Duration(idleWatchdogThreshold.Load()))
+				}
+				return result, toolCount.Load(), nil
+			case <-time.After(terminalResultHandoffBudget):
+				// Nothing arrived, so there is no outcome to preserve and the
+				// liveness verdict is the only one available. Linearizing here
+				// keeps the branch bounded no matter how a backend behaves.
+				taskLog.Warn("backend did not hand over a result within the budget; classifying by liveness",
+					"budget", terminalResultHandoffBudget.String())
+			}
 			return agent.Result{
 				Status: "idle_watchdog",
 				Error:  idleWatchdogReason(time.Duration(idleWatchdogThreshold.Load())),
@@ -9247,11 +9262,18 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	}
 }
 
-// terminalResultHandoffBudget is how long executeAndDrain waits for a backend
-// that has already observed its terminal result to hand that result over. It is
-// a backstop, not the real bound: the backend caps its own finalization, and
-// this only decides how long we believe it before falling back to liveness
-// classification.
+// terminalResultHandoffBudget is how long executeAndDrain waits, after force-
+// stopping a run, for the backend to hand over whatever result it has. It only
+// decides how long we believe a backend before falling back to the liveness
+// verdict; the backend caps its own finalization, so in practice the wait ends
+// far sooner.
+//
+// The value is derived from the slowest finalization this daemon drives today,
+// Cursor's, rather than picked: a concurrent background-cleanup pass we may
+// have to wait behind (cursorCloseBudget, 10s), the closing pass itself
+// (another 10s), the background reaper's tick before it observes the stop (1s),
+// and the process WaitDelay after cancellation (0.5s) — about 21.5s. 30s leaves
+// margin without letting a wedged backend hold a runtime slot indefinitely.
 const terminalResultHandoffBudget = 30 * time.Second
 
 // idleWatchdogReason formats the human-facing explanation surfaced on
