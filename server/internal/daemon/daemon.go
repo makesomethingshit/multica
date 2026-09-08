@@ -8932,6 +8932,12 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// A backend that can prove its outcome is already decided outranks every
 	// liveness policy below: a run whose terminal result has been read is not a
 	// hang, no matter how long its cleanup then takes.
+	// Nil is meaningful and kept distinguishable: a backend that offers no
+	// terminal boundary is one whose result cannot outrank a force stop, so it
+	// must not be given a hand-off window it can never use. Every such backend
+	// keeps the previous behaviour, including a wedged one, which is force
+	// stopped and classified without waiting for anything.
+	handsOverTerminal := session.TerminalObserved != nil
 	terminalObserved := session.TerminalObserved
 	if terminalObserved == nil {
 		terminalObserved = func() bool { return false }
@@ -9205,39 +9211,50 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		// classifiers so a watchdog-induced stop isn't misreported as
 		// "task cancelled by server".
 		if idleWatchdogFired.Load() {
-			// Enter the hand-off unconditionally rather than asking
-			// terminalObserved first. Reading a flag and then acting on it is
-			// exactly the window this branch kept losing: the backend can
-			// publish its terminal result between the read and the classifier
-			// below. Waiting for the result instead makes the result's arrival
-			// the linearization point, and the backend contract (publish the
-			// observation before sending Result) is what then makes the check
-			// after it reliable rather than lucky.
-			taskLog.Info("idle watchdog fired; waiting for the backend to hand over its result",
-				"budget", terminalResultHandoffBudget.String())
-			select {
-			case result := <-session.Result:
-				if terminalObserved() {
-					// The backend had already read its authoritative result, so
-					// this is the real outcome of the run, not a hang.
-					return result, toolCount.Load(), nil
-				}
-				// The backend's wait goroutine (e.g. claude.go) translates the
-				// SIGKILL we delivered via agentCancel into Status="aborted".
-				// Re-tag it as "idle_watchdog" so runTask routes the
-				// disposition through a dedicated failure_reason, not the
-				// generic "agent_error" bucket the aborted path falls into.
-				result.Status = "idle_watchdog"
-				if result.Error == "" {
-					result.Error = idleWatchdogReason(time.Duration(idleWatchdogThreshold.Load()))
-				}
-				return result, toolCount.Load(), nil
-			case <-time.After(terminalResultHandoffBudget):
-				// Nothing arrived, so there is no outcome to preserve and the
-				// liveness verdict is the only one available. Linearizing here
-				// keeps the branch bounded no matter how a backend behaves.
-				taskLog.Warn("backend did not hand over a result within the budget; classifying by liveness",
+			// For a backend that publishes a terminal boundary, enter the
+			// hand-off without asking terminalObserved first. Reading a flag and
+			// then acting on it is exactly the window this branch kept losing:
+			// the backend can publish between the read and the classifier below.
+			// Waiting for the result instead makes its delivery the
+			// linearization point, and the backend contract — publish the
+			// observation before sending Result — is what makes the check after
+			// delivery reliable rather than lucky.
+			//
+			// Such a backend always closes Result, so a wedged one still ends
+			// this wait promptly through the closed channel rather than the
+			// budget.
+			if handsOverTerminal {
+				taskLog.Info("idle watchdog fired; waiting for the backend to hand over its result",
 					"budget", terminalResultHandoffBudget.String())
+				select {
+				case result, ok := <-session.Result:
+					if ok && terminalObserved() {
+						// The backend had already read its authoritative
+						// result, so this is the real outcome, not a hang.
+						return result, toolCount.Load(), nil
+					}
+					if ok {
+						// The backend's wait goroutine (e.g. claude.go)
+						// translates the SIGKILL we delivered via agentCancel
+						// into Status="aborted". Re-tag it as "idle_watchdog"
+						// so runTask routes the disposition through a dedicated
+						// failure_reason, not the generic "agent_error" bucket
+						// the aborted path falls into.
+						result.Status = "idle_watchdog"
+						if result.Error == "" {
+							result.Error = idleWatchdogReason(time.Duration(idleWatchdogThreshold.Load()))
+						}
+						return result, toolCount.Load(), nil
+					}
+					// Closed with no value: the backend gave up without an
+					// outcome, so the liveness verdict is the only one left.
+				case <-time.After(terminalResultHandoffBudget):
+					// A backend that neither delivers nor closes is itself the
+					// hang. Linearizing here keeps the branch bounded whatever
+					// a backend does.
+					taskLog.Warn("backend did not hand over a result within the budget; classifying by liveness",
+						"budget", terminalResultHandoffBudget.String())
+				}
 			}
 			return agent.Result{
 				Status: "idle_watchdog",

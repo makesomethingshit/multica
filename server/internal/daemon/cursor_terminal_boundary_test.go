@@ -243,3 +243,42 @@ func TestExecuteAndDrainKeepsTerminalResultHandedOverAfterForceStop(t *testing.T
 		t.Fatalf("a decided outcome was reclassified after the force stop: %+v", result)
 	}
 }
+
+// wedgedBackend offers no terminal boundary and never finishes: the shape the
+// idle watchdog exists for. It must be classified the moment the watchdog
+// fires, with no hand-off wait, because a result that could outrank the force
+// stop is precisely what this backend cannot produce.
+type wedgedBackend struct{}
+
+func (wedgedBackend) Execute(context.Context, string, agent.ExecOptions) (*agent.Session, error) {
+	messages := make(chan agent.Message, 1)
+	messages <- agent.Message{Type: agent.MessageText, Content: "hello"}
+	// Neither closed nor written to again, and no TerminalObserved.
+	return &agent.Session{Messages: messages, Result: make(chan agent.Result)}, nil
+}
+
+// TestExecuteAndDrainDoesNotDelayBackendsWithoutATerminalBoundary keeps the
+// hand-off from becoming a tax on every force stop. Waiting is only justified
+// for a backend that can hand back an outcome outranking the watchdog; for the
+// rest the point of the watchdog is to free the runtime slot promptly.
+func TestExecuteAndDrainDoesNotDelayBackendsWithoutATerminalBoundary(t *testing.T) {
+	d := newTestDaemon(t)
+	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	start := time.Now()
+	result, _, err := d.executeAndDrain(ctx, wedgedBackend{}, "p", agent.ExecOptions{}, slog.Default(), "wedged", "", new(atomic.Int32))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("executeAndDrain: %v", err)
+	}
+	if result.Status != "idle_watchdog" {
+		t.Fatalf("status=%q, want idle_watchdog", result.Status)
+	}
+	if elapsed > 5*d.cfg.AgentIdleWatchdog {
+		t.Fatalf("force stop took %s, want under %s: a backend with no terminal boundary must not wait for a hand-off it cannot make",
+			elapsed, 5*d.cfg.AgentIdleWatchdog)
+	}
+}
