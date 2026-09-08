@@ -163,6 +163,13 @@ type Session struct {
 	// force-stop. The daemon's AgentToolWatchdog documentation states the
 	// operator-facing consequence.
 	InterruptBackgroundTools func() bool
+	// TerminalObserved reports whether the backend has already read its
+	// authoritative terminal result. Once true the run's outcome is decided and
+	// no liveness policy may reclassify it, however long the backend then takes
+	// to finish cleaning up. Backends must publish this before any cleanup that
+	// can block or fail, otherwise a completed run can still be re-tagged as a
+	// hang. Nil means the backend offers no such boundary.
+	TerminalObserved func() bool
 	// Messages streams events as the agent works. The channel is closed
 	// when the agent finishes (before Result is sent).
 	Messages <-chan Message

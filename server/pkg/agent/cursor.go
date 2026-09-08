@@ -253,6 +253,12 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 			case "result":
 				resultSeen = true
+				// Publish the decided outcome BEFORE cleanup. Close() can block
+				// on the tracker lock behind a tool watchdog Interrupt already in
+				// progress, and that Interrupt can return false without moving
+				// native accounting — which would leave the watchdog free to
+				// cancel and re-tag this completed run as idle_watchdog.
+				background.ObserveTerminal()
 				background.Close()
 				if evt.IsError || evt.Subtype == "error" {
 					resultIsError = true
@@ -457,7 +463,13 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh, ToolActivity: background.Activity, InterruptBackgroundTools: background.Interrupt}, nil
+	return &Session{
+		Messages:                 msgCh,
+		Result:                   resCh,
+		ToolActivity:             background.Activity,
+		InterruptBackgroundTools: background.Interrupt,
+		TerminalObserved:         background.TerminalObserved,
+	}, nil
 }
 
 const cursorIncompleteFinalizationWarning = "actions completed before finalization may already have taken effect"

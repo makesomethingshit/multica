@@ -29,7 +29,19 @@ type cursorBackgroundTools struct {
 	once             sync.Once
 	inFlight         atomic.Int32
 	lastToolActivity atomic.Int64
+	// terminal is set the moment Cursor's authoritative result is read, before
+	// Close() takes mu. Cleanup can block on that lock behind an in-progress
+	// Interrupt and can legitimately fail, so it cannot be the signal that the
+	// outcome is decided; this flag is, and it is deliberately lock-free.
+	terminal atomic.Bool
 }
+
+// ObserveTerminal records that the backend has read its authoritative terminal
+// result. Call it before any cleanup that may block or fail.
+func (b *cursorBackgroundTools) ObserveTerminal() { b.terminal.Store(true) }
+
+// TerminalObserved reports whether the run's outcome is already decided.
+func (b *cursorBackgroundTools) TerminalObserved() bool { return b.terminal.Load() }
 
 func newCursorBackgroundTools(ctx context.Context, cmd *exec.Cmd, messages chan<- Message, logger *slog.Logger) *cursorBackgroundTools {
 	b := &cursorBackgroundTools{ctx: ctx, cmd: cmd, messages: messages, logger: logger, stop: make(chan struct{}), done: make(chan struct{})}
