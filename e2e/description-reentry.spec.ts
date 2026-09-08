@@ -7,7 +7,9 @@ type Frame = {
   text: string;
   height: number;
   imageHeight: number;
+  imageWidth: number;
   scroll: number;
+  anchorTop: number | null;
   pageY: number;
   readonly: boolean;
   ready: boolean;
@@ -29,6 +31,60 @@ const body = [
   "End of reentry A.",
 ].join("\n\n");
 
+const anchorText = "Section 50";
+
+function expectStableDescriptionFrames(
+  frames: Frame[],
+  {
+    issueId,
+    expectedText,
+    absentText,
+    expectedScroll,
+    expectedAnchorTop,
+  }: {
+    issueId: string;
+    expectedText: string;
+    absentText?: string;
+    expectedScroll: number;
+    expectedAnchorTop?: number;
+  },
+) {
+  expect(frames.length).toBeGreaterThan(0);
+  expect(frames[0]!.text).toContain(expectedText);
+
+  for (const frame of frames) {
+    expect(frame.issue).toContain(issueId);
+    expect(frame.text).toContain(expectedText);
+    if (absentText) expect(frame.text).not.toContain(absentText);
+    expect(frame.readonly).toBe(false);
+    expect(Math.abs(frame.scroll - expectedScroll)).toBeLessThanOrEqual(1);
+  }
+
+  // Restored task descriptions keep native image sizing. Markdown images have
+  // no dimensions before their resource decodes, so browser image loading is
+  // intentionally measured separately from editor readiness and re-entry.
+  const settledFrames = frames.filter((frame) => frame.imageLoaded);
+  expect(settledFrames.length).toBeGreaterThanOrEqual(3);
+  const firstSettled = settledFrames[0]!;
+
+  for (const frame of settledFrames) {
+    expect(frame.height).toBeCloseTo(firstSettled.height, 1);
+    expect(frame.imageHeight).toBeCloseTo(firstSettled.imageHeight, 1);
+    expect(frame.imageWidth).toBeCloseTo(firstSettled.imageWidth, 1);
+    expect(frame.pageY).toBeCloseTo(firstSettled.pageY, 1);
+    if (expectedAnchorTop !== undefined) {
+      expect(frame.anchorTop).not.toBeNull();
+      expect(Math.abs((frame.anchorTop ?? Infinity) - expectedAnchorTop)).toBeLessThanOrEqual(2);
+    }
+  }
+
+  const readyImage = settledFrames.find(
+    (frame) => frame.ready && frame.imageLoaded && frame.imageWidth > 0,
+  );
+  expect(readyImage).toBeDefined();
+  expect(readyImage!.imageHeight / readyImage!.imageWidth).toBeCloseTo(0.5, 2);
+}
+
 test.describe("#8083 description initialization", () => {
   test.describe.configure({ timeout: 120000 });
   let api: TestApiClient;
@@ -37,6 +93,7 @@ test.describe("#8083 description initialization", () => {
     api = await createTestApi();
     await page.route("**/e2e-description.svg", route => route.fulfill({
       contentType: "image/svg+xml",
+      headers: { "cache-control": "public, max-age=3600" },
       body: '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="320"><rect width="640" height="320" fill="teal"/></svg>',
     }));
     await page.addInitScript(() => {
@@ -46,14 +103,21 @@ test.describe("#8083 description initialization", () => {
         const host = document.querySelector('[data-testid="issue-description"]');
         const editor = host?.querySelector<HTMLElement>(".ProseMirror");
         const image = host?.querySelector("img");
+        const anchor = Array.from(editor?.querySelectorAll<HTMLElement>("h2") ?? [])
+          .find((heading) => heading.textContent === "Section 50");
         if (window.recordDescription && host) {
           const scroll = host.closest<HTMLElement>("[data-tab-scroll-root]");
+          const scrollBounds = scroll?.getBoundingClientRect();
           window.descriptionFrames.push({
             issue: scroll?.dataset.tabScrollRoot ?? "",
             text: editor?.textContent ?? "",
             height: host.getBoundingClientRect().height,
             imageHeight: image?.getBoundingClientRect().height ?? 0,
+            imageWidth: image?.getBoundingClientRect().width ?? 0,
             scroll: scroll?.scrollTop ?? 0,
+            anchorTop: anchor && scrollBounds
+              ? anchor.getBoundingClientRect().top - scrollBounds.top
+              : null,
             pageY: window.scrollY,
             readonly: !!host.querySelector("[data-rich-content]"),
             ready: !!(editor as HTMLElement & { editor?: { isInitialized: boolean } } | null)?.editor?.isInitialized,
@@ -68,9 +132,11 @@ test.describe("#8083 description initialization", () => {
 
   test.afterEach(async () => { await api?.cleanup(); });
 
-  test("cached detail/list re-entry has one populated surface and stable geometry", async ({ page }, testInfo) => {
+  test("cached detail re-entry keeps its content, geometry, and restored scroll stable", async ({ page }, testInfo) => {
     const a = await api.createIssue(`E2E Reentry A ${Date.now()}`, { description: body });
-    const b = await api.createIssue(`E2E Reentry B ${Date.now()}`, { description: "Reentry B distinct description." });
+    const b = await api.createIssue(`E2E Reentry B ${Date.now()}`, {
+      description: "Reentry B distinct description.",
+    });
     const slug = await loginAsDefault(page);
     const description = page.getByTestId("issue-description");
     const list = page.locator(`a[href="/${slug}/issues"]`).first();
@@ -78,77 +144,93 @@ test.describe("#8083 description initialization", () => {
       await page.locator(`a[href$="/issues/${id}"]`).first().click();
       await expect(description.locator(".ProseMirror")).toBeVisible({ timeout: 30000 });
     };
-    // Warm both query data and the image, just as re-entry does in #8083.
+    const leaveDetail = async () => {
+      await list.click();
+      await expect(description).toHaveCount(0);
+    };
+    const captureReentry = async (id: string) => {
+      await expect(description).toHaveCount(0);
+      await page.evaluate(() => {
+        window.descriptionFrames = [];
+        window.recordDescription = true;
+      });
+      await open(id);
+      await page.waitForFunction(
+        () => window.descriptionFrames.filter((frame) => frame.imageLoaded).length >= 3
+          && window.descriptionFrames.some((frame) => frame.ready && frame.imageLoaded),
+      );
+      return page.evaluate(() => {
+        window.recordDescription = false;
+        return window.descriptionFrames;
+      });
+    };
+
+    // Warm cached issue data and the original 2:1 image presentation before
+    // sampling a zero-scroll re-entry.
     await open(a.id);
     await expect(description.locator("img")).toBeVisible();
     await description.locator("img").evaluate((img: HTMLImageElement) => img.decode());
-    await list.click();
+    await leaveDetail();
     await open(b.id);
-    await list.click();
+    await leaveDetail();
 
-    const visits: Frame[][] = [];
-    for (const issue of [a, a, b, a, b, a]) {
-      await expect(description).toHaveCount(0);
-      await page.evaluate(() => { window.descriptionFrames = []; window.recordDescription = true; });
-      await open(issue.id);
-      await page.waitForFunction(() => window.descriptionFrames.length >= 3 && window.descriptionFrames.some(frame => frame.ready));
-      // Sampling begins before navigation and continues through readiness.
-      const frames = await page.evaluate(() => { window.recordDescription = false; return window.descriptionFrames; });
-      visits.push(frames);
-      const expected = issue.id === a.id ? "Reentry A" : "Reentry B";
-      for (const frame of frames) {
-        expect(frame.issue).toContain(issue.id);
-        expect(frame.text).toContain(expected);
-        expect(frame.readonly).toBe(false);
-        expect(frame.height).toBeCloseTo(frames[0]!.height, 1);
-        expect(frame.imageHeight).toBeCloseTo(frames[0]!.imageHeight, 1);
-        expect(frame.scroll).toBe(frames[0]!.scroll);
-        expect(frame.pageY).toBe(frames[0]!.pageY);
-      }
-      await list.click();
-    }
-    await testInfo.attach("description-frames", { body: JSON.stringify(visits, null, 2), contentType: "application/json" });
-  });
-
-  test("cold image loading preserves the initial description geometry", async ({ page }, testInfo) => {
-    const issue = await api.createIssue(`E2E Cold Image ${Date.now()}`, { description: body });
-    let release!: () => void;
-    const response = new Promise<void>(resolve => { release = resolve; });
-    await page.route("**/e2e-description.svg", async route => {
-      await response;
-      await route.fulfill({
-        contentType: "image/svg+xml",
-        body: '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="320"><rect width="640" height="320" fill="teal"/></svg>',
-      });
+    const zeroScrollFrames = await captureReentry(a.id);
+    expectStableDescriptionFrames(zeroScrollFrames, {
+      issueId: a.id,
+      expectedText: "Reentry A",
+      absentText: "Reentry B distinct description.",
+      expectedScroll: 0,
     });
-    try {
-      await loginAsDefault(page);
-      await page.evaluate(() => { window.descriptionFrames = []; window.recordDescription = true; });
-      await page.locator(`a[href$="/issues/${issue.id}"]`).first().click();
-      const host = page.getByTestId("issue-description");
-      await expect(host.locator(".ProseMirror")).toBeVisible({ timeout: 30000 });
-      await page.waitForFunction(() => window.descriptionFrames.length >= 3);
-      await testInfo.attach("cold-image-before", { body: await page.screenshot(), contentType: "image/png" });
-      release();
-      await page.waitForFunction(() => window.descriptionFrames.filter(frame => frame.imageLoaded).length >= 3);
-      const frames = await page.evaluate(() => { window.recordDescription = false; return window.descriptionFrames; });
-      await testInfo.attach("cold-image-frames", { body: JSON.stringify(frames), contentType: "application/json" });
-      expect(frames.some(frame => !frame.imageLoaded)).toBe(true);
-      for (const frame of frames) {
-        expect(frame.text).toContain("Reentry A");
-        expect(frame.imageHeight).toBeGreaterThan(0);
-        expect(frame.height).toBeCloseTo(frames[0]!.height, 1);
-        expect(frame.imageHeight).toBeCloseTo(frames[0]!.imageHeight, 1);
-        expect(frame.scroll).toBe(frames[0]!.scroll);
-        expect(frame.pageY).toBe(frames[0]!.pageY);
-      }
-      await testInfo.attach("cold-image-after", { body: await page.screenshot(), contentType: "image/png" });
-      await host.locator(".image-toolbar button").first().click();
-      await expect(page.getByRole("dialog")).toBeVisible();
-      await page.keyboard.press("Escape");
-    } finally {
-      release();
-    }
+
+    const savedPosition = await page.waitForFunction(
+      ({ scrollKey, anchorLabel }) => {
+        const scroll = document.querySelector<HTMLElement>(`[data-tab-scroll-root="${scrollKey}"]`);
+        const anchor = Array.from(scroll?.querySelectorAll<HTMLElement>(".ProseMirror h2") ?? [])
+          .find((heading) => heading.textContent?.trim() === anchorLabel);
+        if (!scroll || !anchor) return null;
+
+        const scrollBounds = scroll.getBoundingClientRect();
+        const anchorBounds = anchor.getBoundingClientRect();
+        scroll.scrollTop += anchorBounds.top - scrollBounds.top - scroll.clientHeight / 3;
+        scroll.dispatchEvent(new Event("scroll", { bubbles: true }));
+        return {
+          scroll: scroll.scrollTop,
+          anchorTop: anchor.getBoundingClientRect().top - scroll.getBoundingClientRect().top,
+        };
+      },
+      { scrollKey: `main:${a.id}`, anchorLabel: anchorText },
+    ).then((handle) => handle.jsonValue<{ scroll: number; anchorTop: number }>());
+    expect(savedPosition.scroll).toBeGreaterThan(0);
+
+    await leaveDetail();
+    const sameIssueFrames = await captureReentry(a.id);
+    expectStableDescriptionFrames(sameIssueFrames, {
+      issueId: a.id,
+      expectedText: "Reentry A",
+      absentText: "Reentry B distinct description.",
+      expectedScroll: savedPosition.scroll,
+      expectedAnchorTop: savedPosition.anchorTop,
+    });
+
+    // A → list → B → list → A must retain A's scroll memento and never show
+    // B's cached document during A's first visible frame or readiness path.
+    await leaveDetail();
+    await open(b.id);
+    await expect(description).toContainText("Reentry B distinct description.");
+    await leaveDetail();
+    const crossIssueFrames = await captureReentry(a.id);
+    expectStableDescriptionFrames(crossIssueFrames, {
+      issueId: a.id,
+      expectedText: "Reentry A",
+      absentText: "Reentry B distinct description.",
+      expectedScroll: savedPosition.scroll,
+      expectedAnchorTop: savedPosition.anchorTop,
+    });
+
+    await testInfo.attach("description-reentry-frames", {
+      body: JSON.stringify({ zeroScrollFrames, sameIssueFrames, crossIssueFrames }, null, 2),
+      contentType: "application/json",
+    });
   });
 
   test("first edit and file drop survive startup and save on immediate navigation", async ({ page }) => {

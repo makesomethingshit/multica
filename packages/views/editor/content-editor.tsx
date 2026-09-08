@@ -223,6 +223,13 @@ interface ContentEditorBaseProps {
    */
   flushPendingOnUnmount?: boolean;
   /**
+   * Create the ProseMirror view during the first client render. This is opt-in
+   * because most editor hosts preserve their existing deferred creation; the
+   * issue description uses it to keep its populated surface continuous on
+   * cached re-entry.
+   */
+  eagerClientRender?: boolean;
+  /**
    * Called once the initial document is usable in the connected editor DOM.
    * This also waits for the client commit when hydrating. Readonly-first
    * hosts use this to swap their static shell for the live editor.
@@ -377,6 +384,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       quickActionMenu,
       attachments,
       flushPendingOnUnmount = false,
+      eagerClientRender = false,
       onReady,
     },
     ref,
@@ -557,9 +565,9 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     const mountChunked = initialContent.length > MARKDOWN_CHUNK_THRESHOLD;
 
     const editor = useEditor({
-      // CSR re-entry must commit a populated ProseMirror surface on its first
-      // paint. Tiptap's getServerSnapshot stays null during SSR and hydration.
-      immediatelyRender: typeof window !== "undefined",
+      // Keep deferred creation as the default for existing hosts. IssueDetail
+      // opts in so a cached description first-paints as one populated editor.
+      immediatelyRender: eagerClientRender && typeof window !== "undefined",
       // Explicit for clarity — the real perf win is useEditorState in BubbleMenu.
       shouldRerenderOnTransaction: false,
       onBeforeCreate: ({ editor: ed }) => {

@@ -90,11 +90,15 @@ const emitTransaction = () => {
   for (const listener of [...transactionListeners.current]) listener();
 };
 const latestEditorOptions = vi.hoisted<{
-  current?: { onUpdate?: (args: { editor: unknown }) => void };
+  current?: {
+    immediatelyRender?: boolean;
+    onUpdate?: (args: { editor: unknown }) => void;
+  };
 }>(() => ({}));
 
 vi.mock("@tiptap/react", () => ({
   useEditor: (options: {
+    immediatelyRender?: boolean;
     onMount?: (args: { editor: unknown }) => void;
     onCreate?: (args: { editor: unknown }) => void;
     onUpdate?: (args: { editor: unknown }) => void;
@@ -194,6 +198,15 @@ describe("ContentEditor", () => {
     fireEvent.mouseDown(screen.getByTestId("prosemirror"));
 
     expect(mockFocus).not.toHaveBeenCalled();
+  });
+
+  it("keeps client rendering deferred unless a host explicitly opts in", () => {
+    const defaultEditor = render(<ContentEditor value="Deferred by default." />);
+    expect(latestEditorOptions.current?.immediatelyRender).toBe(false);
+
+    defaultEditor.unmount();
+    render(<ContentEditor value="Eager issue description." eagerClientRender />);
+    expect(latestEditorOptions.current?.immediatelyRender).toBe(true);
   });
 
   it("syncs editor content when value changes externally and editor is unfocused", () => {

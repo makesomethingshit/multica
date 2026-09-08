@@ -2010,11 +2010,8 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
     baseMarkdown: string;
     attachmentIds: string[];
   } | null>(null);
-  // Keep the description editor mounted from the start. Unlike the empty
-  // composer shells, a long rendered description cannot swap between
-  // react-markdown and ProseMirror without small per-block height differences
-  // accumulating into a visible scroll/layout jump. The chunked Markdown path
-  // keeps this single eager editor affordable; title and composers stay lazy.
+  // IssueDetail alone opts into an eager, continuously mounted description
+  // editor. Title and composer hosts retain ContentEditor's deferred default.
   const titleEditorRef = useRef<TitleEditorRef>(null);
   const titleBaseRef = useRef<string | undefined>(issue?.title);
   const [titleConflictDraft, setTitleConflictDraft] = useState<string | null>(null);
@@ -3042,17 +3039,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
           <div
             data-testid="issue-description"
             {...descDropZoneProps}
-            // Markdown does not carry intrinsic image sizes. Keep a stable
-            // preview frame even after decode; contain preserves the whole
-            // image, and the existing toolbar opens the full-size preview.
-            className={cn(
-              "relative mt-5 rounded-lg",
-              "[&_.image-figure]:w-full [&_.image-figure]:aspect-video",
-              "[&_.image-content]:absolute [&_.image-content]:inset-0 [&_.image-content]:m-0! [&_.image-content]:h-full! [&_.image-content]:object-contain",
-              // Avoid a delayed monospace font swap accumulating block-height
-              // differences in long descriptions, including WebKit.
-              "[&_pre]:[font-family:ui-monospace,monospace]! [&_code]:[font-family:ui-monospace,monospace]!",
-            )}
+            className="relative mt-5 rounded-lg"
             onFocusCapture={() => {
               if (!descriptionEditingRef.current) {
                 descriptionEditingRef.current = true;
@@ -3067,6 +3054,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             <ContentEditor
               ref={descEditorRef}
               key={id}
+              eagerClientRender
               value={issue.description ?? ""}
               placeholder={t(($) => $.detail.desc_placeholder)}
               onUpdate={(md, baseMarkdown) => {

@@ -175,6 +175,7 @@ vi.mock("../../editor", async () => ({
       onUpdate,
       placeholder,
       flushPendingOnUnmount,
+      eagerClientRender,
       onReady,
     }: any,
     ref: any,
@@ -238,6 +239,7 @@ vi.mock("../../editor", async () => ({
         placeholder={placeholder}
         data-testid="rich-text-editor"
         data-flush-on-unmount={flushPendingOnUnmount ? "true" : undefined}
+        data-eager-client-render={eagerClientRender ? "true" : undefined}
       />
     );
   }),
@@ -926,6 +928,13 @@ describe("IssueDetail (shared)", () => {
 
     const description = await screen.findByDisplayValue("Add JWT auth to the backend");
     expect(description).toHaveAttribute("data-flush-on-unmount", "true");
+  });
+
+  it("opts only the description editor into eager client rendering", async () => {
+    renderIssueDetail();
+
+    const description = await screen.findByDisplayValue("Add JWT auth to the backend");
+    expect(description).toHaveAttribute("data-eager-client-render", "true");
   });
 
   it("remounts the eager description on issue switch without carrying stale content", async () => {

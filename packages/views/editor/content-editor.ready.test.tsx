@@ -43,7 +43,7 @@ describe("ContentEditor initial document (real Tiptap)", () => {
       snapshots.push(dom.innerHTML);
       expect(ref.current).not.toBeNull();
     });
-    render(host(<StrictMode><ContentEditor ref={ref} value={markdown} onReady={onReady} showBubbleMenu={false} /></StrictMode>));
+    render(host(<StrictMode><ContentEditor ref={ref} value={markdown} onReady={onReady} showBubbleMenu={false} eagerClientRender /></StrictMode>));
     await act(async () => {});
     const dom = document.querySelector(".ProseMirror")!;
     expect(dom.textContent).toContain(first);
@@ -65,7 +65,7 @@ describe("ContentEditor initial document (real Tiptap)", () => {
   it("retains and flushes the first edit made before create", async () => {
     vi.useFakeTimers();
     const onUpdate = vi.fn();
-    const view = render(host(<ContentEditor value={long} onUpdate={onUpdate} flushPendingOnUnmount debounceMs={1500} showBubbleMenu={false} />));
+    const view = render(host(<ContentEditor value={long} onUpdate={onUpdate} flushPendingOnUnmount debounceMs={1500} showBubbleMenu={false} eagerClientRender />));
     expect(mountedEditor().isInitialized).toBe(false);
     act(() => { mountedEditor().commands.insertContent("FIRSTEDIT "); });
     await act(() => vi.advanceTimersByTimeAsync(1));
@@ -84,7 +84,7 @@ describe("ContentEditor initial document (real Tiptap)", () => {
       filename: file.name, content_type: file.type, size_bytes: file.size, created_at: "2026-09-01T00:00:00Z",
       url: "/file.txt", download_url: "/file.txt", markdown_url: "/file.txt", link: "/file.txt", markdownLink: "/file.txt",
     }));
-    render(host(<ContentEditor ref={ref} value={long} onUploadFile={upload} showBubbleMenu={false} />));
+    render(host(<ContentEditor ref={ref} value={long} onUploadFile={upload} showBubbleMenu={false} eagerClientRender />));
     expect(mountedEditor().isInitialized).toBe(false);
     await act(async () => { ref.current!.uploadFile(file); });
     await act(() => vi.advanceTimersByTimeAsync(20));
@@ -96,7 +96,7 @@ describe("ContentEditor initial document (real Tiptap)", () => {
   it("does not add a readiness render for a consumer without onReady", async () => {
     vi.useFakeTimers();
     const commit = vi.fn();
-    render(host(<Profiler id="editor" onRender={commit}><ContentEditor value="Short." showBubbleMenu={false} /></Profiler>));
+    render(host(<Profiler id="editor" onRender={commit}><ContentEditor value="Short." showBubbleMenu={false} eagerClientRender /></Profiler>));
     commit.mockClear();
     await act(() => vi.advanceTimersByTimeAsync(1));
     expect(mountedEditor().isInitialized).toBe(true);
@@ -111,7 +111,7 @@ describe("ContentEditor initial document (real Tiptap)", () => {
     const recoverable = vi.fn();
     let root: ReturnType<typeof hydrateRoot>;
     await act(async () => {
-      root = hydrateRoot(container, host(<ContentEditor value={long} onReady={onReady} showBubbleMenu={false} />), { onRecoverableError: recoverable });
+      root = hydrateRoot(container, host(<ContentEditor value={long} onReady={onReady} showBubbleMenu={false} eagerClientRender />), { onRecoverableError: recoverable });
     });
     await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1));
     expect(container.querySelector(".ProseMirror")?.textContent).toContain("Paragraph 499.");
