@@ -219,3 +219,35 @@ func TestExecuteAndDrain_BackgroundNativeCountSurvivesDroppedTranscript(t *testi
 		t.Fatalf("native tool state lost: %+v err=%v", result, err)
 	}
 }
+
+// TestCursorBackgroundCapturedDisabledToolWatchdog is the deliberate mirror of
+// TestCursorBackgroundUncapturedDisabledToolWatchdog. When ownership WAS
+// captured the launched process is genuinely in flight, so a zero tool budget
+// means what it says and nothing force-stops the run — the same outcome a
+// foreground tool that never returns already has. The uncaptured case releases
+// its tool precisely because nothing was claimed there; these two must not be
+// "fixed" into agreeing without changing what MULTICA_AGENT_TOOL_WATCHDOG=0
+// promises. See the knob's documentation in config.go.
+func TestCursorBackgroundCapturedDisabledToolWatchdog(t *testing.T) {
+	d := newTestDaemon(t)
+	d.cfg.AgentIdleWatchdog = 50 * time.Millisecond
+	d.cfg.AgentToolWatchdog = 0
+
+	// noResult: the launched process never exits on its own (GH #7833's dev
+	// server). invalid stays false, so ownership is held and the tool is real.
+	backend := &backgroundToolBackend{noResult: true}
+
+	// Stands in for MULTICA_AGENT_TIMEOUT, which is 0 (unbounded) by default.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	result, _, err := d.executeAndDrain(ctx, backend, "test", agent.ExecOptions{}, slog.Default(), "captured-background", "", new(atomic.Int32))
+	if err != nil {
+		t.Fatalf("executeAndDrain: %v", err)
+	}
+	if result.Status == "idle_watchdog" {
+		t.Fatalf("a held background tool was force-stopped despite a zero tool budget: %+v", result)
+	}
+	if backend.interrupts.Load() != 0 {
+		t.Fatalf("cleanup ran %d times without a tool budget", backend.interrupts.Load())
+	}
+}
