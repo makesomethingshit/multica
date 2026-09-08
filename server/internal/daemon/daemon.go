@@ -9286,11 +9286,16 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 // far sooner.
 //
 // The value is derived from the slowest finalization this daemon drives today,
-// Cursor's, rather than picked: a concurrent background-cleanup pass we may
-// have to wait behind (cursorCloseBudget, 10s), the closing pass itself
-// (another 10s), the background reaper's tick before it observes the stop (1s),
-// and the process WaitDelay after cancellation (0.5s) — about 21.5s. 30s leaves
-// margin without letting a wedged backend hold a runtime slot indefinitely.
+// Cursor's, rather than picked: a concurrent background-cleanup pass we may have
+// to wait behind (cursorCloseBudget, 10s), the closing pass itself (another
+// 10s), one already-started process termination per pass overshooting its
+// budget by that termination's own bound (~1s each), and the process WaitDelay
+// after cancellation (0.5s) — about 22.5s. 30s leaves margin without letting a
+// wedged backend hold a runtime slot indefinitely.
+//
+// Deliberately not a term: the background reaper's tick. Closing its stop
+// channel wakes it immediately rather than at the next tick, so it adds
+// nothing to this ceiling.
 const terminalResultHandoffBudget = 30 * time.Second
 
 // idleWatchdogReason formats the human-facing explanation surfaced on

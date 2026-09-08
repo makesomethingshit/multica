@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 )
@@ -10,11 +11,25 @@ import (
 // stuckBackgroundProcess never dies and takes a fixed time to signal, which is
 // the shape that makes per-process bounds insufficient: each one is bounded,
 // but a run may launch any number of them.
-type stuckBackgroundProcess struct{ signal time.Duration }
+type stuckBackgroundProcess struct {
+	signal time.Duration
+	// entered, when set, is closed the first time this process is signalled.
+	// finish() holds mu for the whole pass, so that close is proof the caller
+	// owns the lock — which a channel closed just before calling Interrupt is
+	// not: it only says the goroutine was about to try.
+	entered chan struct{}
+	once    sync.Once
+}
 
 func (p *stuckBackgroundProcess) alive() (bool, error) { return true, nil }
-func (p *stuckBackgroundProcess) terminate() error     { time.Sleep(p.signal); return nil }
-func (p *stuckBackgroundProcess) close()               {}
+func (p *stuckBackgroundProcess) terminate() error {
+	if p.entered != nil {
+		p.once.Do(func() { close(p.entered) })
+	}
+	time.Sleep(p.signal)
+	return nil
+}
+func (p *stuckBackgroundProcess) close() {}
 
 // TestCursorBackgroundCloseIsBoundedAcrossTools pins the bound that matters
 // after a terminal result: Close() runs once the daemon's watchdog has stopped
@@ -80,21 +95,28 @@ func TestCursorBackgroundCloseIsBoundedBehindAConcurrentPass(t *testing.T) {
 	messages := make(chan Message, 8*tools)
 	b := newCursorBackgroundTools(context.Background(), nil, messages, slog.Default())
 	b.closeBudget = budget
+	// Only the first process carries the gate; it is the one the interrupting
+	// pass reaches first, so closing it happens inside that pass's critical
+	// section.
+	entered := make(chan struct{})
 	for i := 0; i < tools; i++ {
+		platform := &stuckBackgroundProcess{signal: signal}
+		if i == 0 {
+			platform.entered = entered
+		}
 		b.tools = append(b.tools, cursorBackgroundTool{
 			call:    cursorToolCall{Name: "shell", CallID: "bg", Result: `{"isBackground":true}`},
-			process: &cursorBackgroundProcess{platform: &stuckBackgroundProcess{signal: signal}},
+			process: &cursorBackgroundProcess{platform: platform},
 		})
 	}
 
-	// The watchdog's cleanup pass is already in flight and holding the lock.
-	// Unbounded, that pass alone would take tools*signal = 1s.
-	interrupting := make(chan struct{})
-	go func() {
-		close(interrupting)
-		b.Interrupt()
-	}()
-	<-interrupting
+	// The watchdog's cleanup pass must already hold the lock before Close() asks
+	// for it, or Close() can win the lock and finish on its own — and then an
+	// unbounded Interrupt() would still pass this test. Waiting for the gate
+	// inside the pass is what makes the ordering a fact rather than a scheduling
+	// habit. Unbounded, that pass alone would take tools*signal = 1s.
+	go b.Interrupt()
+	<-entered
 
 	start := time.Now()
 	b.Close()
