@@ -149,7 +149,7 @@ type Config struct {
 	CodexThreadHandshakeTimeout time.Duration
 	OpenCodeIdleWatchdog        time.Duration // OpenCode-specific no-message window; 0 falls back to AgentIdleWatchdog and values above it cannot extend the global bound
 	AgentIdleWatchdog           time.Duration // force-stop a run when the backend goes silent this long with an empty queue (0 = disabled)
-	AgentToolWatchdog           time.Duration // force-stop a run when a single tool call stays in flight (silent) this long (0 = never force-stop during a tool call); defaults to AgentIdleWatchdog, so operators tune one number unless they deliberately want a wider tool budget
+	AgentToolWatchdog           time.Duration // force-stop a run when a single tool call stays in flight (silent) this long (0 = never force-stop during a tool call, which now also covers a live Cursor background shell); defaults to AgentIdleWatchdog, so operators tune one number unless they deliberately want a wider tool budget
 	ClaudeArgs                  []string
 	CodexArgs                   []string
 	CodebuddyArgs               []string
@@ -361,6 +361,14 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// MULTICA_AGENT_TOOL_WATCHDOG still overrides for the deliberate "tools may
 	// run longer than the model may think" case, and 0 keeps its meaning: never
 	// force-stop while a tool is in flight.
+	//
+	// A Cursor background shell counts as in flight for as long as the launched
+	// process lives, not just until Cursor reports the launch complete — that is
+	// what keeps a legitimate long background job on the tool budget instead of
+	// the shorter idle one. The consequence at 0 is the same one a foreground
+	// tool that never returns already has: such a run is bounded only by
+	// MULTICA_AGENT_TIMEOUT, which is itself 0 by default. Operators who want a
+	// stalled background shell bounded must leave this non-zero.
 	agentToolWatchdog, err := durationFromEnv("MULTICA_AGENT_TOOL_WATCHDOG", agentIdleWatchdog)
 	if err != nil {
 		return Config{}, err

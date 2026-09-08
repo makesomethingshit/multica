@@ -157,6 +157,11 @@ type Session struct {
 	// one tool completed/was stopped and released from accounting; the watchdog
 	// gives the agent a fresh budget to report its authoritative result.
 	// Implementations must be concurrency-safe and return false after cleanup.
+	//
+	// This is reached only at the tool budget, so a zero tool budget never calls
+	// it: work that is genuinely in flight is what that setting declines to
+	// force-stop. The daemon's AgentToolWatchdog documentation states the
+	// operator-facing consequence.
 	InterruptBackgroundTools func() bool
 	// Messages streams events as the agent works. The channel is closed
 	// when the agent finishes (before Result is sent).
