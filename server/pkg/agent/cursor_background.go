@@ -139,8 +139,19 @@ func (b *cursorBackgroundTools) Reap() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.closed {
-		b.finish(false, time.Time{})
+		b.finish(false, time.Now().Add(b.budget()))
 	}
+}
+
+// budget resolves the per-pass cleanup bound. Every pass that holds mu is
+// bounded by it, not just the closing one: Close() has to wait for this lock,
+// so an unbounded pass held by anyone else is an unbounded Close(), which is
+// the same defect one level down.
+func (b *cursorBackgroundTools) budget() time.Duration {
+	if b.closeBudget > 0 {
+		return b.closeBudget
+	}
+	return cursorCloseBudget
 }
 
 // Interrupt is called synchronously by the daemon's tool watchdog. Each tool
@@ -151,7 +162,7 @@ func (b *cursorBackgroundTools) Interrupt() bool {
 	if b.closed || b.ctx.Err() != nil {
 		return false
 	}
-	return b.finish(true, time.Time{})
+	return b.finish(true, time.Now().Add(b.budget()))
 }
 
 // finish is called with mu held. A failed ownership check or cleanup never
@@ -196,13 +207,20 @@ func (b *cursorBackgroundTools) finish(interrupt bool, deadline time.Time) bool 
 
 func (b *cursorBackgroundTools) Close() {
 	b.once.Do(func() {
-		budget := b.closeBudget
-		if budget <= 0 {
-			budget = cursorCloseBudget
-		}
-		deadline := time.Now().Add(budget)
+		// Taken before the lock on purpose: waiting for a concurrent pass is
+		// part of what Close() has to bound, not something outside its budget.
+		// Every other pass is bounded by the same value, so the wait is too.
+		deadline := time.Now().Add(b.budget())
 		b.mu.Lock()
 		b.closed = true
+		// If waiting for the lock already consumed the budget, the closing pass
+		// still gets a full one of its own: the bound this guards is "Close()
+		// returns", and giving it zero time would just push every tool onto the
+		// unconfirmed path without trying. Two budgets is the honest ceiling,
+		// and terminalResultHandoffBudget is derived from exactly that.
+		if !time.Now().Before(deadline) {
+			deadline = time.Now().Add(b.budget())
+		}
 		b.finish(true, deadline)
 		if len(b.tools) > 0 {
 			// Retry a transient lookup/termination failure before releasing the
