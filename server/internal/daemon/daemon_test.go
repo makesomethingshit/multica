@@ -4203,7 +4203,7 @@ func TestReportTaskResult_CompletedHitsCompleteEndpoint(t *testing.T) {
 		BranchName: "agent/foo",
 		SessionID:  "ses-1",
 		WorkDir:    "/tmp/foo",
-	}, slog.Default())
+	}, slog.Default(), time.Time{})
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
@@ -4269,7 +4269,7 @@ func TestReportTaskResult_CancelledParentStillReportsTerminalState(t *testing.T)
 			cancel()
 
 			d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
-			d.reportTaskResult(ctx, "task-cancelled-parent", tc.result, slog.Default())
+			d.reportTaskResult(ctx, "task-cancelled-parent", tc.result, slog.Default(), time.Time{})
 
 			if got := calls.Load(); got != 1 {
 				t.Fatalf("terminal callback calls = %d, want 1", got)
@@ -4348,7 +4348,7 @@ func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
 				SessionID:     "ses-x",
 				WorkDir:       "/tmp/x",
 				FailureReason: tc.failureReasonIn,
-			}, slog.Default())
+			}, slog.Default(), time.Time{})
 
 			rec.mu.Lock()
 			defer rec.mu.Unlock()
@@ -4399,7 +4399,7 @@ func TestReportTaskResult_RetriesTransientCompleteThenSucceeds(t *testing.T) {
 	d.reportTaskResult(context.Background(), "task-retry", TaskResult{
 		Status:  "completed",
 		Comment: "ok",
-	}, slog.Default())
+	}, slog.Default(), time.Time{})
 
 	if got := completeCalls.Load(); got != 2 {
 		t.Fatalf("expected 2 complete attempts (one 502, one 200), got %d", got)
@@ -4440,7 +4440,7 @@ func TestReportTaskResult_TransientCompleteExhaustedQueuesLiveRecovery(t *testin
 	d.reportTaskResult(context.Background(), "task-repro", TaskResult{
 		Status:  "completed",
 		Comment: "provider finished",
-	}, slog.Default())
+	}, slog.Default(), time.Time{})
 
 	// Schedule {0, 0} → 3 attempts (one immediate + two retries).
 	if got := completeCalls.Load(); got != 3 {
@@ -4493,7 +4493,7 @@ func TestReportTaskResult_PermanentCompleteFallsBackToFail(t *testing.T) {
 	d.reportTaskResult(context.Background(), "task-bad", TaskResult{
 		Status:  "completed",
 		Comment: "ok",
-	}, slog.Default())
+	}, slog.Default(), time.Time{})
 
 	if got := completeCalls.Load(); got != 1 {
 		t.Fatalf("permanent 400 should not retry, got %d complete attempts", got)
@@ -4528,7 +4528,7 @@ func TestReportTaskResult_CancelledParentStillRunsPermanentFailureFallback(t *te
 	d.reportTaskResult(ctx, "task-cancelled-fallback", TaskResult{
 		Status:  "completed",
 		Comment: "ok",
-	}, slog.Default())
+	}, slog.Default(), time.Time{})
 
 	if got := completeCalls.Load(); got != 1 {
 		t.Fatalf("complete calls = %d, want 1", got)

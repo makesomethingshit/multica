@@ -230,6 +230,15 @@ type terminalTaskReport struct {
 	// run on the issue or chat can select it again, however many clean rows
 	// still reference it.
 	retiredSessionID string
+	// claimDispatchedAt is the server-authoritative dispatched_at this
+	// claim received in its claim response — the delivery generation fence
+	// (#8157 r4). The report replays only while the server's current
+	// dispatched_at still matches this value, so a stale pre-execution
+	// failure from an earlier delivery can never fail a later reclaim of
+	// the same task ID. Zero when the claim carried no value (old server):
+	// the fence then cannot apply and recovery falls back to the pre-fence
+	// behavior. Never stamped from time.Now — always the claim response.
+	claimDispatchedAt time.Time
 }
 
 type executionEnvironmentCommand func() ([]string, error)
@@ -5360,6 +5369,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			taskID:        task.ID,
 			errorMessage:  "runtime went offline before the task started",
 			failureReason: taskfailure.ReasonRuntimeOffline.String(),
+			// Fence this pre-execution failure to the claim that produced
+			// it (#8157 r4): a stale dispatch of the same task ID that is
+			// re-claimed later must not be failed by this report.
+			claimDispatchedAt: parseClaimDispatchedAt(task.DispatchedAt),
 		}); err != nil {
 			d.logger.Error("fail task callback failed", "task", task.ID, "error", err)
 		}
@@ -5519,6 +5532,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			workDir:        result.WorkDir,
 			durableWorkDir: result.DurableWorkDir,
 			failureReason:  taskRunFailureReason(err),
+			claimDispatchedAt: parseClaimDispatchedAt(task.DispatchedAt),
 		}); failErr != nil {
 			taskLog.Error("fail task callback failed", "error", failErr)
 		}
@@ -5550,7 +5564,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		return
 	}
 
-	d.reportTaskResult(ctx, task.ID, result, taskLog)
+	d.reportTaskResult(ctx, task.ID, result, taskLog, parseClaimDispatchedAt(task.DispatchedAt))
 
 	// Write GC metadata after the task finishes so the periodic GC loop
 	// can look up the parent record (issue / chat session / autopilot run /
@@ -5686,6 +5700,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			taskID:        task.ID,
 			errorMessage:  err.Error(),
 			failureReason: "local_directory_error",
+			claimDispatchedAt: parseClaimDispatchedAt(task.DispatchedAt),
 		}); failErr != nil {
 			taskLog.Error("fail task after local_directory resolve error", "error", failErr)
 		}
@@ -5705,6 +5720,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			taskID:        task.ID,
 			errorMessage:  err.Error(),
 			failureReason: "local_directory_error",
+			claimDispatchedAt: parseClaimDispatchedAt(task.DispatchedAt),
 		}); failErr != nil {
 			taskLog.Error("fail task after local_directory mode check", "error", failErr)
 		}
@@ -5717,6 +5733,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			taskID:        task.ID,
 			errorMessage:  err.Error(),
 			failureReason: "local_directory_error",
+			claimDispatchedAt: parseClaimDispatchedAt(task.DispatchedAt),
 		}); failErr != nil {
 			taskLog.Error("fail task after local_directory validation error", "error", failErr)
 		}
@@ -5847,6 +5864,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			taskID:        task.ID,
 			errorMessage:  fmt.Sprintf("local_directory wait cancelled: %s", err.Error()),
 			failureReason: failureReason,
+			claimDispatchedAt: parseClaimDispatchedAt(task.DispatchedAt),
 		}); failErr != nil {
 			taskLog.Error("fail task after local_directory lock cancel", "error", failErr)
 		}
@@ -5866,7 +5884,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 // the agent may have built a real session before getting stuck, and we want
 // the next chat turn to resume there rather than start over and "forget"
 // the conversation.
-func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result TaskResult, taskLog *slog.Logger) {
+func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result TaskResult, taskLog *slog.Logger, claimDispatchedAt time.Time) {
 	switch result.Status {
 	case "completed":
 		taskLog.Info("task completed", "status", result.Status)
@@ -5880,6 +5898,10 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			durableWorkDir:        result.DurableWorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			// Fence this terminal result to the claim that produced it
+			// (#8157 r4); a stale delivery of the same task ID must not
+			// settle a later reclaim.
+			claimDispatchedAt: claimDispatchedAt,
 		})
 		if err == nil {
 			return
@@ -5916,6 +5938,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			kind:         terminalTaskReportFail,
 			taskID:       taskID,
 			errorMessage: fallbackErrMsg,
+			claimDispatchedAt: claimDispatchedAt,
 			// The agent succeeded here — only the server's complete callback was
 			// rejected. Its branch is real and already committed, so it must
 			// survive the downgrade to a failure report.
@@ -5962,6 +5985,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			sessionID:      result.SessionID,
 			workDir:        result.WorkDir,
 			durableWorkDir: result.DurableWorkDir,
+			claimDispatchedAt: claimDispatchedAt,
 			// Worktree mode commits the agent's leftovers before tearing the
 			// worktree down, so a failed run routinely still has a branch. This
 			// is the case where the user most needs it: the task went wrong and

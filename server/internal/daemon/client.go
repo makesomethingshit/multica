@@ -601,6 +601,27 @@ func (c *Client) RecoverOrphans(ctx context.Context, runtimeID string) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/recover-orphans", runtimeID), map[string]any{}, nil)
 }
 
+// TaskRecoveryState is the authoritative per-task settlement state the
+// live-daemon terminal recovery loop compares its pending reports against
+// (#8157 r4): the current status plus the delivery generation discriminator.
+// DispatchedAt decodes from the status endpoint's RFC3339Nano form; compare
+// generations with time.Time.Equal after second-truncation (see
+// claimGenerationMatches) — never the raw strings, never time.Now.
+type TaskRecoveryState struct {
+	Status       string    `json:"status"`
+	DispatchedAt time.Time `json:"dispatched_at"`
+}
+
+// GetTaskRecoveryState reads the authoritative recovery state for one task.
+// Superset of GetTaskStatus for the recovery loop; GetTaskStatus stays for
+// the execution-phase watchers that only need the status string.
+func (c *Client) GetTaskRecoveryState(ctx context.Context, taskID string) (TaskRecoveryState, error) {
+	var resp TaskRecoveryState
+	if err := c.getJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/status", taskID), &resp); err != nil {
+		return TaskRecoveryState{}, err
+	}
+	return resp, nil
+}
 // GetTaskStatus returns the current status of a task. Used by the daemon to
 // detect terminal/interruption signals (cancelled, failed, completed, or a
 // 404 task-not-found) while a task is executing.

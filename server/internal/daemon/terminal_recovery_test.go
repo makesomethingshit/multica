@@ -21,9 +21,14 @@ import (
 type terminalRecoveryServer struct {
 	mu           sync.Mutex
 	status       string // authoritative task status answered by /status
-	notFound     bool   // /status answers 404 task not found
-	statusBroken bool   // /status answers 502
-	statusCode   int    // /status answer override (0 → default behavior)
+	notFound     bool      // /status answers 404 task not found
+	statusBroken bool      // /status answers 502
+	statusCode   int       // /status answer override (0 → default behavior)
+	// statusDispatchedAt is the authoritative delivery generation answered
+	// by /status (zero → field omitted, fence cannot apply). Emitted in
+	// RFC3339Nano to exercise the claim(RFC3339)/status(nano) precision
+	// asymmetry the fence comparison must survive.
+	statusDispatchedAt time.Time
 	completeCode int    // POST /complete answer (0 → 200)
 	failCode     int    // POST /fail answer (0 → 200)
 	// onStatus, when set, runs inside the /status handler — test seam for
@@ -43,6 +48,15 @@ func (s *terminalRecoveryServer) setLockStatus(status string) {
 	s.status = status
 }
 
+// setLockStatusWithGen sets the authoritative status and its delivery
+// generation together, mirroring a server row that a (re-)claim produced.
+func (s *terminalRecoveryServer) setLockStatusWithGen(status string, gen time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = status
+	s.statusDispatchedAt = gen
+}
+
 func (s *terminalRecoveryServer) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch {
@@ -52,7 +66,7 @@ func (s *terminalRecoveryServer) handler() http.Handler {
 				s.onStatus()
 			}
 			s.mu.Lock()
-			notFound, broken, status, statusCode := s.notFound, s.statusBroken, s.status, s.statusCode
+			notFound, broken, status, statusCode, genAt := s.notFound, s.statusBroken, s.status, s.statusCode, s.statusDispatchedAt
 			s.mu.Unlock()
 			if notFound {
 				w.WriteHeader(http.StatusNotFound)
@@ -68,7 +82,11 @@ func (s *terminalRecoveryServer) handler() http.Handler {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"status":%q}`, status)
+			if genAt.IsZero() {
+				_, _ = fmt.Fprintf(w, `{"status":%q}`, status)
+			} else {
+				_, _ = fmt.Fprintf(w, `{"status":%q,"dispatched_at":%q}`, status, genAt.Format(time.RFC3339Nano))
+			}
 		case strings.HasSuffix(req.URL.Path, "/complete"):
 			s.completeCalls.Add(1)
 			s.mu.Lock()
@@ -138,7 +156,7 @@ func TestTerminalReportRecovery_DeliversWhileServerRunning(t *testing.T) {
 	d.reportTaskResult(context.Background(), "task-live", TaskResult{
 		Status:  "completed",
 		Comment: "provider finished",
-	}, slog.Default())
+	}, slog.Default(), time.Time{})
 	if got := srvState.completeCalls.Load(); got != 3 {
 		t.Fatalf("initial complete attempts = %d, want 3", got)
 	}
@@ -283,7 +301,7 @@ func TestTerminalReportRecovery_FailTaskGetsSameOwnershipProtection(t *testing.T
 		Status:        "failed",
 		Comment:       "boom",
 		FailureReason: "process_failure",
-	}, slog.Default())
+	}, slog.Default(), time.Time{})
 
 	pending := d.pendingTerminalReportSnapshot()
 	if len(pending) != 1 {
@@ -667,5 +685,243 @@ func TestPendingTerminalReportNotFoundDropsPending(t *testing.T) {
 	}
 	if got := srvState.failCalls.Load(); got != 0 {
 		t.Fatalf("fail calls = %d, want 0", got)
+	}
+}
+
+// mustParseClaimInstant parses an RFC3339 instant for fence tests. Times
+// ending in whole seconds mirror the claim payload's second-precision
+// (RFC3339) form; times with a fractional part mirror the status endpoint's
+// RFC3339Nano form for the same DB instant — the fence comparison must treat
+// both as the same generation (§8 round-trip).
+func mustParseClaimInstant(t *testing.T, s string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t.Fatalf("bad test instant %q: %v", s, err)
+	}
+	return parsed
+}
+
+// Claim generation test clock: T1 is the original delivery, T2 a reclaim at
+// least the ~90s claim recovery window later, so distinct generations stay
+// distinct even after second-truncation.
+var (
+	fenceT1     = "2026-09-08T12:00:00Z"
+	fenceT1Nano = "2026-09-08T12:00:00.123456Z"
+	fenceT2     = "2026-09-08T12:02:30Z"
+)
+
+// §9 Test 1 — stale pre-execution fail must not kill a reclaimed task. The
+// old claim's fail report (generation T1) meets a re-claimed row of the same
+// task ID at dispatched with generation T2: no FailTaskOnce call, stale
+// report dropped, current row untouched.
+func TestTerminalReportRecovery_StaleFailMustNotKillReclaimedTask(t *testing.T) {
+	srvState := &terminalRecoveryServer{status: "dispatched"}
+	srvState.setLockStatusWithGen("dispatched", mustParseClaimInstant(t, fenceT2))
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:              terminalTaskReportFail,
+		taskID:            "task-reclaimed",
+		errorMessage:      "runtime went offline before the task started",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT1),
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.failCalls.Load(); got != 0 {
+		t.Fatalf("fail calls = %d, want 0 (stale report must never fail the reclaim)", got)
+	}
+	if got := srvState.completeCalls.Load(); got != 0 {
+		t.Fatalf("complete calls = %d, want 0", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0 (stale report dropped)", got)
+	}
+	srvState.mu.Lock()
+	defer srvState.mu.Unlock()
+	if srvState.status != "dispatched" {
+		t.Fatalf("server state = %q, want dispatched (reclaim untouched)", srvState.status)
+	}
+}
+
+// §9 Test 2 — same-generation dispatched fail still replays (r3 regression
+// guard). The report's second-precision claim instant and the status
+// endpoint's nanosecond form of the SAME instant must compare as the same
+// generation (§8 round-trip).
+func TestTerminalReportRecovery_SameGenerationDispatchedFailReplays(t *testing.T) {
+	srvState := &terminalRecoveryServer{}
+	srvState.setLockStatusWithGen("dispatched", mustParseClaimInstant(t, fenceT1Nano))
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:              terminalTaskReportFail,
+		taskID:            "task-samegen",
+		errorMessage:      "boom",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT1),
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.failCalls.Load(); got != 1 {
+		t.Fatalf("fail calls = %d, want 1 (same generation replays)", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0", got)
+	}
+	srvState.mu.Lock()
+	defer srvState.mu.Unlock()
+	if srvState.status != "failed" {
+		t.Fatalf("server state = %q, want failed", srvState.status)
+	}
+}
+
+// §9 Test 3 — same-generation waiting_local_directory fail still replays.
+func TestTerminalReportRecovery_SameGenerationWaitingFailReplays(t *testing.T) {
+	srvState := &terminalRecoveryServer{}
+	srvState.setLockStatusWithGen("waiting_local_directory", mustParseClaimInstant(t, fenceT1))
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:              terminalTaskReportFail,
+		taskID:            "task-waiting-samegen",
+		errorMessage:      "local_directory wait cancelled: context canceled",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT1),
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.failCalls.Load(); got != 1 {
+		t.Fatalf("fail calls = %d, want 1", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0", got)
+	}
+}
+
+// §9 Test 4 — same-generation running fail still replays (fenced variant of
+// the existing unfenced running-fail test).
+func TestTerminalReportRecovery_SameGenerationRunningFailReplays(t *testing.T) {
+	srvState := &terminalRecoveryServer{}
+	srvState.setLockStatusWithGen("running", mustParseClaimInstant(t, fenceT1))
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:              terminalTaskReportFail,
+		taskID:            "task-running-fenced",
+		errorMessage:      "boom",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT1),
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.failCalls.Load(); got != 1 {
+		t.Fatalf("fail calls = %d, want 1", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0", got)
+	}
+}
+
+// §9 Test 5 — stale completion must not affect a reclaimed running task. The
+// same claim generation fence applies to complete reports: an old completion
+// meeting a newer generation drops without any mutation.
+func TestTerminalReportRecovery_StaleCompletionDroppedOnReclaimedRunning(t *testing.T) {
+	srvState := &terminalRecoveryServer{}
+	srvState.setLockStatusWithGen("running", mustParseClaimInstant(t, fenceT2))
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:              terminalTaskReportComplete,
+		taskID:            "task-reclaimed-complete",
+		output:            "provider finished",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT1),
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.completeCalls.Load(); got != 0 {
+		t.Fatalf("complete calls = %d, want 0 (stale completion must not settle the reclaim)", got)
+	}
+	if got := srvState.failCalls.Load(); got != 0 {
+		t.Fatalf("fail calls = %d, want 0", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0 (stale report dropped)", got)
+	}
+}
+
+// §9 Test 6 — a terminal server state beats even a stale generation: the
+// server-authority gate runs before the fence, so a lost success response
+// converges without mutation.
+func TestTerminalReportRecovery_TerminalStateBeatsStaleGeneration(t *testing.T) {
+	srvState := &terminalRecoveryServer{}
+	srvState.setLockStatusWithGen("completed", mustParseClaimInstant(t, fenceT2))
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	d.enqueuePendingTerminalReport(terminalTaskReport{
+		kind:              terminalTaskReportComplete,
+		taskID:            "task-terminal-beats-fence",
+		output:            "provider finished",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT1),
+	})
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	if got := srvState.completeCalls.Load(); got != 0 {
+		t.Fatalf("complete calls = %d, want 0", got)
+	}
+	if got := srvState.failCalls.Load(); got != 0 {
+		t.Fatalf("fail calls = %d, want 0", got)
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0", got)
+	}
+}
+
+// §9 Test 8 (generation-diff half) — a stale snapshot removal must not
+// delete a newer report that carries a DIFFERENT generation. Extends the
+// value-guarded removal tests: same taskID, newer output, newer fence.
+func TestPendingTerminalReportStaleGenerationRemoveKeepsNewer(t *testing.T) {
+	d := &Daemon{logger: slog.Default()}
+	stale := terminalTaskReport{
+		kind:              terminalTaskReportFail,
+		taskID:            "task-gen-race",
+		errorMessage:      "old claim failed",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT1),
+	}
+	newer := terminalTaskReport{
+		kind:              terminalTaskReportFail,
+		taskID:            "task-gen-race",
+		errorMessage:      "new claim failed",
+		claimDispatchedAt: mustParseClaimInstant(t, fenceT2),
+	}
+	d.enqueuePendingTerminalReport(stale)
+	d.enqueuePendingTerminalReport(newer)
+
+	d.removePendingTerminalReport("task-gen-race", stale)
+	pending := d.pendingTerminalReportSnapshot()
+	if len(pending) != 1 {
+		t.Fatalf("pending reports = %d, want 1", len(pending))
+	}
+	if got := pending["task-gen-race"]; got.errorMessage != "new claim failed" || !got.claimDispatchedAt.Equal(newer.claimDispatchedAt) {
+		t.Fatalf("surviving report = %+v, want the newer generation", got)
+	}
+
+	d.removePendingTerminalReport("task-gen-race", newer)
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports = %d, want 0", got)
 	}
 }

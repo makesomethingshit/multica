@@ -4383,7 +4383,19 @@ func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": task.Status})
+	writeJSON(w, http.StatusOK, func() map[string]string {
+		resp := map[string]string{"status": task.Status}
+		// Recovery generation fence (#8157 r4): expose the delivery
+		// generation discriminator alongside the status, at sub-second
+		// precision so the daemon can round-trip it without loss. The
+		// legacy claim payload keeps its second-precision form; only this
+		// new field uses nanoseconds. Omitted when the column is NULL so
+		// old rows behave like an unfenced lookup.
+		if ts := util.TimestampToNanoPtr(task.DispatchedAt); ts != nil {
+			resp["dispatched_at"] = *ts
+		}
+		return resp
+	}())
 }
 
 // FailTask marks a running task as failed.

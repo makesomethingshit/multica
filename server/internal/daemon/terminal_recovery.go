@@ -170,6 +170,50 @@ func terminalReportCanReplay(status string, kind terminalTaskReportKind) bool {
 	return false
 }
 
+// parseClaimDispatchedAt parses the server-authoritative dispatched_at
+// from a claim response into the recovery generation fence. RFC3339Nano
+// parses both the claim payload's second-precision RFC3339 form and the
+// status endpoint's nanosecond form. Empty, nil, or unparseable input
+// yields the zero time — the fence then cannot apply (old server) and
+// recovery falls back to the pre-fence behavior instead of dropping.
+func parseClaimDispatchedAt(s *string) time.Time {
+	if s == nil || *s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, *s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// claimGenerationMatches reports whether a pending report's delivery
+// generation still matches the server's current generation. Either side
+// missing (old server without the status field, or a report built without a
+// claim value) means the fence cannot apply — match, so pre-fence behavior
+// continues instead of dropping everything old servers settle. When both
+// sides are present, truncate to seconds before comparing: the claim payload
+// carries dispatched_at at second precision while the status endpoint
+// preserves sub-second precision, so the same delivery compares equal only
+// after truncation; a stale-dispatch reclaim always lands at least the claim
+// recovery window (~90s) later, so distinct generations stay distinct.
+// Compare instants (Equal), never raw strings, never time.Now.
+func claimGenerationMatches(reportGen, currentGen time.Time) bool {
+	if reportGen.IsZero() || currentGen.IsZero() {
+		return true
+	}
+	return reportGen.Truncate(time.Second).Equal(currentGen.Truncate(time.Second))
+}
+
+// formatClaimGeneration renders a fence value for recovery logs (RFC3339Nano;
+// empty when unset) so stale-drop lines carry both sides of the comparison.
+func formatClaimGeneration(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339Nano)
+}
+
 // recoverOneTerminalReport settles one pending report against the
 // authoritative server state. The state machine is intentionally total:
 //
@@ -191,7 +235,7 @@ func terminalReportCanReplay(status string, kind terminalTaskReportKind) bool {
 func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTaskReport) {
 	taskLog := d.logger.With("task_id", report.taskID, "terminal_kind", report.kind.String())
 
-	status, err := d.client.GetTaskStatus(ctx, report.taskID)
+	state, err := d.client.GetTaskRecoveryState(ctx, report.taskID)
 	if err != nil {
 		if isTaskNotFoundError(err) {
 			d.removePendingTerminalReport(report.taskID, report)
@@ -212,7 +256,27 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 		return
 	}
 
+	status := state.Status
 	switch {
+	case isAgentTaskTerminal(status):
+		// Server authority first: a terminal row always wins over the
+		// pending report — including over a stale generation — so a lost
+		// success response converges without any mutation.
+		d.removePendingTerminalReport(report.taskID, report)
+		taskLog.Info("dropping pending terminal report; server task is already terminal", "server_status", status, "outcome", "dropped_server_terminal")
+
+	case !claimGenerationMatches(report.claimDispatchedAt, state.DispatchedAt):
+		// Claim generation fence (#8157 r4): the task was re-claimed since
+		// this report was produced. A stale pre-execution failure from an
+		// earlier delivery must never fail the later reclaim — drop without
+		// any terminal mutation. A normal convergence, not a warning.
+		d.removePendingTerminalReport(report.taskID, report)
+		taskLog.Info("dropping stale terminal report; task was re-claimed",
+			"server_status", status,
+			"report_dispatched_at", formatClaimGeneration(report.claimDispatchedAt),
+			"current_dispatched_at", formatClaimGeneration(state.DispatchedAt),
+			"outcome", "dropped_stale_claim")
+
 	case terminalReportCanReplay(status, report.kind):
 		// Single delivery attempt — the loop is the retry mechanism. Do not
 		// stack defaultTerminalRetrySchedule inside background passes; that
@@ -228,15 +292,6 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 		}
 		d.removePendingTerminalReport(report.taskID, report)
 		taskLog.Info("terminal report recovery delivered", "server_status", status, "outcome", "delivered")
-
-	case isAgentTaskTerminal(status):
-		// Server authority: never overwrite a terminal state. A pending
-		// completion meeting cancelled/failed/completed is dropped, so user
-		// cancellation wins and a failed parent is never resurrected. The
-		// value guard keeps a report re-enqueued mid-pass for the next pass,
-		// which re-reads the (still terminal) state and drops it there.
-		d.removePendingTerminalReport(report.taskID, report)
-		taskLog.Info("dropping pending terminal report; server task is already terminal", "server_status", status, "outcome", "dropped_server_terminal")
 
 	default:
 		// queued, dispatched, deferred, waiting_local_directory, or a future
