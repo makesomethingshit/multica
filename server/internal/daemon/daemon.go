@@ -525,6 +525,21 @@ type Daemon struct {
 	pendingWorkInflight map[string]struct{}  // runtime_id -> hint-driven heartbeat in flight
 	pendingWorkLastRun  map[string]time.Time // runtime_id -> when the last hint-driven heartbeat started
 
+	// pendingTerminalReports holds terminal callback reports (complete/fail)
+	// whose bounded transient-retry schedule was exhausted while the server
+	// row was still running (GitHub #8157). The single recovery loop replays
+	// them until the server settles them authoritatively; the state machine
+	// lives in terminal_recovery.go. In-memory only by design: a daemon
+	// restart drops them, because durable replay would cross the server's
+	// parent-failure / retry-child authority boundary (#4579) and stays out
+	// of scope. Guarded by terminalReportsMu; keyed by taskID with one
+	// pending report per task (latest enqueue wins). Reports are plain
+	// values: settlement never retains a task goroutine, provider slot, or
+	// local-directory lock.
+	terminalReportsMu      sync.Mutex
+	pendingTerminalReports map[string]terminalTaskReport
+	terminalReportsWake    chan struct{} // capacity 1; non-blocking send coalesces wakes
+
 	cancelFunc context.CancelFunc // set by Run(); called by triggerRestart
 	rootCtx    context.Context    // set by Run(); used by long-running recoveries that must survive per-runtime ctx cancellation
 	// restartMu guards restartBinary. Two goroutines can reach triggerRestart —
@@ -663,6 +678,8 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		pendingWorkLastRun:        make(map[string]time.Time),
 		reregisterNextAttempt:     make(map[string]time.Time),
 		reregisterLastCompletedAt: make(map[string]time.Time),
+		pendingTerminalReports:    make(map[string]terminalTaskReport),
+		terminalReportsWake:       make(chan struct{}, 1),
 		cancelPollInterval:        5 * time.Second,
 		envRootBusyWait:           15 * time.Second,
 		taskPrepareTimeout:        defaultTaskPrepareTimeout,
@@ -2050,6 +2067,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.tokenRenewalLoop(ctx)
+	go d.terminalRecoveryLoop(ctx)
 
 	// Preflight succeeded and the background loops are up: the daemon has
 	// registered its runtimes and can now claim and run tasks. Flip /health
@@ -2057,7 +2075,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// readiness wait blocks on, so success is reported only after startup
 	// actually completed, not merely because the health port came up.
 	d.ready.Store(true)
-	d.logger.Debug("background loops launched (workspace-sync, task-wakeup, heartbeat, gc, auto-update, token-renewal); health now reporting ready")
+	d.logger.Debug("background loops launched (workspace-sync, task-wakeup, heartbeat, gc, auto-update, token-renewal, terminal-recovery); health now reporting ready")
 	err = d.pollLoop(ctx, taskWakeups)
 	d.logger.Debug("daemon main loop returning", "error", err)
 	return err
@@ -5878,7 +5896,23 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		// has already refused this task and the only useful UI signal
 		// left is a concrete failure.
 		if isTransientError(err) {
-			taskLog.Error("complete task failed after retries; leaving task in running rather than falling back to fail", "error", err)
+			// #8157: transfer ownership of the already-produced terminal
+			// result to the live-daemon recovery loop instead of leaving it
+			// ownerless. The report is memory-only for the daemon process
+			// lifetime; the loop replays it while the server row is still
+			// running and defers to any server-terminal state.
+			taskLog.Error("complete task failed after retries; queued terminal report for live-daemon recovery", "error", err)
+			d.enqueuePendingTerminalReport(terminalTaskReport{
+				kind:                  terminalTaskReportComplete,
+				taskID:                taskID,
+				output:                result.Comment,
+				branchName:            result.BranchName,
+				sessionID:             result.SessionID,
+				workDir:               result.WorkDir,
+				durableWorkDir:        result.DurableWorkDir,
+				sessionRolloutMissing: result.SessionRolloutMissing,
+				retiredSessionID:      result.RetiredSessionID,
+			})
 			return
 		}
 		taskLog.Error("complete task rejected by server, falling back to fail", "error", err)
@@ -5891,7 +5925,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		// which is the canonical replacement for the legacy
 		// "agent_error" coarse bucket.
 		fallbackErrMsg := fmt.Sprintf("complete task failed: %s", err.Error())
-		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+		fallbackReport := terminalTaskReport{
 			kind:         terminalTaskReportFail,
 			taskID:       taskID,
 			errorMessage: fallbackErrMsg,
@@ -5905,7 +5939,15 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			failureReason:         taskfailure.Classify(fallbackErrMsg).String(),
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
-		}); failErr != nil {
+		}
+		if failErr := d.reportTerminalTask(ctx, fallbackReport); failErr != nil {
+			if isTransientError(failErr) {
+				// Same ownership rule as the primary paths: a fail callback
+				// whose retries were exhausted must not become ownerless.
+				taskLog.Error("fail task fallback also failed after retries; queued terminal report for live-daemon recovery", "error", failErr)
+				d.enqueuePendingTerminalReport(fallbackReport)
+				return
+			}
 			taskLog.Error("fail task fallback also failed", "error", failErr)
 		}
 	default:
@@ -5928,7 +5970,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			}
 		}
 		taskLog.Info("task did not complete, reporting failure", "status", result.Status, "failure_reason", failureReason)
-		if err := d.reportTerminalTask(ctx, terminalTaskReport{
+		failReport := terminalTaskReport{
 			kind:           terminalTaskReportFail,
 			taskID:         taskID,
 			errorMessage:   result.Comment,
@@ -5943,7 +5985,16 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			failureReason:         failureReason,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
-		}); err != nil {
+		}
+		if err := d.reportTerminalTask(ctx, failReport); err != nil {
+			// #8157: the ownership rule covers both terminal callback types —
+			// a fail report whose transient retries were exhausted while the
+			// server row is still running goes to the same recovery store.
+			if isTransientError(err) {
+				taskLog.Error("fail task failed after retries; queued terminal report for live-daemon recovery", "error", err)
+				d.enqueuePendingTerminalReport(failReport)
+				return
+			}
 			taskLog.Error("report failed task failed", "error", err)
 		}
 	}

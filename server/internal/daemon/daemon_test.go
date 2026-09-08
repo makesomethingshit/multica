@@ -4409,16 +4409,16 @@ func TestReportTaskResult_RetriesTransientCompleteThenSucceeds(t *testing.T) {
 	}
 }
 
-// Pins the new "don't downgrade success to failure on transient errors"
-// rule: when /complete is 502 across the entire retry schedule, we must
-// NOT fall through to /fail — that would surface a real success as a
-// failure in the UI. The task is left in running for a future recovery
-// path to pick up.
-func TestReportTaskResult_TransientCompleteExhaustedDoesNotFallback(t *testing.T) {
+// #8157 regression: when /complete is 502 across the entire retry schedule,
+// we must NOT fall through to /fail — that would surface a real success as a
+// failure in the UI — and the terminal result must not become ownerless
+// either. reportTaskResult now queues the report for the live-daemon recovery
+// loop, which owns settlement until the server settles it.
+func TestReportTaskResult_TransientCompleteExhaustedQueuesLiveRecovery(t *testing.T) {
 	defer noSleepRetry(t)()
 
 	prevSchedule := defaultTerminalRetrySchedule
-	defaultTerminalRetrySchedule = []time.Duration{time.Nanosecond, time.Nanosecond}
+	defaultTerminalRetrySchedule = []time.Duration{0, 0}
 	t.Cleanup(func() { defaultTerminalRetrySchedule = prevSchedule })
 
 	var completeCalls, failCalls atomic.Int32
@@ -4437,16 +4437,34 @@ func TestReportTaskResult_TransientCompleteExhaustedDoesNotFallback(t *testing.T
 	t.Cleanup(srv.Close)
 
 	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
-	d.reportTaskResult(context.Background(), "task-stuck", TaskResult{
+	d.reportTaskResult(context.Background(), "task-repro", TaskResult{
 		Status:  "completed",
-		Comment: "ok",
+		Comment: "provider finished",
 	}, slog.Default())
 
-	if got := completeCalls.Load(); got != int32(len(defaultTerminalRetrySchedule)+1) {
-		t.Fatalf("expected %d complete attempts, got %d", len(defaultTerminalRetrySchedule)+1, got)
+	// Schedule {0, 0} → 3 attempts (one immediate + two retries).
+	if got := completeCalls.Load(); got != 3 {
+		t.Fatalf("expected 3 complete attempts, got %d", got)
 	}
 	if got := failCalls.Load(); got != 0 {
 		t.Fatalf("exhausted transient retries must NOT fall back to /fail; got %d /fail calls", got)
+	}
+
+	// The completed result must not become ownerless: exactly one pending
+	// report remains, owned by the live-daemon recovery loop.
+	pending := d.pendingTerminalReportSnapshot()
+	if len(pending) != 1 {
+		t.Fatalf("expected exactly 1 pending terminal report, got %d (%v)", len(pending), pending)
+	}
+	report, ok := pending["task-repro"]
+	if !ok {
+		t.Fatalf("pending report keyed by task-repro not found; got keys %v", pending)
+	}
+	if report.kind != terminalTaskReportComplete {
+		t.Fatalf("pending report kind = %v, want complete", report.kind)
+	}
+	if report.output != "provider finished" {
+		t.Fatalf("pending report output = %q, want %q", report.output, "provider finished")
 	}
 }
 
