@@ -5896,23 +5896,10 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		// has already refused this task and the only useful UI signal
 		// left is a concrete failure.
 		if isTransientError(err) {
-			// #8157: transfer ownership of the already-produced terminal
-			// result to the live-daemon recovery loop instead of leaving it
-			// ownerless. The report is memory-only for the daemon process
-			// lifetime; the loop replays it while the server row is still
-			// running and defers to any server-terminal state.
-			taskLog.Error("complete task failed after retries; queued terminal report for live-daemon recovery", "error", err)
-			d.enqueuePendingTerminalReport(terminalTaskReport{
-				kind:                  terminalTaskReportComplete,
-				taskID:                taskID,
-				output:                result.Comment,
-				branchName:            result.BranchName,
-				sessionID:             result.SessionID,
-				workDir:               result.WorkDir,
-				durableWorkDir:        result.DurableWorkDir,
-				sessionRolloutMissing: result.SessionRolloutMissing,
-				retiredSessionID:      result.RetiredSessionID,
-			})
+			// #8157: reportTerminalTask has already queued the complete report
+			// for live-daemon recovery — the terminal result is no longer
+			// ownerless, and it must not be downgraded to a failure here (a
+			// control-plane outage is not an agent failure).
 			return
 		}
 		taskLog.Error("complete task rejected by server, falling back to fail", "error", err)
@@ -5942,10 +5929,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		}
 		if failErr := d.reportTerminalTask(ctx, fallbackReport); failErr != nil {
 			if isTransientError(failErr) {
-				// Same ownership rule as the primary paths: a fail callback
-				// whose retries were exhausted must not become ownerless.
-				taskLog.Error("fail task fallback also failed after retries; queued terminal report for live-daemon recovery", "error", failErr)
-				d.enqueuePendingTerminalReport(fallbackReport)
+				// Same ownership rule as the primary paths — queued for
+				// live-daemon recovery by reportTerminalTask.
 				return
 			}
 			taskLog.Error("fail task fallback also failed", "error", failErr)
@@ -5988,11 +5973,9 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		}
 		if err := d.reportTerminalTask(ctx, failReport); err != nil {
 			// #8157: the ownership rule covers both terminal callback types —
-			// a fail report whose transient retries were exhausted while the
-			// server row is still running goes to the same recovery store.
+			// reportTerminalTask queued the fail report for live-daemon
+			// recovery on transient exhaustion.
 			if isTransientError(err) {
-				taskLog.Error("fail task failed after retries; queued terminal report for live-daemon recovery", "error", err)
-				d.enqueuePendingTerminalReport(failReport)
 				return
 			}
 			taskLog.Error("report failed task failed", "error", err)
@@ -6000,7 +5983,18 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 	}
 }
 
-// reportTerminalTask is the only path that sends complete/fail callbacks.
+// reportTerminalTask is the only path that sends complete/fail callbacks, and
+// the single ownership-transfer point for live-daemon terminal recovery
+// (#8157). Every normal terminal callback funnels through here —
+// reportTaskResult's completed/fail/fallback-fail paths plus the direct fail
+// reports from handleTask (runtime untracked, runTask error) and
+// acquireLocalDirectoryLockIfNeeded (resolve/mode/validation/lock failures) —
+// so a transient exhaustion of the bounded retry schedule enqueues the report
+// for the recovery loop instead of leaving the already-produced terminal
+// result ownerless. Permanent server rejections are NOT queued: the server
+// already refused this callback for good, and replaying it cannot succeed.
+// An unsupported report kind fails fast without queueing.
+//
 // It deliberately preserves context values while discarding cancellation and
 // parent deadlines: daemon shutdown cancels the root context before pollLoop's
 // 30-second drain, but terminal callbacks must still use that remaining window.
@@ -6009,14 +6003,24 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), terminalTaskReportTimeout)
 	defer cancel()
 
+	var err error
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
+		err = d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
 	case terminalTaskReportFail:
-		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
+		err = d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
+	if err != nil && isTransientError(err) {
+		// #8157: the bounded schedule was exhausted on a transient error while
+		// the server row may still be running — transfer settlement ownership
+		// to the live-daemon recovery loop instead of dropping the result.
+		d.logger.Error("terminal task callback failed after retries; queued terminal report for live-daemon recovery",
+			"task_id", report.taskID, "terminal_kind", report.kind.String(), "error", err)
+		d.enqueuePendingTerminalReport(report)
+	}
+	return err
 }
 
 // gcMetaForTask classifies a finished task and produces a GCMeta of the right

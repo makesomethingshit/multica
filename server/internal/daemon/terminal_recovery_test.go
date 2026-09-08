@@ -25,6 +25,11 @@ type terminalRecoveryServer struct {
 	statusBroken bool   // /status answers 502
 	completeCode int    // POST /complete answer (0 → 200)
 	failCode     int    // POST /fail answer (0 → 200)
+	// onStatus, when set, runs inside the /status handler — test seam for
+	// injecting a concurrent re-enqueue between the recovery pass's snapshot
+	// and its removal (synchronous: recovery passes under test run in the
+	// test goroutine).
+	onStatus func()
 
 	completeCalls atomic.Int32
 	failCalls     atomic.Int32
@@ -42,6 +47,9 @@ func (s *terminalRecoveryServer) handler() http.Handler {
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/status"):
 			s.statusCalls.Add(1)
+			if s.onStatus != nil {
+				s.onStatus()
+			}
 			s.mu.Lock()
 			notFound, broken, status := s.notFound, s.statusBroken, s.status
 			s.mu.Unlock()
@@ -368,5 +376,154 @@ func TestPendingTerminalReportShutdownExitsLoop(t *testing.T) {
 	// still exactly one, never persisted anywhere.
 	if got := len(d.pendingTerminalReportSnapshot()); got != 1 {
 		t.Fatalf("pending reports after shutdown = %d, want 1 (memory-only store)", got)
+	}
+}
+
+// #8157 §9: every terminal callback path funnels through reportTerminalTask,
+// so transient exhaustion there — not only inside reportTaskResult — must
+// transfer ownership to the recovery store. This pins the direct fail-report
+// call paths (handleTask's runtime-untracked and runTask-error sites,
+// acquireLocalDirectoryLockIfNeeded's local-directory failures) that do not
+// pass through reportTaskResult, and re-checks §5: a permanently rejected
+// callback is never queued.
+func TestTerminalReportOwnershipTransferredOnTransientExhaustion(t *testing.T) {
+	collapseTerminalRetries(t)
+
+	srvState := &terminalRecoveryServer{failCode: http.StatusBadGateway, completeCode: http.StatusBadGateway}
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	ctx := context.Background()
+
+	// Transient exhaustion on the fail callback queues a fail report.
+	if err := d.reportTerminalTask(ctx, terminalTaskReport{
+		kind:         terminalTaskReportFail,
+		taskID:       "task-direct-fail",
+		errorMessage: "runtime went offline before the task started",
+	}); err == nil {
+		t.Fatal("expected transient error from exhausted fail callback")
+	}
+	// Transient exhaustion on the complete callback queues a complete report.
+	if err := d.reportTerminalTask(ctx, terminalTaskReport{
+		kind:   terminalTaskReportComplete,
+		taskID: "task-direct-complete",
+		output: "done",
+	}); err == nil {
+		t.Fatal("expected transient error from exhausted complete callback")
+	}
+
+	pending := d.pendingTerminalReportSnapshot()
+	if len(pending) != 2 {
+		t.Fatalf("pending reports = %d, want 2 (%v)", len(pending), pending)
+	}
+	if got := pending["task-direct-fail"]; got.kind != terminalTaskReportFail || got.errorMessage != "runtime went offline before the task started" {
+		t.Fatalf("pending fail report = %+v, want fail kind with original payload", got)
+	}
+	if got := pending["task-direct-complete"]; got.kind != terminalTaskReportComplete || got.output != "done" {
+		t.Fatalf("pending complete report = %+v, want complete kind with original payload", got)
+	}
+
+	// §5: a permanent rejection (400) is never queued.
+	srvState.mu.Lock()
+	srvState.failCode = http.StatusBadRequest
+	srvState.mu.Unlock()
+	if err := d.reportTerminalTask(ctx, terminalTaskReport{
+		kind:         terminalTaskReportFail,
+		taskID:       "task-direct-permanent",
+		errorMessage: "bad request",
+	}); err == nil {
+		t.Fatal("expected permanent error from 400 fail callback")
+	}
+	if _, queued := d.pendingTerminalReportSnapshot()["task-direct-permanent"]; queued {
+		t.Fatal("permanently rejected report must not be queued (§5)")
+	}
+	if got := len(d.pendingTerminalReportSnapshot()); got != 2 {
+		t.Fatalf("pending reports after permanent rejection = %d, want 2", got)
+	}
+}
+
+// Concurrency regression (cross-validation round 1): removal must be
+// value-guarded. Re-enqueueing the same task with a newer report (latest-wins
+// enqueue) followed by a removal attempt holding the STALE report value must
+// preserve the newer report; only removing the current value drops it.
+func TestPendingTerminalReportStaleRemoveKeepsLatest(t *testing.T) {
+	d := &Daemon{logger: slog.Default()}
+	stale := terminalTaskReport{kind: terminalTaskReportComplete, taskID: "task-race", output: "old"}
+	latest := terminalTaskReport{kind: terminalTaskReportComplete, taskID: "task-race", output: "newer"}
+
+	d.enqueuePendingTerminalReport(stale)
+	d.enqueuePendingTerminalReport(latest)
+
+	// A recovery pass snapshotted the stale report; while it was in flight a
+	// newer report was enqueued. Removing by the stale value must be a no-op.
+	d.removePendingTerminalReport("task-race", stale)
+	pending := d.pendingTerminalReportSnapshot()
+	if len(pending) != 1 {
+		t.Fatalf("pending reports after stale removal = %d, want 1", len(pending))
+	}
+	if got := pending["task-race"]; got.output != "newer" {
+		t.Fatalf("surviving report output = %q, want the newer report %q", got.output, "newer")
+	}
+
+	// Removing the current value does drop it.
+	d.removePendingTerminalReport("task-race", latest)
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports after current-value removal = %d, want 0", got)
+	}
+}
+
+// End-to-end race regression: a re-enqueue landing between the recovery
+// pass's status read and its removal must not discard the newer report. The
+// pass delivers the stale report it snapshotted; the newer report survives
+// for the next pass, which re-reads authoritative state.
+func TestPendingTerminalReportReenqueueDuringRecoveryKeepsLatest(t *testing.T) {
+	srvState := &terminalRecoveryServer{status: "running"}
+	srv := httptest.NewServer(srvState.handler())
+	t.Cleanup(srv.Close)
+
+	d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
+	stale := terminalTaskReport{kind: terminalTaskReportComplete, taskID: "task-race-pass", output: "old"}
+	d.enqueuePendingTerminalReport(stale)
+
+	// While the pass reads authoritative state, the same task is re-enqueued
+	// with a newer report (latest-wins replacement in the store).
+	srvState.onStatus = func() {
+		d.enqueuePendingTerminalReport(terminalTaskReport{
+			kind:   terminalTaskReportComplete,
+			taskID: "task-race-pass",
+			output: "newer",
+		})
+	}
+
+	d.recoverPendingTerminalReports(context.Background())
+
+	// The stale report was delivered and removed; the newer report survives.
+	pending := d.pendingTerminalReportSnapshot()
+	if len(pending) != 1 {
+		t.Fatalf("pending reports after recovery = %d, want 1 (newer report must survive)", len(pending))
+	}
+	if got := pending["task-race-pass"]; got.output != "newer" {
+		t.Fatalf("surviving report output = %q, want %q", got.output, "newer")
+	}
+	if got := srvState.completeCalls.Load(); got != 1 {
+		t.Fatalf("complete calls = %d, want 1 (stale snapshot was still delivered)", got)
+	}
+	srvState.mu.Lock()
+	status := srvState.status
+	srvState.mu.Unlock()
+	if status != "completed" {
+		t.Fatalf("server state = %q, want completed", status)
+	}
+
+	// The next pass re-reads the now-terminal state and drops the newer
+	// report authoritatively — no second mutation, no resurrected queue.
+	srvState.onStatus = nil
+	d.recoverPendingTerminalReports(context.Background())
+	if got := len(d.pendingTerminalReportSnapshot()); got != 0 {
+		t.Fatalf("pending reports after follow-up pass = %d, want 0", got)
+	}
+	if got := srvState.completeCalls.Load(); got != 1 {
+		t.Fatalf("complete calls after follow-up pass = %d, want 1 (no second mutation)", got)
 	}
 }

@@ -74,12 +74,22 @@ func (d *Daemon) enqueuePendingTerminalReport(report terminalTaskReport) {
 	}
 }
 
-// removePendingTerminalReport drops a report once it is settled — delivered,
-// or discarded because the server state already won.
-func (d *Daemon) removePendingTerminalReport(taskID string) {
+// removePendingTerminalReport drops a settled report — delivered, or
+// discarded because the server state already won — but only when it is still
+// the one currently stored for the task. A recovery pass works on a snapshot:
+// if the same task was re-enqueued with a newer report while the pass was in
+// flight (latest-wins enqueue), deleting by taskID alone would discard the
+// newer report the daemon now owns. terminalTaskReport is comparable (plain
+// string/bool fields), so an equality check against the store's current value
+// guarantees latest-wins without a generation counter. A newer report that
+// survives a drop here is re-evaluated — and dropped authoritatively if the
+// server state is terminal — by the next recovery pass.
+func (d *Daemon) removePendingTerminalReport(taskID string, report terminalTaskReport) {
 	d.terminalReportsMu.Lock()
-	delete(d.pendingTerminalReports, taskID)
-	d.terminalReportsMu.Unlock()
+	defer d.terminalReportsMu.Unlock()
+	if current, ok := d.pendingTerminalReports[taskID]; ok && current == report {
+		delete(d.pendingTerminalReports, taskID)
+	}
 }
 
 // pendingTerminalReportSnapshot returns a copy of the store. Test seam and
@@ -157,7 +167,7 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 	status, err := d.client.GetTaskStatus(ctx, report.taskID)
 	if err != nil {
 		if isTaskNotFoundError(err) {
-			d.removePendingTerminalReport(report.taskID)
+			d.removePendingTerminalReport(report.taskID, report)
 			taskLog.Info("dropping pending terminal report; server task not found")
 			return
 		}
@@ -175,18 +185,20 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 				taskLog.Warn("terminal recovery delivery failed; keeping pending report", "server_status", status, "outcome", "retry_later", "error", err)
 				return
 			}
-			d.removePendingTerminalReport(report.taskID)
+			d.removePendingTerminalReport(report.taskID, report)
 			taskLog.Error("terminal recovery delivery permanently rejected; dropping pending report", "server_status", status, "outcome", "dropped_permanent_rejection", "error", err)
 			return
 		}
-		d.removePendingTerminalReport(report.taskID)
+		d.removePendingTerminalReport(report.taskID, report)
 		taskLog.Info("terminal report recovery delivered", "server_status", status, "outcome", "delivered")
 
 	case isAgentTaskTerminal(status):
 		// Server authority: never overwrite a terminal state. A pending
 		// completion meeting cancelled/failed/completed is dropped, so user
-		// cancellation wins and a failed parent is never resurrected.
-		d.removePendingTerminalReport(report.taskID)
+		// cancellation wins and a failed parent is never resurrected. The
+		// value guard keeps a report re-enqueued mid-pass for the next pass,
+		// which re-reads the (still terminal) state and drops it there.
+		d.removePendingTerminalReport(report.taskID, report)
 		taskLog.Info("dropping pending terminal report; server task is already terminal", "server_status", status, "outcome", "dropped_server_terminal")
 
 	default:
