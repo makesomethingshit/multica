@@ -179,8 +179,8 @@ type Task struct {
 	// handlers, so it doubles as this claim's delivery generation fence for
 	// live-daemon terminal recovery (#8157 r4): a pending report replays
 	// only while the server's current dispatched_at still matches the
-	// claim that produced it. Nil on old servers — the fence then cannot
-	// apply and recovery falls back to the pre-fence behavior.
+	// claim that produced it. Nil on old servers — recovery holds the report
+	// until ownership can be proven rather than issuing an unfenced callback.
 	DispatchedAt *string `json:"dispatched_at,omitempty"`
 }
 

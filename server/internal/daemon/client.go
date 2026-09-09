@@ -27,6 +27,12 @@ type requestError struct {
 	Body       string
 }
 
+// errClaimGenerationUnavailable is returned when a terminal callback has no
+// server-issued claim generation to fence it to. An unfenced write could
+// settle a later reclaim of the same task ID, so callers must retain the
+// report for live-daemon recovery instead of sending it.
+var errClaimGenerationUnavailable = errors.New("terminal report claim generation unavailable")
+
 func (e *requestError) Error() string {
 	return fmt.Sprintf("%s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
 }
@@ -494,7 +500,7 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 	}, nil)
 }
 
-func completeTaskBody(output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) map[string]any {
+func completeTaskBody(output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expected ...time.Time) map[string]any {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -514,11 +520,17 @@ func completeTaskBody(output, branchName, sessionID, workDir string, sessionRoll
 	if retiredSessionID != "" {
 		body["retired_session_id"] = retiredSessionID
 	}
+	if len(expected) > 0 && !expected[0].IsZero() {
+		body["expected_dispatched_at"] = expected[0].Format(time.RFC3339Nano)
+	}
 	return body
 }
 
-func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), completeTaskBody(output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir), nil, defaultTerminalRetrySchedule)
+func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expected ...time.Time) error {
+	if len(expected) > 0 && expected[0].IsZero() {
+		return errClaimGenerationUnavailable
+	}
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), completeTaskBody(output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, expected...), nil, defaultTerminalRetrySchedule)
 }
 
 // CompleteTaskOnce sends the complete callback as a single HTTP attempt with
@@ -526,8 +538,11 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, s
 // the loop itself is the retry mechanism, so stacking
 // defaultTerminalRetrySchedule inside background passes would multiply every
 // transient blip into another 124-second stall.
-func (c *Client) CompleteTaskOnce(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), completeTaskBody(output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir), nil)
+func (c *Client) CompleteTaskOnce(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expected ...time.Time) error {
+	if len(expected) > 0 && expected[0].IsZero() {
+		return errClaimGenerationUnavailable
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), completeTaskBody(output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, expected...), nil)
 }
 
 func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []TaskUsageEntry) error {
@@ -539,7 +554,7 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 	}, nil)
 }
 
-func failTaskBody(errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) map[string]any {
+func failTaskBody(errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expected ...time.Time) map[string]any {
 	body := map[string]any{"error": errMsg}
 	if sessionID != "" {
 		body["session_id"] = sessionID
@@ -565,17 +580,26 @@ func failTaskBody(errMsg, sessionID, workDir, branchName, failureReason string, 
 	if retiredSessionID != "" {
 		body["retired_session_id"] = retiredSessionID
 	}
+	if len(expected) > 0 && !expected[0].IsZero() {
+		body["expected_dispatched_at"] = expected[0].Format(time.RFC3339Nano)
+	}
 	return body
 }
 
-func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), failTaskBody(errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir), nil, defaultTerminalRetrySchedule)
+func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expected ...time.Time) error {
+	if len(expected) > 0 && expected[0].IsZero() {
+		return errClaimGenerationUnavailable
+	}
+	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), failTaskBody(errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, expected...), nil, defaultTerminalRetrySchedule)
 }
 
 // FailTaskOnce is CompleteTaskOnce for the fail callback: a single HTTP
 // attempt, no retry schedule — the recovery loop owns retries (#8157).
-func (c *Client) FailTaskOnce(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), failTaskBody(errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir), nil)
+func (c *Client) FailTaskOnce(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, expected ...time.Time) error {
+	if len(expected) > 0 && expected[0].IsZero() {
+		return errClaimGenerationUnavailable
+	}
+	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), failTaskBody(errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, expected...), nil)
 }
 
 // PinTaskSession persists the agent's session_id and work_dir on the task
@@ -622,6 +646,7 @@ func (c *Client) GetTaskRecoveryState(ctx context.Context, taskID string) (TaskR
 	}
 	return resp, nil
 }
+
 // GetTaskStatus returns the current status of a task. Used by the daemon to
 // detect terminal/interruption signals (cancelled, failed, completed, or a
 // 404 task-not-found) while a task is executing.
@@ -1076,6 +1101,9 @@ var retrySleep = func(ctx context.Context, d time.Duration) error {
 // reach here as context errors wrapped by net/http.
 func isTransientError(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, errClaimGenerationUnavailable) {
 		return false
 	}
 	var reqErr *requestError

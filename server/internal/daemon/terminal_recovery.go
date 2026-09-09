@@ -175,7 +175,7 @@ func terminalReportCanReplay(status string, kind terminalTaskReportKind) bool {
 // parses both the claim payload's second-precision RFC3339 form and the
 // status endpoint's nanosecond form. Empty, nil, or unparseable input
 // yields the zero time — the fence then cannot apply (old server) and
-// recovery falls back to the pre-fence behavior instead of dropping.
+// recovery holds the report rather than issuing an unfenced callback.
 func parseClaimDispatchedAt(s *string) time.Time {
 	if s == nil || *s == "" {
 		return time.Time{}
@@ -198,9 +198,11 @@ func parseClaimDispatchedAt(s *string) time.Time {
 // after truncation; a stale-dispatch reclaim always lands at least the claim
 // recovery window (~90s) later, so distinct generations stay distinct.
 // Compare instants (Equal), never raw strings, never time.Now.
+// Missing values intentionally do not match: recovery must hold rather than
+// issue a terminal callback when ownership cannot be proven.
 func claimGenerationMatches(reportGen, currentGen time.Time) bool {
 	if reportGen.IsZero() || currentGen.IsZero() {
-		return true
+		return false
 	}
 	return reportGen.Truncate(time.Second).Equal(currentGen.Truncate(time.Second))
 }
@@ -265,6 +267,12 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 		d.removePendingTerminalReport(report.taskID, report)
 		taskLog.Info("dropping pending terminal report; server task is already terminal", "server_status", status, "outcome", "dropped_server_terminal")
 
+	case report.claimDispatchedAt.IsZero() || state.DispatchedAt.IsZero():
+		// A missing/invalid generation is an unknown owner, not a match. Keep
+		// the report in memory until a compatible status response proves the
+		// original claim; never send an unfenced terminal mutation.
+		taskLog.Warn("terminal recovery generation unavailable; keeping pending report", "server_status", status, "outcome", "kept_generation_unknown")
+
 	case !claimGenerationMatches(report.claimDispatchedAt, state.DispatchedAt):
 		// Claim generation fence (#8157 r4): the task was re-claimed since
 		// this report was produced. A stale pre-execution failure from an
@@ -307,11 +315,14 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 // reportTerminalTask with its bounded schedule, and this loop — not a nested
 // backoff — is the retry mechanism.
 func (d *Daemon) sendTerminalTask(ctx context.Context, report terminalTaskReport) error {
+	if report.claimDispatchedAt.IsZero() {
+		return errClaimGenerationUnavailable
+	}
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTaskOnce(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
+		return d.client.CompleteTaskOnce(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.claimDispatchedAt)
 	case terminalTaskReportFail:
-		return d.client.FailTaskOnce(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir)
+		return d.client.FailTaskOnce(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.branchName, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.durableWorkDir, report.claimDispatchedAt)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}

@@ -4203,7 +4203,7 @@ func TestReportTaskResult_CompletedHitsCompleteEndpoint(t *testing.T) {
 		BranchName: "agent/foo",
 		SessionID:  "ses-1",
 		WorkDir:    "/tmp/foo",
-	}, slog.Default(), time.Time{})
+	}, slog.Default(), testClaimDispatchedAt)
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
@@ -4269,7 +4269,7 @@ func TestReportTaskResult_CancelledParentStillReportsTerminalState(t *testing.T)
 			cancel()
 
 			d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
-			d.reportTaskResult(ctx, "task-cancelled-parent", tc.result, slog.Default(), time.Time{})
+			d.reportTaskResult(ctx, "task-cancelled-parent", tc.result, slog.Default(), testClaimDispatchedAt)
 
 			if got := calls.Load(); got != 1 {
 				t.Fatalf("terminal callback calls = %d, want 1", got)
@@ -4348,7 +4348,7 @@ func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
 				SessionID:     "ses-x",
 				WorkDir:       "/tmp/x",
 				FailureReason: tc.failureReasonIn,
-			}, slog.Default(), time.Time{})
+			}, slog.Default(), testClaimDispatchedAt)
 
 			rec.mu.Lock()
 			defer rec.mu.Unlock()
@@ -4399,7 +4399,7 @@ func TestReportTaskResult_RetriesTransientCompleteThenSucceeds(t *testing.T) {
 	d.reportTaskResult(context.Background(), "task-retry", TaskResult{
 		Status:  "completed",
 		Comment: "ok",
-	}, slog.Default(), time.Time{})
+	}, slog.Default(), testClaimDispatchedAt)
 
 	if got := completeCalls.Load(); got != 2 {
 		t.Fatalf("expected 2 complete attempts (one 502, one 200), got %d", got)
@@ -4440,7 +4440,7 @@ func TestReportTaskResult_TransientCompleteExhaustedQueuesLiveRecovery(t *testin
 	d.reportTaskResult(context.Background(), "task-repro", TaskResult{
 		Status:  "completed",
 		Comment: "provider finished",
-	}, slog.Default(), time.Time{})
+	}, slog.Default(), testClaimDispatchedAt)
 
 	// Schedule {0, 0} → 3 attempts (one immediate + two retries).
 	if got := completeCalls.Load(); got != 3 {
@@ -4493,7 +4493,7 @@ func TestReportTaskResult_PermanentCompleteFallsBackToFail(t *testing.T) {
 	d.reportTaskResult(context.Background(), "task-bad", TaskResult{
 		Status:  "completed",
 		Comment: "ok",
-	}, slog.Default(), time.Time{})
+	}, slog.Default(), testClaimDispatchedAt)
 
 	if got := completeCalls.Load(); got != 1 {
 		t.Fatalf("permanent 400 should not retry, got %d complete attempts", got)
@@ -4528,7 +4528,7 @@ func TestReportTaskResult_CancelledParentStillRunsPermanentFailureFallback(t *te
 	d.reportTaskResult(ctx, "task-cancelled-fallback", TaskResult{
 		Status:  "completed",
 		Comment: "ok",
-	}, slog.Default(), time.Time{})
+	}, slog.Default(), testClaimDispatchedAt)
 
 	if got := completeCalls.Load(); got != 1 {
 		t.Fatalf("complete calls = %d, want 1", got)
@@ -4566,7 +4566,7 @@ func TestHandleTask_BareErrorReportsFailureWithCancelledParent(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	d.handleTask(ctx, Task{ID: "task-bare-error", RuntimeID: "rt-1"}, 0)
+	d.handleTask(ctx, Task{ID: "task-bare-error", RuntimeID: "rt-1", DispatchedAt: &testClaimDispatchedAtString}, 0)
 
 	if got := failCalls.Load(); got != 1 {
 		t.Fatalf("fail callback calls = %d, want 1", got)
@@ -4608,7 +4608,7 @@ func TestHandleTask_UntrackedRuntimeFailsBackForRetry(t *testing.T) {
 		return TaskResult{}, nil
 	})
 
-	d.handleTask(context.Background(), Task{ID: "task-gone-runtime", RuntimeID: "rt-demoted"}, 0)
+	d.handleTask(context.Background(), Task{ID: "task-gone-runtime", RuntimeID: "rt-demoted", DispatchedAt: &testClaimDispatchedAtString}, 0)
 
 	body, _ := failBody.Load().(map[string]any)
 	if body == nil {
@@ -4678,6 +4678,7 @@ func TestHandleTask_ReportsUsageBeforeCancel(t *testing.T) {
 		ID:        "task-abc",
 		RuntimeID: "rt-1",
 		IssueID:   "issue-xyz",
+		DispatchedAt: &testClaimDispatchedAtString,
 		Agent:     &AgentData{Name: "test-agent"},
 	}
 
@@ -4781,6 +4782,7 @@ func TestHandleTask_ReportsUsageWhenCancelledByPoll(t *testing.T) {
 		ID:        "task-poll",
 		RuntimeID: "rt-1",
 		IssueID:   "issue-poll",
+		DispatchedAt: &testClaimDispatchedAtString,
 		Agent:     &AgentData{Name: "test-agent"},
 	}
 
@@ -5439,6 +5441,7 @@ func TestHandleTask_AcksCancelAfterPollCancelled(t *testing.T) {
 		ID:        "task-ack-poll",
 		RuntimeID: "rt-1",
 		IssueID:   "issue-ack-poll",
+		DispatchedAt: &testClaimDispatchedAtString,
 		Agent:     &AgentData{Name: "test-agent"},
 	}
 
@@ -5508,6 +5511,7 @@ func TestHandleTask_AcksCancelOnPostRunStatusCheck(t *testing.T) {
 		ID:        "task-ack-postrun",
 		RuntimeID: "rt-1",
 		IssueID:   "issue-ack-postrun",
+		DispatchedAt: &testClaimDispatchedAtString,
 		Agent:     &AgentData{Name: "test-agent"},
 	}
 
