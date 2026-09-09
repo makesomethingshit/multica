@@ -190,8 +190,7 @@ func parseClaimDispatchedAt(s *string) time.Time {
 // claimGenerationMatches reports whether a pending report's delivery
 // generation still matches the server's current generation. Either side
 // missing (old server without the status field, or a report built without a
-// claim value) means the fence cannot apply — match, so pre-fence behavior
-// continues instead of dropping everything old servers settle. When both
+// claim value) means ownership is unknown, so recovery holds the report. When both
 // sides are present, truncate to seconds before comparing: the claim payload
 // carries dispatched_at at second precision while the status endpoint
 // preserves sub-second precision, so the same delivery compares equal only
@@ -269,8 +268,8 @@ func (d *Daemon) recoverOneTerminalReport(ctx context.Context, report terminalTa
 
 	case report.claimDispatchedAt.IsZero() || state.DispatchedAt.IsZero():
 		// A missing/invalid generation is an unknown owner, not a match. Keep
-		// the report in memory until a compatible status response proves the
-		// original claim; never send an unfenced terminal mutation.
+		// the report in memory; a missing original claim cannot be recovered
+		// from a later status response. Never send an unfenced terminal mutation.
 		taskLog.Warn("terminal recovery generation unavailable; keeping pending report", "server_status", status, "outcome", "kept_generation_unknown")
 
 	case !claimGenerationMatches(report.claimDispatchedAt, state.DispatchedAt):

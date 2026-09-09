@@ -1946,7 +1946,11 @@ func (h *Handler) failClaimedTaskBeforeLaunch(
 		false,
 		"",
 		"",
+		task.DispatchedAt.Time,
 	); err != nil {
+		if errors.Is(err, service.ErrTaskClaimGenerationMismatch) {
+			return &claimBuildFailure{outcome: outcome, status: status, message: claimMessage}
+		}
 		slog.Error("task claim: fail rejected task failed; requeueing claim",
 			"task_id", uuidToString(task.ID),
 			"outcome", outcome,
