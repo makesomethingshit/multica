@@ -4748,6 +4748,14 @@ type TaskMessageRequest struct {
 	Content string         `json:"content,omitempty"`
 	Input   map[string]any `json:"input,omitempty"`
 	Output  string         `json:"output,omitempty"`
+	// CreatedAt is optional so installed daemons can roll forward or back
+	// independently of the server. Missing values keep the database-time fallback.
+	CreatedAt *time.Time `json:"created_at,omitempty"`
+	// OutputTruncated is absent from every older daemon's payload, so it stays
+	// a pointer all the way to the column: nil must persist as NULL (unknown),
+	// never as false. Recording an unmeasured output as complete is the one
+	// claim this data is not entitled to make.
+	OutputTruncated *bool `json:"output_truncated,omitempty"`
 }
 
 type TaskMessageBatchRequest struct {
@@ -4804,8 +4812,16 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		Contents: make([]string, 0, n),
 		Inputs:   make([]string, 0, n),
 		Outputs:  make([]string, 0, n),
+		// Optional for mixed-version rollout. Older daemons omit the event
+		// timestamp, and one missing or implausible value makes the whole batch
+		// use database time so paired events never mix clocks.
+		CreatedAts: make([]string, 0, n),
+		// Tri-state through a text[]: "" is NULL, matching how the query maps
+		// every other nullable column in this batch.
+		OutputTruncations: make([]string, 0, n),
 	}
-	for _, msg := range req.Messages {
+	createdAts := taskMessageCreatedAts(req.Messages, time.Now().UTC())
+	for i, msg := range req.Messages {
 		id, err := uuid.NewV7()
 		if err != nil {
 			slog.Error("failed to generate task message id", "task_id", taskID, "error", err)
@@ -4859,6 +4875,8 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
 		params.Contents = append(params.Contents, msg.Content)
 		params.Inputs = append(params.Inputs, inputJSON)
 		params.Outputs = append(params.Outputs, msg.Output)
+		params.CreatedAts = append(params.CreatedAts, createdAts[i])
+		params.OutputTruncations = append(params.OutputTruncations, boolArrayElement(msg.OutputTruncated))
 	}
 
 	created, err := h.Queries.CreateTaskMessages(r.Context(), params)
@@ -4998,16 +5016,61 @@ func taskMessageToPayload(m db.TaskMessage, taskID, issueID string) protocol.Tas
 		createdAt = m.CreatedAt.Time.UTC().Format(time.RFC3339Nano)
 	}
 	return protocol.TaskMessagePayload{
-		TaskID:    taskID,
-		IssueID:   issueID,
-		Seq:       int(m.Seq),
-		Type:      m.Type,
-		Tool:      m.Tool.String,
-		Content:   m.Content.String,
-		Input:     input,
-		Output:    m.Output.String,
-		CreatedAt: createdAt,
+		TaskID:          taskID,
+		IssueID:         issueID,
+		Seq:             int(m.Seq),
+		Type:            m.Type,
+		Tool:            m.Tool.String,
+		Content:         m.Content.String,
+		Input:           input,
+		Output:          m.Output.String,
+		OutputTruncated: util.BoolToPtr(m.OutputTruncated),
+		CreatedAt:       createdAt,
 	}
+}
+
+// boolArrayElement encodes a tri-state bool for the text[] parameters the batch
+// insert uses. Empty string is the query's NULL, so an unmeasured output stays
+// unknown rather than collapsing into false.
+func boolArrayElement(v *bool) string {
+	if v == nil {
+		return ""
+	}
+	if *v {
+		return "true"
+	}
+	return "false"
+}
+
+const maxTaskMessageClockSkew = 2 * time.Minute
+
+// taskMessageCreatedAt encodes the daemon-observed event time for the batch
+// query's nullable text[] transport. Empty means an older daemon omitted the
+// field or its wall clock is implausibly far from the server, so PostgreSQL
+// falls back to its normal insertion time.
+func taskMessageCreatedAt(v *time.Time, serverNow time.Time) string {
+	if v == nil || v.IsZero() {
+		return ""
+	}
+	if skew := v.Sub(serverNow); skew < -maxTaskMessageClockSkew || skew > maxTaskMessageClockSkew {
+		return ""
+	}
+	return v.UTC().Format(time.RFC3339Nano)
+}
+
+// taskMessageCreatedAts keeps every timestamp in a report batch on the same
+// clock. If any event lacks a plausible daemon timestamp, returning all empty
+// values makes PostgreSQL assign one database timestamp to the whole batch.
+func taskMessageCreatedAts(messages []TaskMessageRequest, serverNow time.Time) []string {
+	createdAts := make([]string, len(messages))
+	for i := range messages {
+		createdAts[i] = taskMessageCreatedAt(messages[i].CreatedAt, serverNow)
+		if createdAts[i] == "" {
+			clear(createdAts)
+			return createdAts
+		}
+	}
+	return createdAts
 }
 
 // ListTaskMessages returns the persisted messages for a task (for catch-up after reconnect).
@@ -5095,7 +5158,13 @@ func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := h.TaskService.CancelTaskByUser(r.Context(), existing.ID)
+	workspaceID := uuidToString(issue.WorkspaceID)
+	actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	task, err := h.TaskService.CancelTaskByUser(
+		r.Context(),
+		existing.ID,
+		h.taskCancellationActor(r.Context(), actorType, actorID),
+	)
 	if err != nil {
 		slog.Warn("cancel task failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -5103,7 +5172,7 @@ func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("task cancelled by user", "task_id", taskID, "issue_id", uuidToString(task.IssueID))
-	resp := taskToResponse(*task, uuidToString(issue.WorkspaceID))
+	resp := taskToResponse(*task, workspaceID)
 	// Keep this issue-scoped surface consistent with the list endpoints so a
 	// cancelled row keeps its resolved "on behalf of" name in the UI.
 	h.hydrateTaskAttributions(r.Context(), []*TaskAttribution{resp.Attribution})
@@ -5455,7 +5524,13 @@ func (h *Handler) GetIssueUsage(w http.ResponseWriter, r *http.Request) {
 		"uncosted_output_tokens":      row.UncostedOutputTokens,
 		"uncosted_cache_read_tokens":  row.UncostedCacheReadTokens,
 		"uncosted_cache_write_tokens": row.UncostedCacheWriteTokens,
-		"task_count":                  row.TaskCount,
+		// task_count is the legacy count of tasks with usage. Keep it stable for
+		// installed clients while the explicit coverage fields distinguish runs
+		// from metered runs.
+		"task_count":            row.TaskCount,
+		"terminal_task_count":   row.TerminalTaskCount,
+		"metered_task_count":    row.MeteredTaskCount,
+		"unreported_task_count": row.UnreportedTaskCount,
 	})
 }
 
