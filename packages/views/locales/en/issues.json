@@ -1,4 +1,26 @@
 {
+  "inline_run": {
+    "label": "{{name}} run",
+    "stop": "Stop",
+    "stopping": "Stopping...",
+    "queued": "Waiting for an available agent.",
+    "starting": "Preparing the agent session.",
+    "waiting_directory": "Waiting for another run to release the working directory.",
+    "thinking": "Thinking",
+    "waiting_response": "Waiting for the agent to respond.",
+    "view_activity": "View activity",
+    "steps_one": "{{count}} step",
+    "steps_other": "{{count}} steps",
+    "loading": "Loading activity...",
+    "load_failed": "Could not load activity.",
+    "try_again": "Try again",
+    "empty": "No activity recorded yet.",
+    "show_earlier": "Show {{count}} earlier steps",
+    "full_log": "Open full log",
+    "message": "Agent message",
+    "error": "Error",
+    "waiting_result": "Waiting for the tool result..."
+  },
   "status_catalog_error": {
     "title": "Couldn't load the status list",
     "hint": "Issues are hidden until it loads, because a status filter can't be applied without it.",
@@ -162,6 +184,16 @@
     "card_properties_section": "Card properties",
     "ascending_title": "Ascending",
     "descending_title": "Descending",
+    "newest_first": "Newest first",
+    "oldest_first": "Oldest first",
+    "highest_priority_first": "Highest priority first",
+    "lowest_priority_first": "Lowest priority first",
+    "earliest_first": "Earliest first",
+    "latest_first": "Latest first",
+    "workflow_order": "Workflow order",
+    "reverse_workflow_order": "Reverse workflow order",
+    "alphabetical_order": "A to Z",
+    "reverse_alphabetical_order": "Z to A",
     "group_status": "Status",
     "group_assignee": "Assignee",
     "group_parent": "Parent issue",
@@ -316,7 +348,8 @@
     "empty_column": "No issues",
     "empty_grouping": "No matching issues",
     "no_value": "No value",
-    "ordered_by": "Board ordered by {{field}}"
+    "ordered_by": "Board ordered by {{field}}",
+    "manual_reorder_hint": "Switch to Manual ordering to rearrange issues within a column."
   },
   "detail": {
     "not_found": "This issue does not exist or has been deleted in this workspace.",
@@ -350,7 +383,7 @@
     "quick_action_blocked_body": "“{{name}}” runs as an agent you’re not allowed to trigger. Ask a workspace admin to make that agent available to the team, or to point this action at a shared one.",
     "quick_action_blocked_ok": "Got it",
     "pull_requests_loading": "Loading…",
-    "pull_requests_empty": "No linked pull requests yet. Reference this issue's identifier in a PR's branch name, title, or body to auto-link it.",
+    "pull_requests_empty": "No linked pull requests yet. Put this issue's identifier in a PR's branch name or title, or write it after Closes in the PR body, to auto-link it.",
     "pull_request_state_open": "Open",
     "pull_request_state_draft": "Draft",
     "pull_request_state_merged": "Merged",
@@ -406,26 +439,6 @@
     "unpin_tooltip": "Unpin from sidebar",
     "thread_nav_label": "Jump to comment thread",
     "thread_nav_resolved_label": "{{title}} (resolved)",
-    "thread_nav": {
-      "button_label_one": "Comment threads ({{count}})",
-      "button_label_other": "Comment threads ({{count}})",
-      "search_placeholder": "Search threads or authors",
-      "match_count_one": "{{count}} match",
-      "match_count_other": "{{count}} matches",
-      "filter_all": "All",
-      "filter_unresolved": "Unresolved",
-      "filter_resolved": "Resolved",
-      "filter_mine": "@me",
-      "group": {
-        "today": "Today",
-        "yesterday": "Yesterday",
-        "earlier": "Earlier"
-      },
-      "empty": "No threads match",
-      "hint_select": "select",
-      "hint_jump": "jump",
-      "hint_close": "close"
-    },
     "sidebar_tooltip": "Toggle right sidebar",
     "find": {
       "placeholder": "Find in issue...",
@@ -479,6 +492,9 @@
     "show_more_activities_other": "Show {{count}} more activities"
   },
   "comment": {
+    "add_reaction": "Add reaction",
+    "collapse_thread": "Collapse thread",
+    "expand_thread": "Expand thread",
     "delete_title": "Delete comment",
     "delete_desc": "This comment will be permanently deleted. This cannot be undone.",
     "delete_desc_with_replies": "This comment and all its replies will be permanently deleted. This cannot be undone.",
@@ -553,7 +569,26 @@
     }
   },
   "reply": {
-    "placeholder": "Leave a reply..."
+    "placeholder": "Leave a reply...",
+    "annotations": {
+      "confirm_add": "Add annotation",
+      "save": "Save annotation",
+      "add_comment": "Add to comment",
+      "add": "Add to reply",
+      "note_label": "Comment",
+      "count_one": "{{count}} annotation",
+      "count_other": "{{count}} annotations",
+      "quote_limit": "Select up to {{count}} characters at a time.",
+      "count_limit": "A comment can contain up to {{count}} annotations.",
+      "remove": "Remove annotation {{number}}",
+      "source_changed": "The source changed or is unavailable. Your saved quote is kept.",
+      "intent_hint": "Add a note to an annotation or write a message before sending.",
+      "target_deleted": "The reply target was deleted. Remove all annotations in this draft, then annotate a remaining comment to start a new reply.",
+      "selection_failed": "Could not capture the selection. Select text within one comment or description and try again.",
+      "source_label": "Comment by {{name}}",
+      "edit": "Edit annotation {{number}}",
+      "note_placeholder": "Add a comment…"
+    }
   },
   "agent_activity": {
     "hover_header_one": "{{count}} active agent",
