@@ -44,6 +44,7 @@ var businessMetricLabels = map[string][]string{
 	"multica_agent_task_terminal_total":                {labelSource, labelRuntimeMode, labelTerminalStatus},
 	"multica_agent_task_failed_total":                  {labelSource, labelRuntimeMode, labelFailureReason},
 	"multica_agent_task_queue_wait_seconds":            {labelSource, labelRuntimeMode},
+	"multica_agent_task_claimable_wait_seconds":        {labelSource, labelRuntimeMode},
 	"multica_agent_task_run_seconds":                   {labelSource, labelRuntimeMode, labelTerminalStatus},
 	"multica_agent_task_total_seconds":                 {labelSource, labelRuntimeMode, labelTerminalStatus},
 	"multica_agent_task_in_progress":                   {labelSource, labelRuntimeMode},
@@ -61,6 +62,8 @@ var businessMetricLabels = map[string][]string{
 	"multica_runtime_sweeper_candidate_rows_total":     {labelStage},
 	"multica_runtime_sweeper_rows_changed_total":       {labelStage},
 	"multica_agent_runtime_lookup_total":               {labelSource, labelResult},
+	"multica_issue_metadata_mutation_total":            {labelOp, labelResult},
+	"multica_issue_metadata_mutation_duration_seconds": {labelOp, labelResult},
 
 	// PR3 funnel / community / commercial.
 	"multica_signup_total":                             {labelSignupSource},

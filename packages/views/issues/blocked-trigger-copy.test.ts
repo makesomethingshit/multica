@@ -57,7 +57,7 @@ describe("blocked trigger copy", () => {
     );
   });
 
-  // PUCK-89 adds the fourth member: the agent is bound but its owner cannot
+  // PUCK-89: the agent is bound but its owner cannot
   // execute it on the selected private runtime. Retrying never fixes this, so
   // the copy must name the two real fixes and must not read as a transient
   // failure.
@@ -70,6 +70,21 @@ describe("blocked trigger copy", () => {
     expect(denied.toLowerCase()).not.toContain("try again");
     expect(blockedShortReasonLabel("runtime_access_denied", t)).toBe(
       en.comment.trigger_blocked_short_runtime_access_denied,
+    );
+  });
+
+  // A missing runtime profile is not a broken CLI: the CLI runs, and the
+  // reinstall the unusable copy asks for fixes nothing. Sharing one label was
+  // what told DSH users to reinstall a CLI that was never the problem.
+  it("distinguishes a missing runtime profile from an unusable CLI", () => {
+    const missingProfile = blockedReasonLabel("runtime_profile_missing", t);
+
+    expect(missingProfile).toBe(en.comment.trigger_blocked_runtime_profile_missing);
+    expect(missingProfile).not.toBe(blockedReasonLabel("runtime_unusable", t));
+    expect(missingProfile).not.toBe(en.comment.trigger_blocked_generic);
+    expect(missingProfile.toLowerCase()).not.toContain("reinstall");
+    expect(blockedShortReasonLabel("runtime_profile_missing", t)).toBe(
+      en.comment.trigger_blocked_short_runtime_profile_missing,
     );
   });
 

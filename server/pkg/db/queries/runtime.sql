@@ -216,6 +216,15 @@ SET status = 'online', last_seen_at = now(), updated_at = now()
 WHERE id = $1
 RETURNING *;
 
+-- name: MarkAgentRuntimeOnlineIfOffline :execrows
+-- Reports whether this heartbeat performed an offline -> online transition.
+-- The conditional update prevents concurrent stale heartbeat snapshots from
+-- publishing duplicate lifecycle refresh events after another beat already
+-- recovered the runtime.
+UPDATE agent_runtime
+SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = $1 AND status <> 'online';
+
 -- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime
 SET status = 'offline', updated_at = now()
@@ -336,7 +345,8 @@ RETURNING id, workspace_id, owner_id, daemon_id, provider;
 -- rejects an active row without a runtime — so a missed status now surfaces as
 -- a failed delete (runtime_delete_not_drained) instead of silent data loss.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now()
+SET status = 'cancelled', completed_at = now(),
+    cancelled_by_type = 'system', cancelled_by_id = NULL, cancelled_by_name = NULL
 WHERE (runtime_id = ANY(@runtime_ids::uuid[]) OR agent_id = ANY(@agent_ids::uuid[]))
   AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
