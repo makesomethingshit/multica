@@ -193,6 +193,7 @@ async function measure(ref, label) {
       // Only a report this run wrote may be read back.
       rmSync(reportPath, { force: true });
       const measureStart = Date.now();
+      let scenarioExit = 0;
       try {
         run("pnpm", ["exec", "playwright", "test", "--config=playwright.config.ts", spec], {
           cwd: repoRoot,
@@ -203,15 +204,26 @@ async function measure(ref, label) {
           },
         });
       } catch (error) {
+        scenarioExit = typeof error.status === "number" ? error.status : 1;
         scenarioFailed = true;
-        console.error(`scenario run ${i} for ${label} exited ${error.status ?? "unknown"}`);
+        console.error(`scenario run ${i} for ${label} exited ${scenarioExit}`);
       }
       const measureS = seconds(measureStart);
       let trace = null;
       try {
         trace = JSON.parse(readFileSync(reportPath, "utf8"));
       } catch { /* no readable report for this repeat */ }
-      traces.push({ repeat: i, measure_s: measureS, trace });
+      // The scenario process has the last word (cf. perf-compare.mjs): a
+      // report that says `ok` from a run whose process then failed — e.g.
+      // an assertion after the trace was written — is not a sample.
+      if (scenarioExit !== 0 && trace?.status === "ok") {
+        trace.status = "invalid";
+        trace.invalid = [
+          ...(trace.invalid ?? []),
+          `the scenario reported ok but its process exited ${scenarioExit}`,
+        ];
+      }
+      traces.push({ repeat: i, measure_s: measureS, scenario_exit: scenarioExit, trace });
     }
     const usable = traces.filter((t) => t.trace?.status === "ok");
     return {
@@ -262,8 +274,8 @@ function markdown(base, head) {
     "| --- | ---: | ---: | ---: | ---: |",
     ...rows,
     "",
-    `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)`,
-    `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)`,
+    `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)${base.spec_failed ? "; scenario failed" : ""}`,
+    `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)${head.spec_failed ? "; scenario failed" : ""}`,
     `- spec \`${spec}\` from the working tree; raw traces: \`base-*.json\`, \`head-*.json\``,
     `- base timings: ${timing(base)}`,
     `- head timings: ${timing(head)}`,
@@ -291,9 +303,16 @@ try {
   console.log(`\n${summary}\n\n- total wall clock: ${totalS}s`);
   console.log(`\nreports written to ${outDir}`);
 
-  // The comparison itself only fails when a sample is not usable. A slower
-  // head is information for the reviewer, not a failure of this script.
-  exitCode = base.status === "ok" && head.status === "ok" ? 0 : 1;
+  // The comparison itself fails when a sample is not usable or when any
+  // scenario run failed (its non-zero exit propagates). A slower head is
+  // information for the reviewer, not a failure of this script.
+  exitCode =
+    base.status === "ok" &&
+    head.status === "ok" &&
+    !base.spec_failed &&
+    !head.spec_failed
+      ? 0
+      : 1;
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`\ncomparison aborted: ${message}`);
