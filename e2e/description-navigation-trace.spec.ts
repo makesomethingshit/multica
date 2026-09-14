@@ -15,10 +15,10 @@ import type { TestApiClient } from "./fixtures";
  *   `main:<targetId>`, `firstDetailCommitT`). Matching the target id (not a
  *   `main:` prefix) and requiring `t >= clickT` keeps a stale root from a
  *   pre-click frame from passing as this navigation's commit.
- * - first frame containing the target issue's description surface
- *   (`firstHostT`);
- * - first frame containing populated description content
- *   (`.ProseMirror` with non-empty text, `firstPopulatedT`);
+ * - first frame containing the target issue's description surface, at or
+ *   after this navigation's commit (`firstHostT`);
+ * - first frame containing populated description content (`.ProseMirror`
+ *   with non-empty text, at or after commit, `firstPopulatedT`);
  * - editor `isInitialized` at each sample;
  * - Long Tasks clipped to [click, first commit]: each overlapping entry
  *   contributes only its intersection (`overlapMs`), exported as both max
@@ -30,8 +30,8 @@ import type { TestApiClient } from "./fixtures";
  * file for ref-to-ref A/B runners. Ordering is the only in-spec invariant:
  * `clickT < firstDetailCommitT <= firstHostT <= firstPopulatedT`, plus one
  * populated initialized sample. A/B verdicts are relative guardrails
- * applied outside this spec (base vs head vs revised, same fixture +
- * environment).
+ * applied outside this spec via scripts/nav-trace-compare.mjs (base vs
+ * head vs revised, same fixture + environment).
  *
  * Selectors are base/main/head compatible: the commit root
  * (`[data-tab-scroll-root]`) exists on all three refs, and the description
@@ -90,9 +90,12 @@ declare global {
  * inside the detail scroll root. This mirrors that host div (same position
  * relative to `.ProseMirror`) instead of keying on the head-only testid.
  */
-function descriptionSurface(page: Page) {
+function descriptionSurface(page: Page, issueId?: string) {
+  const root = issueId
+    ? `[data-tab-scroll-root="main:${issueId}"]`
+    : '[data-tab-scroll-root^="main:"]';
   return page
-    .locator('[data-tab-scroll-root^="main:"] .ProseMirror')
+    .locator(`${root} .ProseMirror`)
     .first()
     .locator("xpath=ancestor::div[contains(@class,'relative')][contains(@class,'mt-5')][1]");
 }
@@ -152,18 +155,30 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       const sample = () => {
         if (window.__navRecord) {
           const now = performance.now();
-          const root =
-            document.querySelector<HTMLElement>("[data-tab-scroll-root]");
-          const rootValue = root?.dataset.tabScrollRoot ?? null;
-          // Target-locked commit: pre-click frames (now < clickT) and stale
-          // roots from another issue never count, even if a previous rAF
+          // Target-locked root: the exact `main:<targetId>` element, not
+          // the first scroll root in the document. The list's `list` root
+          // or another issue's `main:<other>` root must never satisfy
+          // commit, host or populated — cross-issue isolation for all
+          // three marks alike.
+          const want = `main:${window.__navTargetId}`;
+          const targetRoot =
+            Array.from(
+              document.querySelectorAll<HTMLElement>("[data-tab-scroll-root]"),
+            ).find(
+              (candidate) =>
+                candidate.getAttribute("data-tab-scroll-root") === want,
+            ) ?? null;
+          const rootValue =
+            targetRoot?.getAttribute("data-tab-scroll-root") ?? null;
+          // Pre-click frames (now < clickT) never count, even if a rAF
           // fired between flag-on and the actual click.
           const committed =
-            now >= window.__navClickT &&
-            rootValue === `main:${window.__navTargetId}`;
+            now >= window.__navClickT && targetRoot !== null;
           // Head carries data-testid="issue-description" on this div;
-          // base/main do not, so resolve from the editor upward instead.
-          const editor = root?.querySelector<HTMLElement>(".ProseMirror");
+          // base/main do not, so resolve from the editor upward instead —
+          // always inside the TARGET root, never a stale sibling.
+          const editor =
+            targetRoot?.querySelector<HTMLElement>(".ProseMirror");
           const host =
             editor?.closest<HTMLElement>("div.relative.mt-5") ?? null;
           const text = editor?.textContent ?? "";
@@ -176,10 +191,17 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
           if (committed && window.__navFirstDetailCommitT === null) {
             window.__navFirstDetailCommitT = now;
           }
-          if (host && window.__navFirstHostT === null) {
+          // Host/populated lock to the target commit: only samples at or
+          // after this navigation's commit may set them, so a stale
+          // surface from another issue can never satisfy them first.
+          if (committed && host && window.__navFirstHostT === null) {
             window.__navFirstHostT = now;
           }
-          if (text.length > 0 && window.__navFirstPopulatedT === null) {
+          if (
+            committed &&
+            text.length > 0 &&
+            window.__navFirstPopulatedT === null
+          ) {
             window.__navFirstPopulatedT = now;
           }
           window.__navSamples.push({
@@ -222,7 +244,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     const list = page.locator(`a[href="/${slug}/issues"]`).first();
     const openLink = (id: string) =>
       page.locator(`a[href$="/issues/${id}"]`).first();
-    const surface = () => descriptionSurface(page);
+    const surface = () => descriptionSurface(page, a.id);
     const editorReady = () =>
       page.waitForFunction(
         (targetId: string) => {

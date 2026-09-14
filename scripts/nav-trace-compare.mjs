@@ -1,0 +1,306 @@
+#!/usr/bin/env node
+/**
+ * Run the MUL-7095 navigation-trace recorder against two refs and report the
+ * difference (PR #8092 Revision 3).
+ *
+ * Each ref is checked out, installed and built on its own, then measured
+ * sequentially on this machine — one build must never be measured while the
+ * other is compiling. The spec, the fixture and the browser always come from
+ * the working tree this script runs in, so the two products are the only
+ * thing that differs; neither ref needs to contain the spec.
+ *
+ * Prerequisite: a live backend + database (e.g. `make up`), with its
+ * environment in this process (run under `make env-exec` or equivalent).
+ * This script passes its own environment through to each ref's install,
+ * build and server — including NEXT_PUBLIC_API_URL / DATABASE_URL — and
+ * only overrides PORT (per-ref frontend) and, for the spec run,
+ * PLAYWRIGHT_BASE_URL + NAV_TRACE_REPORT_PATH. It deliberately does NOT
+ * stub REMOTE_API_URL: the recorder creates real issues through the API.
+ *
+ * One sample per ref is a report, not a verdict. A difference near the noise
+ * floor means "run it again by hand", not "regression".
+ *
+ *   node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N]
+ */
+import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { connect, createServer } from "node:net";
+
+const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"]).toString().trim();
+const args = process.argv.slice(2);
+const flag = (name, fallback) => {
+  const at = args.indexOf(`--${name}`);
+  return at >= 0 && args[at + 1] ? args[at + 1] : fallback;
+};
+const baseRef = flag("base");
+const headRef = flag("head", "HEAD");
+const spec = flag("spec", "e2e/description-navigation-trace.spec.ts");
+const repeats = Math.max(1, Number(flag("repeats", "1")) || 1);
+const outDir = resolve(flag("out", join(repoRoot, "nav-trace-report")));
+if (!baseRef) {
+  console.error("usage: node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N]");
+  process.exit(2);
+}
+
+const run = (cmd, cmdArgs, opts = {}) =>
+  execFileSync(cmd, cmdArgs, { stdio: "inherit", ...opts });
+
+const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+
+/** Servers and checkouts still alive — last-resort handlers only. */
+const liveServers = new Set();
+const liveCheckouts = new Set();
+
+const killGroup = (child, signal) => {
+  try { process.kill(-child.pid, signal); } catch { /* already gone */ }
+};
+
+function removeCheckout(checkout) {
+  liveCheckouts.delete(checkout);
+  try { run("git", ["worktree", "remove", "--force", checkout], { cwd: repoRoot, stdio: "ignore" }); }
+  catch { rmSync(checkout, { recursive: true, force: true }); }
+}
+
+const groupAlive = (pgid) => {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+};
+
+const portBound = (port) =>
+  new Promise((done) => {
+    const socket = connect({ port, host: "127.0.0.1" });
+    const settle = (bound) => { socket.destroy(); done(bound); };
+    socket.setTimeout(1_000, () => settle(true));
+    socket.once("connect", () => settle(true));
+    socket.once("error", (error) => settle(error.code !== "ECONNREFUSED"));
+  });
+
+async function groupExitWithin(pgid, ms) {
+  const deadline = Date.now() + ms;
+  while (groupAlive(pgid)) {
+    if (Date.now() > deadline) return false;
+    await delay(100);
+  }
+  return true;
+}
+
+const STOP_GRACE_MS = Number(process.env.PERF_STOP_GRACE_MS) || 10_000;
+
+async function stopServer(child, port) {
+  const pgid = child.pid;
+  killGroup(child, "SIGTERM");
+  if (!(await groupExitWithin(pgid, STOP_GRACE_MS))) {
+    killGroup(child, "SIGKILL");
+    if (!(await groupExitWithin(pgid, 5_000))) {
+      throw new Error(`server process group ${pgid} survived SIGKILL`);
+    }
+  }
+  liveServers.delete(child);
+
+  const deadline = Date.now() + 5_000;
+  while (await portBound(port)) {
+    if (Date.now() > deadline) {
+      throw new Error(`port ${port} still bound after its server's process group exited`);
+    }
+    await delay(200);
+  }
+}
+
+const emergencyStop = () => {
+  for (const child of liveServers) killGroup(child, "SIGKILL");
+  liveServers.clear();
+  for (const checkout of [...liveCheckouts]) removeCheckout(checkout);
+};
+process.on("exit", emergencyStop);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => { emergencyStop(); process.exit(130); });
+}
+
+const freePort = () =>
+  new Promise((done, fail) => {
+    const probe = createServer();
+    probe.on("error", fail);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address();
+      probe.close(() => done(port));
+    });
+  });
+
+const waitForServer = async (port, timeoutMs = 120_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/`);
+      if (response.status > 0) return;
+    } catch { /* not up yet */ }
+    await new Promise((done) => setTimeout(done, 500));
+  }
+  throw new Error(`frontend on :${port} did not become reachable`);
+};
+
+const seconds = (from) => Math.round((Date.now() - from) / 100) / 10;
+
+async function measure(ref, label) {
+  const sha = execFileSync("git", ["rev-parse", ref], { cwd: repoRoot }).toString().trim();
+  const checkout = mkdtempSync(join(tmpdir(), `nav-trace-${label}-`));
+  liveCheckouts.add(checkout);
+  let server;
+  let port;
+  // Everything this side started is torn down before it returns or throws.
+  try {
+    console.log(`\n=== ${label}: ${ref} (${sha.slice(0, 9)}) ===`);
+    run("git", ["worktree", "add", "--detach", checkout, sha], { cwd: repoRoot });
+
+    const installStart = Date.now();
+    run("pnpm", ["install", "--frozen-lockfile"], { cwd: checkout });
+    const installS = seconds(installStart);
+
+    const buildStart = Date.now();
+    const buildLog = execFileSync(
+      "pnpm",
+      ["exec", "turbo", "build", "--filter=@multica/web"],
+      { cwd: checkout, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+    );
+    process.stdout.write(buildLog);
+    const buildS = seconds(buildStart);
+    const buildCached = /cache hit/.test(buildLog);
+
+    port = await freePort();
+    const startStart = Date.now();
+    // Own environment passes through (backend/database wiring included);
+    // only the frontend port is overridden per side.
+    server = spawn("pnpm", ["--filter", "@multica/web", "start"], {
+      cwd: checkout,
+      env: { ...process.env, PORT: String(port) },
+      stdio: "ignore",
+      detached: true,
+    });
+    liveServers.add(server);
+    await waitForServer(port);
+    const startS = seconds(startStart);
+
+    // The spec, fixture and browser come from this working tree, not the ref's.
+    const traces = [];
+    let scenarioFailed = false;
+    for (let i = 0; i < repeats; i++) {
+      const reportPath = join(outDir, `${label}-${i}.json`);
+      // Only a report this run wrote may be read back.
+      rmSync(reportPath, { force: true });
+      const measureStart = Date.now();
+      try {
+        run("pnpm", ["exec", "playwright", "test", "--config=playwright.config.ts", spec], {
+          cwd: repoRoot,
+          env: {
+            ...process.env,
+            PLAYWRIGHT_BASE_URL: `http://127.0.0.1:${port}`,
+            NAV_TRACE_REPORT_PATH: reportPath,
+          },
+        });
+      } catch (error) {
+        scenarioFailed = true;
+        console.error(`scenario run ${i} for ${label} exited ${error.status ?? "unknown"}`);
+      }
+      const measureS = seconds(measureStart);
+      let trace = null;
+      try {
+        trace = JSON.parse(readFileSync(reportPath, "utf8"));
+      } catch { /* no readable report for this repeat */ }
+      traces.push({ repeat: i, measure_s: measureS, trace });
+    }
+    const usable = traces.filter((t) => t.trace?.status === "ok");
+    return {
+      ref, sha, spec_failed: scenarioFailed, build_cached: buildCached,
+      repeats, usable_repeats: usable.length,
+      status: usable.length > 0 ? "ok" : "invalid",
+      traces,
+      timings_s: { install: installS, build: buildS, start: startS },
+    };
+  } finally {
+    if (server) await stopServer(server, port);
+    removeCheckout(checkout);
+  }
+}
+
+const pick = (traces, key) => {
+  const values = traces
+    .filter((t) => t.trace?.status === "ok" && typeof t.trace[key] === "number")
+    .map((t) => t.trace[key]);
+  if (values.length === 0) return null;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+};
+
+function markdown(base, head) {
+  const usable = base.status === "ok" && head.status === "ok";
+  const rows = [
+    ["clickToCommitMs", "Click → first commit (mean)"],
+    ["maxOverlapMs", "Clipped LongTask max overlap (mean)"],
+    ["totalOverlapMs", "Clipped LongTask total overlap (mean)"],
+  ].map(([key, label]) => {
+    const a = pick(base.traces, key);
+    const b = pick(head.traces, key);
+    if (a === null || b === null) return `| ${label} | ${a ?? "—"} | ${b ?? "—"} | — | — |`;
+    const delta = b - a;
+    const ratio = a === 0 ? "N/A" : `${((b / a - 1) * 100).toFixed(1)}%`;
+    return `| ${label} | ${a.toFixed(1)} | ${b.toFixed(1)} | ${delta >= 0 ? "+" : ""}${delta.toFixed(1)} | ${ratio} |`;
+  });
+  const timing = (r) =>
+    `install ${r.timings_s.install}s · build ${r.timings_s.build}s${r.build_cached ? " (restored from cache — not a real build)" : ""} · start ${r.timings_s.start}s`;
+  return [
+    "## Navigation trace A/B (MUL-7095)",
+    "",
+    usable
+      ? "One sample per ref (or the mean of --repeats). This is a report, not a merge gate — read a small difference as noise until a second run says otherwise."
+      : `**Not a usable comparison.** base: \`${base.status}\`, head: \`${head.status}\`.`,
+    "",
+    "| Metric | base | head | Δ | ratio |",
+    "| --- | ---: | ---: | ---: | ---: |",
+    ...rows,
+    "",
+    `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)`,
+    `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)`,
+    `- spec \`${spec}\` from the working tree; raw traces: \`base-*.json\`, \`head-*.json\``,
+    `- base timings: ${timing(base)}`,
+    `- head timings: ${timing(head)}`,
+  ].join("\n");
+}
+
+mkdirSync(outDir, { recursive: true });
+for (const name of ["base.json", "head.json", "comparison.json", "comparison.md"]) {
+  rmSync(join(outDir, name), { force: true });
+}
+const totalStart = Date.now();
+let exitCode = 1;
+let base;
+let head;
+try {
+  base = await measure(baseRef, "base");
+  writeFileSync(join(outDir, "base.json"), JSON.stringify(base, null, 2));
+  head = await measure(headRef, "head");
+  writeFileSync(join(outDir, "head.json"), JSON.stringify(head, null, 2));
+  const totalS = seconds(totalStart);
+
+  const summary = markdown(base, head);
+  writeFileSync(join(outDir, "comparison.json"), JSON.stringify({ base, head, total_s: totalS }, null, 2));
+  writeFileSync(join(outDir, "comparison.md"), `${summary}\n\n- total wall clock: ${totalS}s\n`);
+  console.log(`\n${summary}\n\n- total wall clock: ${totalS}s`);
+  console.log(`\nreports written to ${outDir}`);
+
+  // The comparison itself only fails when a sample is not usable. A slower
+  // head is information for the reviewer, not a failure of this script.
+  exitCode = base.status === "ok" && head.status === "ok" ? 0 : 1;
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`\ncomparison aborted: ${message}`);
+  writeFileSync(
+    join(outDir, "comparison.json"),
+    JSON.stringify({ error: message, base: base ?? null, head: head ?? null }, null, 2),
+  );
+}
+
+process.exit(exitCode);
