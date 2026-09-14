@@ -233,7 +233,7 @@ test.describe("#8083 description initialization", () => {
     });
   });
 
-  test("first edit and file drop survive startup and save on immediate navigation", async ({ page }) => {
+  test("first edit and file drop survive startup and save on immediate navigation", async ({ page }, testInfo) => {
     const issue = await api.createIssue(`E2E Startup ${Date.now()}`, { description: body });
     // Hold only Tiptap's existing create task until both inputs arrive. A
     // fixed delay would race slower browsers or the first route compilation.
@@ -256,17 +256,62 @@ test.describe("#8083 description initialization", () => {
     const host = page.getByTestId("issue-description");
     const editor = host.locator(".ProseMirror");
     await expect(editor).toBeVisible();
+    // §4 focus/mutation instrumentation: capture the interaction state
+    // around the startup click BEFORE changing any implementation, so a
+    // WebKit failure can be attributed to (1) missing focus/selection vs
+    // (2) a later transaction wiping the mutation. `create`-gated: the
+    // editor is asserted uninitialized here, so everything below records
+    // the pre-create window whose input must survive the create task.
     expect(await editor.evaluate(el => (el as HTMLElement & { editor: { isInitialized: boolean } }).editor.isInitialized)).toBe(false);
+    const textBeforeClick = await editor.evaluate(el => el.textContent ?? "");
     await editor.locator("h1").click();
+    const focusProbeAfterClick = await editor.evaluate((el) => {
+      const prosemirror = el as HTMLElement & {
+        editor?: {
+          isInitialized: boolean;
+          isFocused: boolean;
+          state?: { selection?: { from: number; to: number; empty: boolean } };
+        };
+      };
+      return {
+        activeElementIsEditor: prosemirror.contains(document.activeElement),
+        editorReportsFocused: prosemirror.editor?.isFocused ?? null,
+        selectionFrom: prosemirror.editor?.state?.selection?.from ?? null,
+        selectionTo: prosemirror.editor?.state?.selection?.to ?? null,
+        selectionEmpty: prosemirror.editor?.state?.selection?.empty ?? null,
+      };
+    });
+    await testInfo.attach("first-edit-focus-probe", {
+      body: JSON.stringify({ textBeforeClick, focusProbeAfterClick }, null, 2),
+      contentType: "application/json",
+    });
+    // Cause (1) fails here, not later: without a focused editor + valid
+    // selection the keystroke below is not an edit at all.
+    expect(focusProbeAfterClick.activeElementIsEditor).toBe(true);
+    expect(focusProbeAfterClick.editorReportsFocused).toBe(true);
+    expect(focusProbeAfterClick.selectionFrom).not.toBeNull();
     await page.keyboard.insertText("FIRSTEDIT ");
+    const textAfterInput = await editor.evaluate(el => el.textContent ?? "");
+    expect(textAfterInput).toContain("FIRSTEDIT");
     await host.evaluate(el => {
       const data = new DataTransfer();
       data.items.add(new File(["first drop"], "first-drop.txt", { type: "text/plain" }));
       el.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
     });
     expect(await editor.evaluate(el => (el as HTMLElement & { editor: { isInitialized: boolean } }).editor.isInitialized)).toBe(false);
+    // Cause (2) attribution: this is the pre-create document WITH the
+    // startup input. The post-create assertions below must show the same
+    // bytes — a later setContent/initial-content reinstall would fail them.
+    const textBeforeCreate = await editor.evaluate(el => el.textContent ?? "");
+    expect(textBeforeCreate).toContain("FIRSTEDIT");
     await page.evaluate(() => window.releaseEditorCreates());
     await page.waitForFunction(() => (document.querySelector('[data-testid="issue-description"] .ProseMirror') as HTMLElement & { editor: { isInitialized: boolean } })?.editor.isInitialized);
+    const textAfterCreate = await editor.evaluate(el => el.textContent ?? "");
+    expect(textAfterCreate).toContain("FIRSTEDIT");
+    await testInfo.attach("first-edit-create-window", {
+      body: JSON.stringify({ textBeforeCreate, textAfterCreate }, null, 2),
+      contentType: "application/json",
+    });
     await expect(editor).toContainText("FIRSTEDIT");
     await expect(editor).toContainText("first-drop.txt");
     await expect(editor.locator('[data-uploading]')).toHaveCount(0);

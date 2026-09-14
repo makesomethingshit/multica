@@ -1987,8 +1987,8 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
     baseMarkdown: string;
     attachmentIds: string[];
   } | null>(null);
-  // IssueDetail alone opts into an eager, continuously mounted description
-  // editor. Title and composer hosts retain ContentEditor's deferred default.
+  // Keep the editor mounted with ContentEditor's deferred default so the
+  // route can paint cheaply while preserving startup intent for first input.
   const titleEditorRef = useRef<TitleEditorRef>(null);
   const titleBaseRef = useRef<string | undefined>(issue?.title);
   const [titleConflictDraft, setTitleConflictDraft] = useState<string | null>(null);
@@ -3020,7 +3020,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
           )}
 
           <div
-            data-testid="issue-description"
             {...descDropZoneProps}
             {...descriptionAnnotations.captureProps}
             ref={descriptionAnnotations.cardRef}
@@ -3037,11 +3036,13 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             }}
           >
             {descriptionAnnotations.popup}
-            <div data-comment-content={descriptionSourceId}>
+            <div
+              data-testid="issue-description"
+              data-comment-content={descriptionSourceId}
+            >
               <ContentEditor
                 ref={descEditorRef}
                 key={id}
-                eagerClientRender
                 value={issue.description ?? ""}
                 placeholder={t(($) => $.detail.desc_placeholder)}
                 onUpdate={(md, baseMarkdown) => {
