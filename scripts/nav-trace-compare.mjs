@@ -17,10 +17,12 @@
  * PLAYWRIGHT_BASE_URL + NAV_TRACE_REPORT_PATH. It deliberately does NOT
  * stub REMOTE_API_URL: the recorder creates real issues through the API.
  *
- * One sample per ref is a report, not a verdict. A difference near the noise
- * floor means "run it again by hand", not "regression".
+ * Raw samples are always reported. The runner additionally applies a
+ * configurable relative guardrail to the primary click-to-commit metric; the
+ * guardrail is expressed as a ratio, never as a machine-specific millisecond
+ * threshold. A difference inside that allowance remains reviewer data.
  *
- *   node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N]
+ *   node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N] [--project chromium|webkit] [--max-regression R]
  */
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
@@ -38,9 +40,21 @@ const baseRef = flag("base");
 const headRef = flag("head", "HEAD");
 const spec = flag("spec", "e2e/description-navigation-trace.spec.ts");
 const repeats = Math.max(1, Number(flag("repeats", "1")) || 1);
+const project = flag("project", "chromium");
+const maxRelativeRegression = Number(
+  flag(
+    "max-regression",
+    process.env.NAV_TRACE_MAX_RELATIVE_REGRESSION ?? "0.25",
+  ),
+);
 const outDir = resolve(flag("out", join(repoRoot, "nav-trace-report")));
-if (!baseRef) {
-  console.error("usage: node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N]");
+if (
+  !baseRef ||
+  !["chromium", "webkit"].includes(project) ||
+  !Number.isFinite(maxRelativeRegression) ||
+  maxRelativeRegression < 0
+) {
+  console.error("usage: node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N] [--project chromium|webkit] [--max-regression R]");
   process.exit(2);
 }
 
@@ -189,20 +203,32 @@ async function measure(ref, label) {
     const traces = [];
     let scenarioFailed = false;
     for (let i = 0; i < repeats; i++) {
-      const reportPath = join(outDir, `${label}-${i}.json`);
+      const reportPath = join(outDir, `${project}-${label}-${i}.json`);
       // Only a report this run wrote may be read back.
       rmSync(reportPath, { force: true });
       const measureStart = Date.now();
       let scenarioExit = 0;
       try {
-        run("pnpm", ["exec", "playwright", "test", "--config=playwright.config.ts", spec], {
-          cwd: repoRoot,
-          env: {
-            ...process.env,
-            PLAYWRIGHT_BASE_URL: `http://127.0.0.1:${port}`,
-            NAV_TRACE_REPORT_PATH: reportPath,
+        run(
+          "pnpm",
+          [
+            "exec",
+            "playwright",
+            "test",
+            "--config=playwright.config.ts",
+            "--project",
+            project,
+            spec,
+          ],
+          {
+            cwd: repoRoot,
+            env: {
+              ...process.env,
+              PLAYWRIGHT_BASE_URL: `http://127.0.0.1:${port}`,
+              NAV_TRACE_REPORT_PATH: reportPath,
+            },
           },
-        });
+        );
       } catch (error) {
         scenarioExit = typeof error.status === "number" ? error.status : 1;
         scenarioFailed = true;
@@ -228,7 +254,7 @@ async function measure(ref, label) {
     const usable = traces.filter((t) => t.trace?.status === "ok");
     return {
       ref, sha, spec_failed: scenarioFailed, build_cached: buildCached,
-      repeats, usable_repeats: usable.length,
+      repeats, usable_repeats: usable.length, project,
       status: usable.length > 0 ? "ok" : "invalid",
       traces,
       timings_s: { install: installS, build: buildS, start: startS },
@@ -247,7 +273,21 @@ const pick = (traces, key) => {
   return values.reduce((a, b) => a + b, 0) / values.length;
 };
 
-function markdown(base, head) {
+const relativeRegression = (baseValue, headValue, allowance) => {
+  if (
+    typeof baseValue !== "number" ||
+    typeof headValue !== "number" ||
+    !Number.isFinite(baseValue) ||
+    !Number.isFinite(headValue) ||
+    baseValue <= 0
+  ) {
+    return { available: false, ratio: null, failed: false };
+  }
+  const ratio = headValue / baseValue;
+  return { available: true, ratio, failed: ratio > 1 + allowance };
+};
+
+function markdown(base, head, regression) {
   const usable = base.status === "ok" && head.status === "ok";
   const rows = [
     ["clickToCommitMs", "Click → first commit (mean)"],
@@ -267,23 +307,29 @@ function markdown(base, head) {
     "## Navigation trace A/B (MUL-7095)",
     "",
     usable
-      ? "One sample per ref (or the mean of --repeats). This is a report, not a merge gate — read a small difference as noise until a second run says otherwise."
+      ? "Raw samples (or the mean of --repeats) stay in the report; only the configured relative guardrail can fail this runner."
       : `**Not a usable comparison.** base: \`${base.status}\`, head: \`${head.status}\`.`,
     "",
     "| Metric | base | head | Δ | ratio |",
     "| --- | ---: | ---: | ---: | ---: |",
     ...rows,
     "",
+    `- project \`${project}\`; relative click-to-commit guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
     `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)${base.spec_failed ? "; scenario failed" : ""}`,
     `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)${head.spec_failed ? "; scenario failed" : ""}`,
-    `- spec \`${spec}\` from the working tree; raw traces: \`base-*.json\`, \`head-*.json\``,
+    `- spec \`${spec}\` from the working tree; raw traces: \`${project}-base-*.json\`, \`${project}-head-*.json\``,
     `- base timings: ${timing(base)}`,
     `- head timings: ${timing(head)}`,
   ].join("\n");
 }
 
 mkdirSync(outDir, { recursive: true });
-for (const name of ["base.json", "head.json", "comparison.json", "comparison.md"]) {
+for (const name of [
+  `${project}-base.json`,
+  `${project}-head.json`,
+  `${project}-comparison.json`,
+  `${project}-comparison.md`,
+]) {
   rmSync(join(outDir, name), { force: true });
 }
 const totalStart = Date.now();
@@ -292,32 +338,52 @@ let base;
 let head;
 try {
   base = await measure(baseRef, "base");
-  writeFileSync(join(outDir, "base.json"), JSON.stringify(base, null, 2));
+  writeFileSync(join(outDir, `${project}-base.json`), JSON.stringify(base, null, 2));
   head = await measure(headRef, "head");
-  writeFileSync(join(outDir, "head.json"), JSON.stringify(head, null, 2));
+  writeFileSync(join(outDir, `${project}-head.json`), JSON.stringify(head, null, 2));
   const totalS = seconds(totalStart);
 
-  const summary = markdown(base, head);
-  writeFileSync(join(outDir, "comparison.json"), JSON.stringify({ base, head, total_s: totalS }, null, 2));
-  writeFileSync(join(outDir, "comparison.md"), `${summary}\n\n- total wall clock: ${totalS}s\n`);
+  const regression = relativeRegression(
+    pick(base.traces, "clickToCommitMs"),
+    pick(head.traces, "clickToCommitMs"),
+    maxRelativeRegression,
+  );
+  const summary = markdown(base, head, regression);
+  writeFileSync(
+    join(outDir, `${project}-comparison.json`),
+    JSON.stringify(
+      {
+        base,
+        head,
+        project,
+        max_relative_regression: maxRelativeRegression,
+        regression,
+        total_s: totalS,
+      },
+      null,
+      2,
+    ),
+  );
+  writeFileSync(join(outDir, `${project}-comparison.md`), `${summary}\n\n- total wall clock: ${totalS}s\n`);
   console.log(`\n${summary}\n\n- total wall clock: ${totalS}s`);
   console.log(`\nreports written to ${outDir}`);
 
-  // The comparison itself fails when a sample is not usable or when any
-  // scenario run failed (its non-zero exit propagates). A slower head is
-  // information for the reviewer, not a failure of this script.
+  // A sample must be usable and every scenario must exit zero. A slower head
+  // only fails when it exceeds the configured relative guardrail; raw values
+  // remain report data and no absolute machine-time threshold is used.
   exitCode =
     base.status === "ok" &&
     head.status === "ok" &&
     !base.spec_failed &&
-    !head.spec_failed
+    !head.spec_failed &&
+    !regression.failed
       ? 0
       : 1;
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`\ncomparison aborted: ${message}`);
   writeFileSync(
-    join(outDir, "comparison.json"),
+    join(outDir, `${project}-comparison.json`),
     JSON.stringify({ error: message, base: base ?? null, head: head ?? null }, null, 2),
   );
 }
