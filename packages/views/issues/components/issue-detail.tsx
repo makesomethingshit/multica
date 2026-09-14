@@ -3039,7 +3039,10 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             }}
           >
             {descriptionAnnotations.popup}
-            <div data-comment-content={descriptionSourceId}>
+            <div
+              data-testid="issue-description"
+              data-comment-content={descriptionSourceId}
+            >
               <ContentEditor
                 ref={descEditorRef}
                 key={id}

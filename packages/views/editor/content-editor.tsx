@@ -553,11 +553,23 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
           cdnDomain: configStore.getState().cdnDomain,
         })
       : "";
-    // With `immediatelyRender: false` the Tiptap instance is created after
-    // mount, so an imperative `focus()` fired on the same tick (e.g. chat
-    // auto-focusing a brand-new conversation) would hit a null editor and no-op.
-    // Latch the intent here and honor it in `onCreate` once the editor exists.
+    // Hydration uses Tiptap's null server snapshot. Latch imperative focus
+    // until that snapshot has been replaced with the client editor.
     const focusOnReadyRef = useRef(false);
+    // A startup click carries a position, not just "focus me": keep the
+    // coordinates/anchor so `onCreate` can land the caret where the user
+    // clicked instead of degrading to the end of the document. Plain
+    // `focus()` leaves this null and `onCreate` falls back to `"end"`.
+    const focusTargetRef = useRef<
+      | { kind: "coords"; x: number; y: number }
+      | { kind: "anchor"; anchor: TextAnchor }
+      | null
+    >(null);
+    // Drops that land before the deferred Tiptap instance exists must not
+    // vanish: queue them here and flush once the editor commits. The queue
+    // lives inside this mount, and the description host remounts per issue
+    // (key={id}), so queued files stay issue-keyed without a shared cache.
+    const pendingUploadsRef = useRef<File[]>([]);
     // Large markdown is parsed in chunks to dodge marked's O(n²) tokenizer (see
     // parseMarkdownChunked). Small docs stay on the single-parse fast path.
     const mountChunked = initialContent.length > MARKDOWN_CHUNK_THRESHOLD;
@@ -566,9 +578,15 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       immediatelyRender: false,
       // Explicit for clarity — the real perf win is useEditorState in BubbleMenu.
       shouldRerenderOnTransaction: false,
-      onCreate: ({ editor: ed }) => {
+      onMount: ({ editor: ed }) => {
         // For large docs we mount empty (below) and parse in chunks here, so the
         // O(n²) marked tokenizer never sees the whole document at once.
+        // onMount runs synchronously during editor construction — inside the
+        // deferred creation task, before the browser paints — so the view is
+        // populated before its first visible frame (no empty paint) and before
+        // any later task can deliver a keystroke or upload that a subsequent
+        // setContent would erase. The old onCreate location ran in a later
+        // task, after that empty frame and after the first interaction window.
         if (mountChunked) {
           const manager = (
             ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
@@ -585,14 +603,48 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
             });
           }
         }
+        // Normalize the populated view and establish the save baseline before
+        // it accepts input. The later create task must not reset either one.
         // A markdown draft ending in an empty list item (e.g. `"1. \n\n"` left
         // after typing `1.`) parses into a caretless, schema-invalid item;
         // repair it so the mounted editor has a real cursor in the list.
         repairEmptyListItems(ed);
         lastEmittedRef.current = normalizeEditorMarkdown(ed);
+      },
+      onCreate: ({ editor: ed }) => {
         if (focusOnReadyRef.current) {
           focusOnReadyRef.current = false;
-          ed.commands.focus("end");
+          const target = focusTargetRef.current;
+          focusTargetRef.current = null;
+          // A real user click carries a DOM position; landing the caret
+          // there (not "end") is what lets a startup click become a valid
+          // ProseMirror selection on WebKit as well as Chromium.
+          if (target?.kind === "anchor") {
+            ed.commands.focus(posFromAnchor(ed.state.doc, target.anchor));
+          } else if (target?.kind === "coords") {
+            const pos = ed.view.posAtCoords({ left: target.x, top: target.y });
+            if (pos) ed.commands.focus(pos.pos);
+            else ed.commands.focus("end");
+          } else {
+            ed.commands.focus("end");
+          }
+        }
+        // Startup drops latched before the instance existed become real
+        // uploads only through the same public path as a live-editor drop
+        // (`uploadFile` → `uploadAndInsertFile`): the `uploading` node is
+        // drawn first, so the queued file is visible and settle-tracked
+        // exactly like a drop that arrived after readiness.
+        if (pendingUploadsRef.current.length > 0 && onUploadFileRef.current) {
+          const pending = pendingUploadsRef.current;
+          pendingUploadsRef.current = [];
+          for (const file of pending) {
+            uploadAndInsertFile(
+              ed,
+              file,
+              onUploadFileRef.current,
+              ed.state.doc.content.size,
+            );
+          }
         }
       },
       content: mountChunked ? "" : initialContent,
@@ -913,8 +965,10 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       },
       focusAtCoords: (coords: { x: number; y: number }) => {
         if (!editor) {
-          // Editor not mounted yet — degrade to the latched plain focus.
+          // Editor not mounted yet — latch the click position so `onCreate`
+          // lands the caret at the user's click, not at the document end.
           focusOnReadyRef.current = true;
+          focusTargetRef.current = { kind: "coords", ...coords };
           return;
         }
         const pos = editor.view.posAtCoords({ left: coords.x, top: coords.y });
@@ -923,8 +977,10 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       },
       focusAtAnchor: (anchor: TextAnchor) => {
         if (!editor) {
-          // Editor not mounted yet — degrade to the latched plain focus.
+          // Editor not mounted yet — latch the logical anchor so `onCreate`
+          // resolves it against the populated document.
           focusOnReadyRef.current = true;
+          focusTargetRef.current = { kind: "anchor", anchor };
           return;
         }
         editor.commands.focus(posFromAnchor(editor.state.doc, anchor));
@@ -933,7 +989,15 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
         editor?.commands.blur();
       },
       uploadFile: (file: File) => {
-        if (!editor || !onUploadFileRef.current) return;
+        if (!onUploadFileRef.current) return;
+        if (!editor) {
+          // Deferred creation hasn't produced an instance yet (the same
+          // window the focus latch covers): queue the file and flush it in
+          // `onCreate` through the live `uploadFile` path, so a startup
+          // drop is never silently discarded.
+          pendingUploadsRef.current.push(file);
+          return;
+        }
         const endPos = editor.state.doc.content.size;
         uploadAndInsertFile(editor, file, onUploadFileRef.current, endPos);
       },
