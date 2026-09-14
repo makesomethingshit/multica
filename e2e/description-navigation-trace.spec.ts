@@ -1,41 +1,53 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { createTestApi, loginAsDefault } from "./helpers";
 import type { TestApiClient } from "./fixtures";
 
 /**
  * MUL-7095 / PR #8092 Revision 3 — navigation performance recorder.
  *
- * §5 requirement: measurement must begin BEFORE issue navigation (at link
- * activation), not once `issue-description` already exists. This spec records:
+ * §0-A requirement: measurement must begin BEFORE issue navigation (at link
+ * activation), not once the description host already exists. This spec
+ * records, per navigation:
  *
  * - link click timestamp (`navClickT`);
- * - first committed detail frame (first rAF sample whose scroll root carries
- *   the target issue's `data-tab-scroll-root`, `firstDetailCommitT`);
- * - first frame containing the description host (`firstHostT`);
+ * - first committed detail frame for the TARGET issue (first rAF sample with
+ *   `t >= clickT` whose `[data-tab-scroll-root]` exactly equals
+ *   `main:<targetId>`, `firstDetailCommitT`). Matching the target id (not a
+ *   `main:` prefix) and requiring `t >= clickT` keeps a stale root from a
+ *   pre-click frame from passing as this navigation's commit.
+ * - first frame containing the target issue's description surface
+ *   (`firstHostT`);
  * - first frame containing populated description content
  *   (`.ProseMirror` with non-empty text, `firstPopulatedT`);
  * - editor `isInitialized` at each sample;
- * - Long Tasks overlapping [click, first commit] via PerformanceObserver
- *   (`buffered: true`, started pre-click).
+ * - Long Tasks clipped to [click, first commit]: each overlapping entry
+ *   contributes only its intersection (`overlapMs`), exported as both max
+ *   (`maxOverlapMs`) and sum (`totalOverlapMs`).
  *
- * No portable CI threshold is asserted: absolute timings are machine-specific
- * (codex cross-check). The spec attaches raw samples for A/B comparison
- * (base vs head vs revised, same fixture + environment) and applies only
- * stable guardrails:
+ * No portable timing threshold is asserted: absolute numbers are
+ * machine-specific. The spec writes the raw trace to a JSON attachment
+ * (`navigation-trace`) and, when `NAV_TRACE_REPORT_PATH` is set, to that
+ * file for ref-to-ref A/B runners. Ordering is the only in-spec invariant:
+ * `clickT < firstDetailCommitT <= firstHostT <= firstPopulatedT`, plus one
+ * populated initialized sample. A/B verdicts are relative guardrails
+ * applied outside this spec (base vs head vs revised, same fixture +
+ * environment).
  *
- * - the current `eagerClientRender` head MUST show a several-hundred-ms
- *   main-thread Long Task attributable to synchronous editor creation in the
- *   click→commit window (F1 regression demonstration — fails on base, passes
- *   on eager head);
- * - the revised implementation must keep click→first-commit within the same
- *   practical range as base with no new large synchronous task.
+ * Selectors are base/main/head compatible: the commit root
+ * (`[data-tab-scroll-root]`) exists on all three refs, and the description
+ * surface is found via the drop-zone container (head: the same element
+ * carrying `data-testid="issue-description"`; base/main: its structurally
+ * identical container without the testid). Nothing here keys on
+ * `data-testid="issue-description"`, so the same spec runs unchanged on
+ * every ref.
  *
  * Cold compilation outliers are discarded separately: the first navigation
- * after load is a warm-up sample, excluded from the comparison.
+ * after load is a warm-up sample, excluded from the measured pass.
  */
 
 type NavSample = {
   t: number;
+  commitRoot: string | null;
   detailCommitted: boolean;
   hostPresent: boolean;
   proseMirrorPresent: boolean;
@@ -50,6 +62,12 @@ type LongTaskEntry = {
   name: string;
 };
 
+type OverlapTask = LongTaskEntry & {
+  overlapStart: number;
+  overlapEnd: number;
+  overlapMs: number;
+};
+
 declare global {
   interface Window {
     __navInstalled: boolean;
@@ -57,11 +75,26 @@ declare global {
     __navRecord: boolean;
     __navLongTasks: LongTaskEntry[];
     __navClickT: number;
+    __navTargetId: string;
     __navFirstDetailCommitT: number | null;
     __navFirstHostT: number | null;
     __navFirstPopulatedT: number | null;
-    __startNavRecording: () => void;
+    __startNavRecording: (targetId: string) => void;
   }
+}
+
+/**
+ * Base/main have no `data-testid="issue-description"` (added on the PR head
+ * at issue-detail.tsx:3023). The container is still locatable on all refs:
+ * it is the drop-zone div wrapping the description editor's `.ProseMirror`,
+ * inside the detail scroll root. This mirrors that host div (same position
+ * relative to `.ProseMirror`) instead of keying on the head-only testid.
+ */
+function descriptionSurface(page: Page) {
+  return page
+    .locator('[data-tab-scroll-root^="main:"] .ProseMirror')
+    .first()
+    .locator("xpath=ancestor::div[contains(@class,'relative')][contains(@class,'mt-5')][1]");
 }
 
 const LONG_BODY = [
@@ -90,22 +123,22 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     );
     await page.addInitScript(() => {
       // addInitScript re-runs on full document loads. The trace assumes
-      // SPA client navigation (same assumption as description-reentry.spec.ts:
-      // window state persists across open()/leaveDetail()). The guard keeps
-      // a reload from double-registering the observer (duplicate entries)
-      // or wiping an in-flight recording.
+      // SPA client navigation (window state persists across open()/list
+      // trips). The guard keeps a reload from double-registering the
+      // observer (duplicate entries) or wiping an in-flight recording.
       if (window.__navInstalled) return;
       window.__navInstalled = true;
       window.__navSamples = [];
       window.__navLongTasks = [];
       window.__navRecord = false;
       window.__navClickT = 0;
+      window.__navTargetId = "";
       window.__navFirstDetailCommitT = null;
       window.__navFirstHostT = null;
       window.__navFirstPopulatedT = null;
       // Started pre-click with buffered:true so tasks straddling navigation
-      // are still observed; only the overlap with [click, first commit] is
-      // counted at analysis time.
+      // are still observed; only the intersection with [click, first commit]
+      // is counted at analysis time.
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
           window.__navLongTasks.push({
@@ -118,10 +151,21 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       observer.observe({ type: "longtask", buffered: true });
       const sample = () => {
         if (window.__navRecord) {
-          const host = document.querySelector(
-            '[data-testid="issue-description"]',
-          );
-          const editor = host?.querySelector<HTMLElement>(".ProseMirror");
+          const now = performance.now();
+          const root =
+            document.querySelector<HTMLElement>("[data-tab-scroll-root]");
+          const rootValue = root?.dataset.tabScrollRoot ?? null;
+          // Target-locked commit: pre-click frames (now < clickT) and stale
+          // roots from another issue never count, even if a previous rAF
+          // fired between flag-on and the actual click.
+          const committed =
+            now >= window.__navClickT &&
+            rootValue === `main:${window.__navTargetId}`;
+          // Head carries data-testid="issue-description" on this div;
+          // base/main do not, so resolve from the editor upward instead.
+          const editor = root?.querySelector<HTMLElement>(".ProseMirror");
+          const host =
+            editor?.closest<HTMLElement>("div.relative.mt-5") ?? null;
           const text = editor?.textContent ?? "";
           const initialized = (
             editor as
@@ -129,10 +173,6 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
               | null
               | undefined
           )?.editor?.isInitialized;
-          const now = performance.now();
-          const committed = !!document.querySelector(
-            '[data-tab-scroll-root^="main:"]',
-          );
           if (committed && window.__navFirstDetailCommitT === null) {
             window.__navFirstDetailCommitT = now;
           }
@@ -144,6 +184,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
           }
           window.__navSamples.push({
             t: now,
+            commitRoot: rootValue,
             detailCommitted: committed,
             hostPresent: !!host,
             proseMirrorPresent: !!editor,
@@ -155,8 +196,9 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         requestAnimationFrame(sample);
       };
       requestAnimationFrame(sample);
-      window.__startNavRecording = () => {
+      window.__startNavRecording = (targetId: string) => {
         window.__navSamples = [];
+        window.__navTargetId = targetId;
         window.__navClickT = performance.now();
         window.__navFirstDetailCommitT = null;
         window.__navFirstHostT = null;
@@ -170,7 +212,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     await api?.cleanup();
   });
 
-  test("click-to-commit navigation trace with Long Tasks (A/B guardrail)", async ({
+  test("click-to-commit navigation trace with clipped Long Tasks", async ({
     page,
   }, testInfo) => {
     const a = await api.createIssue(`E2E Nav A ${Date.now()}`, {
@@ -180,68 +222,102 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     const list = page.locator(`a[href="/${slug}/issues"]`).first();
     const openLink = (id: string) =>
       page.locator(`a[href$="/issues/${id}"]`).first();
+    const surface = () => descriptionSurface(page);
+    const editorReady = () =>
+      page.waitForFunction(
+        (targetId: string) => {
+          const root = document.querySelector<HTMLElement>(
+            `[data-tab-scroll-root="main:${targetId}"]`,
+          );
+          return (
+            (
+              root?.querySelector(".ProseMirror") as HTMLElement & {
+                editor?: { isInitialized: boolean };
+              }
+            )?.editor?.isInitialized === true
+          );
+        },
+        a.id,
+        { timeout: 30000 },
+      );
 
     // Warm-up navigation (cold compilation outlier — discarded from the
     // comparison, kept only so the measured pass is warm).
     await openLink(a.id).click();
-    await expect(
-      page.getByTestId("issue-description").locator(".ProseMirror"),
-    ).toBeVisible({ timeout: 30000 });
+    await expect(surface().locator(".ProseMirror")).toBeVisible({
+      timeout: 30000,
+    });
     await list.click();
-    await expect(page.getByTestId("issue-description")).toHaveCount(0);
+    await expect(surface()).toHaveCount(0);
 
-    // Measured navigation: recorder starts BEFORE the click.
-    await page.evaluate(() => window.__startNavRecording());
+    // Measured navigation: recorder starts BEFORE the click, target-locked.
+    await page.evaluate((id: string) => window.__startNavRecording(id), a.id);
     await openLink(a.id).click();
-    await expect(
-      page.getByTestId("issue-description").locator(".ProseMirror"),
-    ).toBeVisible({ timeout: 30000 });
+    await expect(surface().locator(".ProseMirror")).toBeVisible({
+      timeout: 30000,
+    });
     // Wait until the populated editor reports initialized so the trace
     // covers the full startup path, not just the first commit.
-    await page.waitForFunction(
-      () =>
-        (
-          document.querySelector(
-            '[data-testid="issue-description"] .ProseMirror',
-          ) as HTMLElement & { editor?: { isInitialized: boolean } }
-        )?.editor?.isInitialized === true,
-      { timeout: 30000 },
-    );
+    await editorReady();
 
     const trace = await page.evaluate(() => {
       window.__navRecord = false;
       const clickT = window.__navClickT;
+      const targetId = window.__navTargetId;
       const firstCommit = window.__navFirstDetailCommitT;
-      const overlapping = window.__navLongTasks.filter((task) => {
-        if (firstCommit === null) return false;
-        const taskEnd = task.startTime + task.duration;
-        return task.startTime <= firstCommit && taskEnd >= clickT;
-      });
+      // Clip each overlapping task to [click, firstCommit]: only the
+      // intersection counts toward max/sum, so a task straddling the
+      // window edge is never billed for work outside it.
+      const overlapping: OverlapTask[] = [];
+      if (firstCommit !== null) {
+        for (const task of window.__navLongTasks) {
+          const overlapStart = Math.max(task.startTime, clickT);
+          const overlapEnd = Math.min(task.startTime + task.duration, firstCommit);
+          if (overlapEnd > overlapStart) {
+            overlapping.push({
+              ...task,
+              overlapStart,
+              overlapEnd,
+              overlapMs: overlapEnd - overlapStart,
+            });
+          }
+        }
+      }
       return {
+        targetId,
         clickT,
         firstDetailCommitT: firstCommit,
         firstHostT: window.__navFirstHostT,
         firstPopulatedT: window.__navFirstPopulatedT,
         samples: window.__navSamples,
         overlappingLongTasks: overlapping,
-        maxLongTaskMs: overlapping.reduce(
-          (max, task) => Math.max(max, task.duration),
+        maxOverlapMs: overlapping.reduce(
+          (max, task) => Math.max(max, task.overlapMs),
           0,
         ),
-        clickToCommitMs:
-          firstCommit !== null ? firstCommit - clickT : null,
+        totalOverlapMs: overlapping.reduce(
+          (sum, task) => sum + task.overlapMs,
+          0,
+        ),
+        clickToCommitMs: firstCommit !== null ? firstCommit - clickT : null,
       };
     });
 
+    const report = { ...trace, status: "ok", fixture: "navigation-trace-v1" };
     await testInfo.attach("navigation-trace", {
-      body: JSON.stringify(trace, null, 2),
+      body: JSON.stringify(report, null, 2),
       contentType: "application/json",
     });
+    const reportPath = process.env.NAV_TRACE_REPORT_PATH;
+    if (reportPath) {
+      const { writeFileSync } = await import("node:fs");
+      writeFileSync(reportPath, JSON.stringify(report, null, 2));
+    }
 
-    // Ordering invariant: click < first commit <= host <= populated.
+    // Strict ordering invariant: click < first commit <= host <= populated.
     expect(trace.firstDetailCommitT).not.toBeNull();
     expect(trace.clickToCommitMs).not.toBeNull();
-    expect(trace.clickToCommitMs!).toBeGreaterThanOrEqual(0);
+    expect(trace.clickToCommitMs!).toBeGreaterThan(0);
     expect(trace.firstHostT).not.toBeNull();
     expect(trace.firstPopulatedT).not.toBeNull();
     expect(trace.firstHostT!).toBeGreaterThanOrEqual(
@@ -257,11 +333,8 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       ),
     ).toBe(true);
 
-    // Eager-head regression demonstration (F1/INV-1): synchronous editor
-    // construction of a ~100-section document inside the route render must
-    // surface as a several-hundred-ms Long Task overlapping click→commit.
-    // On the deferred base this guardrail fails (no such task) — that is
-    // the intended A/B signal, not a portable timing threshold.
-    expect(trace.maxLongTaskMs).toBeGreaterThanOrEqual(200);
+    // No absolute timing assertion here: A/B verdicts are relative
+    // guardrails over the attached raw traces (base vs head vs revised,
+    // same fixture + environment), not a portable millisecond threshold.
   });
 });
