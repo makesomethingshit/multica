@@ -9,7 +9,11 @@ import type { TestApiClient } from "./fixtures";
  * activation), not once the description host already exists. This spec
  * records, per navigation:
  *
- * - link click timestamp (`navClickT`);
+ * - link click timestamp (`navClickT`): stamped at the target link's own
+ *   click event (capture listener on the matching `a[href$="/issues/<id>"]`),
+ *   not at a `page.evaluate` round-trip before `locator.click()`. Playwright's
+ *   click waits for actionability first, so stamping pre-click would bill
+ *   that wait (and its LongTasks) to click-to-commit.
  * - first committed detail frame for the TARGET issue (first rAF sample with
  *   `t >= clickT` whose `[data-tab-scroll-root]` exactly equals
  *   `main:<targetId>`, `firstDetailCommitT`). Matching the target id (not a
@@ -35,9 +39,12 @@ import type { TestApiClient } from "./fixtures";
  *
  * Selectors are base/main/head compatible: the commit root
  * (`[data-tab-scroll-root]`) exists on all three refs, and the description
- * surface is found via the drop-zone container (head: the same element
- * carrying `data-testid="issue-description"`; base/main: its structurally
- * identical container without the testid). Nothing here keys on
+ * surface is found independently inside the target root: head's
+ * `data-testid="issue-description"` div, falling back to the structurally
+ * identical drop-zone container (`div.relative.mt-5.rounded-lg`) on
+ * base/main. It is never resolved via `.ProseMirror.closest(...)`, so a
+ * host-committed frame is recordable before any editor node exists.
+ * Nothing here keys on
  * `data-testid="issue-description"`, so the same spec runs unchanged on
  * every ref.
  *
@@ -74,12 +81,14 @@ declare global {
     __navSamples: NavSample[];
     __navRecord: boolean;
     __navLongTasks: LongTaskEntry[];
-    __navClickT: number;
+    __navClickT: number | null;
     __navTargetId: string;
+    __navArmed: boolean;
     __navFirstDetailCommitT: number | null;
     __navFirstHostT: number | null;
     __navFirstPopulatedT: number | null;
     __startNavRecording: (targetId: string) => void;
+    __armNavRecording: (targetId: string) => void;
   }
 }
 
@@ -94,10 +103,12 @@ function descriptionSurface(page: Page, issueId?: string) {
   const root = issueId
     ? `[data-tab-scroll-root="main:${issueId}"]`
     : '[data-tab-scroll-root^="main:"]';
-  return page
-    .locator(`${root} .ProseMirror`)
-    .first()
-    .locator("xpath=ancestor::div[contains(@class,'relative')][contains(@class,'mt-5')][1]");
+  // Host resolved independently of `.ProseMirror` (see the in-page sampler
+  // below): head's testid div, else the structurally identical drop-zone
+  // container on base/main. Never `.ProseMirror.closest(...)`.
+  return page.locator(
+    `${root} [data-testid="issue-description"], ${root} div.relative.mt-5.rounded-lg`,
+  ).first();
 }
 
 const LONG_BODY = [
@@ -134,8 +145,9 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       window.__navSamples = [];
       window.__navLongTasks = [];
       window.__navRecord = false;
-      window.__navClickT = 0;
+      window.__navClickT = null;
       window.__navTargetId = "";
+      window.__navArmed = false;
       window.__navFirstDetailCommitT = null;
       window.__navFirstHostT = null;
       window.__navFirstPopulatedT = null;
@@ -170,17 +182,21 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
             ) ?? null;
           const rootValue =
             targetRoot?.getAttribute("data-tab-scroll-root") ?? null;
-          // Pre-click frames (now < clickT) never count, even if a rAF
-          // fired between flag-on and the actual click.
+          // Pre-click frames (clickT null, or now < clickT) never count,
+          // even if a rAF fired between arming and the actual click.
+          const clicked = window.__navClickT !== null;
           const committed =
-            now >= window.__navClickT && targetRoot !== null;
-          // Head carries data-testid="issue-description" on this div;
-          // base/main do not, so resolve from the editor upward instead —
-          // always inside the TARGET root, never a stale sibling.
+            clicked && now >= (window.__navClickT as number) && targetRoot !== null;
+          // Host is resolved independently inside the TARGET root — head's
+          // testid div, else the structurally identical drop-zone container
+          // on base/main — never via `.ProseMirror.closest(...)`, so a
+          // host-committed frame is recordable before any editor exists.
+          const host =
+            targetRoot?.querySelector<HTMLElement>(
+              '[data-testid="issue-description"], div.relative.mt-5.rounded-lg',
+            ) ?? null;
           const editor =
             targetRoot?.querySelector<HTMLElement>(".ProseMirror");
-          const host =
-            editor?.closest<HTMLElement>("div.relative.mt-5") ?? null;
           const text = editor?.textContent ?? "";
           const initialized = (
             editor as
@@ -218,15 +234,33 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         requestAnimationFrame(sample);
       };
       requestAnimationFrame(sample);
-      window.__startNavRecording = (targetId: string) => {
+      // Arm the click stamp: the target link's own click event (capture)
+      // records `performance.now()` in-page, so Playwright's pre-click
+      // actionability wait and the evaluate→click round-trip are never
+      // billed to click-to-commit or its LongTask window. Arming is
+      // idempotent per navigation and scoped to the target href.
+      window.__armNavRecording = (targetId: string) => {
         window.__navSamples = [];
         window.__navTargetId = targetId;
-        window.__navClickT = performance.now();
+        window.__navClickT = null;
+        window.__navArmed = true;
         window.__navFirstDetailCommitT = null;
         window.__navFirstHostT = null;
         window.__navFirstPopulatedT = null;
         window.__navRecord = true;
       };
+      document.addEventListener(
+        "click",
+        (event) => {
+          if (!window.__navArmed || window.__navClickT !== null) return;
+          const anchor = (event.target as HTMLElement | null)?.closest?.(
+            `a[href$="/issues/${window.__navTargetId}"]`,
+          );
+          if (anchor) window.__navClickT = performance.now();
+        },
+        true,
+      );
+      window.__startNavRecording = window.__armNavRecording;
     });
   });
 
@@ -272,8 +306,10 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     await list.click();
     await expect(surface()).toHaveCount(0);
 
-    // Measured navigation: recorder starts BEFORE the click, target-locked.
-    await page.evaluate((id: string) => window.__startNavRecording(id), a.id);
+    // Measured navigation: arm the recorder, then click. The click stamp
+    // lands at the target link's own click event (target-locked), so the
+    // measured pass excludes Playwright's actionability wait.
+    await page.evaluate((id: string) => window.__armNavRecording(id), a.id);
     await openLink(a.id).click();
     await expect(surface().locator(".ProseMirror")).toBeVisible({
       timeout: 30000,
@@ -291,7 +327,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       // intersection counts toward max/sum, so a task straddling the
       // window edge is never billed for work outside it.
       const overlapping: OverlapTask[] = [];
-      if (firstCommit !== null) {
+      if (clickT !== null && firstCommit !== null) {
         for (const task of window.__navLongTasks) {
           const overlapStart = Math.max(task.startTime, clickT);
           const overlapEnd = Math.min(task.startTime + task.duration, firstCommit);
@@ -321,7 +357,8 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
           (sum, task) => sum + task.overlapMs,
           0,
         ),
-        clickToCommitMs: firstCommit !== null ? firstCommit - clickT : null,
+        clickToCommitMs:
+          clickT !== null && firstCommit !== null ? firstCommit - clickT : null,
       };
     });
 
@@ -337,6 +374,9 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     }
 
     // Strict ordering invariant: click < first commit <= host <= populated.
+    // Null clickT fails here (listener never saw the target link's event),
+    // so a stamp-less run can never pass as a measurement.
+    expect(trace.clickT).not.toBeNull();
     expect(trace.firstDetailCommitT).not.toBeNull();
     expect(trace.clickToCommitMs).not.toBeNull();
     expect(trace.clickToCommitMs!).toBeGreaterThan(0);

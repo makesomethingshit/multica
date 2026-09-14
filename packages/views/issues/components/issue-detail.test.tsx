@@ -20,7 +20,7 @@ const TEST_RESOURCES = { en: { common: enCommon, issues: enIssues } };
 const mockViewport = vi.hoisted(() => ({ isMobile: false }));
 
 // Counts MockContentEditor mounts. This pins the description to exactly one
-// eager editor per issue and catches stale editor reuse across issue switches.
+// deferred editor per issue and catches stale editor reuse across issue switches.
 const contentEditorMounts = vi.hoisted(() => ({ count: 0 }));
 const descriptionSelectionAction = vi.hoisted(() => ({ current: undefined as { label: string; onSelect: () => void } | undefined }));
 // Stable empty-attachments reference: the real store returns a shared constant
@@ -828,8 +828,8 @@ describe("IssueDetail (shared)", () => {
   it("renders issue title and description after loading", async () => {
     renderIssueDetail();
 
-    // The description is the one eager editor: keeping one renderer avoids the
-    // layout jump caused by swapping a long react-markdown tree for ProseMirror.
+    // The description stays on ContentEditor's deferred default: it mounts
+    // one editor per issue without synchronous eager creation in route render.
     // Title and comment/reply composers remain readonly-first.
     expect(await screen.findByDisplayValue("Add JWT auth to the backend")).toBeInTheDocument();
     expect(screen.getByText("Implement authentication")).toBeInTheDocument();
@@ -947,14 +947,18 @@ describe("IssueDetail (shared)", () => {
     expect(description).toHaveAttribute("data-flush-on-unmount", "true");
   });
 
-  it("opts only the description editor into eager client rendering", async () => {
+  it("keeps the description editor on the deferred default (no eager client render)", async () => {
+    // MUL-7095 Revision 3: IssueDetail must not opt the description into
+    // eager client rendering — synchronous ProseMirror construction in the
+    // route render regresses navigation. The deferred default keeps one
+    // continuously mounted editor per issue (see the remount test below).
     renderIssueDetail();
 
     const description = await screen.findByDisplayValue("Add JWT auth to the backend");
-    expect(description).toHaveAttribute("data-eager-client-render", "true");
+    expect(description).not.toHaveAttribute("data-eager-client-render");
   });
 
-  it("remounts the eager description on issue switch without carrying stale content", async () => {
+  it("remounts the description on issue switch without carrying stale content", async () => {
     // The web route reuses IssueDetail across issues. The keyed description
     // editor must remount atomically for the new issue while the title remains
     // on its cheap stand-in.
