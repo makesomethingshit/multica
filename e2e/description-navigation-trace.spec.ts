@@ -24,16 +24,20 @@ import type { TestApiClient } from "./fixtures";
  * - first frame containing populated description content (`.ProseMirror`
  *   with non-empty text, at or after commit, `firstPopulatedT`);
  * - editor `isInitialized` at each sample;
- * - Long Tasks clipped to [click, first commit]: each overlapping entry
- *   contributes only its intersection (`overlapMs`), exported as both max
- *   (`maxOverlapMs`) and sum (`totalOverlapMs`).
+ * - Long Tasks clipped to [click, first populated] (falls back to first
+ *   commit only when the populated mark never fires — such a run fails the
+ *   ordering assertions anyway): each overlapping entry contributes only
+ *   its intersection (`overlapMs`), exported as both max (`maxOverlapMs`)
+ *   and sum (`totalOverlapMs`). This keeps deferred parse/view work inside
+ *   the measured window instead of hiding it past the route commit.
  *
  * No portable timing threshold is asserted: absolute numbers are
  * machine-specific. The spec writes the raw trace to a JSON attachment
  * (`navigation-trace`) and, when `NAV_TRACE_REPORT_PATH` is set, to that
  * file for ref-to-ref A/B runners. Ordering is the only in-spec invariant:
  * `clickT < firstDetailCommitT <= firstHostT <= firstPopulatedT`, plus one
- * populated initialized sample. A/B verdicts are relative guardrails
+ * populated initialized sample, zero `host && !populated` frames after
+ * commit, and the primary `clickToPopulatedMs` metric. A/B verdicts are relative guardrails
  * applied outside this spec via scripts/nav-trace-compare.mjs (base vs
  * head vs revised, same fixture + environment).
  *
@@ -152,8 +156,8 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       window.__navFirstHostT = null;
       window.__navFirstPopulatedT = null;
       // Started pre-click with buffered:true so tasks straddling navigation
-      // are still observed; only the intersection with [click, first commit]
-      // is counted at analysis time.
+      // are still observed; only the intersection with [click, first
+      // populated] is counted at analysis time.
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
           window.__navLongTasks.push({
@@ -323,14 +327,23 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       const clickT = window.__navClickT;
       const targetId = window.__navTargetId;
       const firstCommit = window.__navFirstDetailCommitT;
-      // Clip each overlapping task to [click, firstCommit]: only the
+      const firstPopulated = window.__navFirstPopulatedT;
+      // MUL-7095 BLOCKER ②: LongTask window runs to firstPopulated, not
+      // firstCommit. With `immediatelyRender: false` the heavy parse/view
+      // work lands after the route's first commit — clipping at commit
+      // would let a 300–500ms post-commit LongTask pass the gate.
+      // `firstPopulated` falls back to `firstCommit` only when the
+      // populated mark never fired (that run then fails the ordering
+      // assertions below, so the fallback can never pass as data).
+      const windowEnd = firstPopulated ?? firstCommit;
+      // Clip each overlapping task to [click, windowEnd]: only the
       // intersection counts toward max/sum, so a task straddling the
       // window edge is never billed for work outside it.
       const overlapping: OverlapTask[] = [];
-      if (clickT !== null && firstCommit !== null) {
+      if (clickT !== null && windowEnd !== null) {
         for (const task of window.__navLongTasks) {
           const overlapStart = Math.max(task.startTime, clickT);
-          const overlapEnd = Math.min(task.startTime + task.duration, firstCommit);
+          const overlapEnd = Math.min(task.startTime + task.duration, windowEnd);
           if (overlapEnd > overlapStart) {
             overlapping.push({
               ...task,
@@ -346,7 +359,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         clickT,
         firstDetailCommitT: firstCommit,
         firstHostT: window.__navFirstHostT,
-        firstPopulatedT: window.__navFirstPopulatedT,
+        firstPopulatedT: firstPopulated,
         samples: window.__navSamples,
         overlappingLongTasks: overlapping,
         maxOverlapMs: overlapping.reduce(
@@ -359,6 +372,10 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         ),
         clickToCommitMs:
           clickT !== null && firstCommit !== null ? firstCommit - clickT : null,
+        // Primary metric for the relative guardrail: click → usable
+        // (populated) description, not just click → route commit.
+        clickToPopulatedMs:
+          clickT !== null && firstPopulated !== null ? firstPopulated - clickT : null,
       };
     });
 
@@ -394,6 +411,20 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         (s: NavSample) => s.populated && s.editorInitialized === true,
       ),
     ).toBe(true);
+    // Blank-free requirement: once the target route commits, no sampled
+    // frame may show the host without populated content. Any such sample
+    // means the user saw an empty description between commit and populate.
+    expect(
+      trace.samples.filter(
+        (s: NavSample) =>
+          s.detailCommitted && s.hostPresent && !s.populated,
+      ),
+    ).toEqual([]);
+    // Primary metric stays defined for the relative guardrail runner.
+    expect(trace.clickToPopulatedMs).not.toBeNull();
+    expect(trace.clickToPopulatedMs!).toBeGreaterThanOrEqual(
+      trace.clickToCommitMs!,
+    );
 
     // No absolute timing assertion here: A/B verdicts are relative
     // guardrails over the attached raw traces (base vs head vs revised,

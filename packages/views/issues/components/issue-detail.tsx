@@ -3034,6 +3034,24 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                 descriptionEditingRef.current = false;
               }
             }}
+            onMouseDown={(event) => {
+              // MUL-7095: pre-instance click preservation. The editor's own
+              // container handler returns early while the deferred instance
+              // is null, so this wrapper owns that window: forward the click
+              // point into the editor's focus latch (`focusAtCoords` latches
+              // pre-instance and focuses post-instance; `onCreate` lands the
+              // caret via the existing `posAtCoords` path). A text anchor
+              // needs a laid-out readonly root, which does not exist before
+              // the instance mounts, so coordinates are the right granularity
+              // here. Interactive children use the same exclusion list as the
+              // editor's container handler; an already-handled (prevented)
+              // inner click is never re-latched.
+              if (event.defaultPrevented) return;
+              const target = event.target as HTMLElement;
+              if (target.closest(".ProseMirror")) return;
+              if (target.closest("a, button, input, textarea, [role='button'], [data-node-view-wrapper]")) return;
+              descEditorRef.current?.focusAtCoords({ x: event.clientX, y: event.clientY });
+            }}
           >
             {descriptionAnnotations.popup}
             <div

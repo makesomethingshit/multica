@@ -139,7 +139,9 @@ vi.mock("@tiptap/react", () => ({
             (listener) => listener !== cb,
           );
         },
-        view: { dispatch: mockDispatch },
+        // jsdom has no layout: `posAtCoords` never resolves, so latched
+        // coordinates exercise the pre-existing coords→end fallback.
+        view: { dispatch: mockDispatch, posAtCoords: () => null },
         state: {
           get tr() {
             return emptyTr;
@@ -1014,6 +1016,44 @@ describe("ContentEditor — startup intent queue (MUL-7095)", () => {
         }}
       />,
     );
+    expect(mockFocus).toHaveBeenCalledWith("end");
+  });
+
+  it("routes a pre-instance wrapper click through focusAtCoords without dropping it", () => {
+    // MUL-7095 BLOCKER ①: the real failure window is BEFORE `useEditor`
+    // returns an instance — `handleContainerMouseDown` early-returns there,
+    // and the old `.ProseMirror visible → h1.click()` E2E never covered it.
+    // This pins the wrapper-owns-the-click contract: a mousedown against a
+    // not-yet-created editor must latch coordinates via `focusAtCoords`, and
+    // releasing the instance must land the caret at that point via the
+    // existing `posAtCoords` path — not degrade to document end.
+    deferEditor.value = true;
+    let imperativeRef: {
+      focusAtCoords: (coords: { x: number; y: number }) => void;
+    } | null = null;
+    const { rerender } = render(
+      <ContentEditor
+        ref={(r) => {
+          imperativeRef = r;
+        }}
+      />,
+    );
+    // No editor yet — this must NOT throw or focus, only latch.
+    act(() => {
+      imperativeRef?.focusAtCoords({ x: 120, y: 80 });
+    });
+    expect(mockFocus).not.toHaveBeenCalled();
+    // Deferred creation arrives: `onCreate` resolves the latched coords.
+    deferEditor.value = false;
+    rerender(
+      <ContentEditor
+        ref={(r) => {
+          imperativeRef = r;
+        }}
+      />,
+    );
+    // posAtCoords is unresolvable in jsdom (no layout), so the latch lands
+    // via the pre-existing coords→end fallback without dropping the click.
     expect(mockFocus).toHaveBeenCalledWith("end");
   });
 

@@ -18,7 +18,7 @@
  * stub REMOTE_API_URL: the recorder creates real issues through the API.
  *
  * Raw samples are always reported. The runner additionally applies a
- * configurable relative guardrail to the primary click-to-commit metric; the
+ * configurable relative guardrail to the primary click-to-populated metric; the
  * guardrail is expressed as a ratio, never as a machine-specific millisecond
  * threshold. A difference inside that allowance remains reviewer data.
  *
@@ -290,6 +290,7 @@ const relativeRegression = (baseValue, headValue, allowance) => {
 function markdown(base, head, regression) {
   const usable = base.status === "ok" && head.status === "ok";
   const rows = [
+    ["clickToPopulatedMs", "Click → first populated (mean)"],
     ["clickToCommitMs", "Click → first commit (mean)"],
     ["maxOverlapMs", "Clipped LongTask max overlap (mean)"],
     ["totalOverlapMs", "Clipped LongTask total overlap (mean)"],
@@ -314,7 +315,7 @@ function markdown(base, head, regression) {
     "| --- | ---: | ---: | ---: | ---: |",
     ...rows,
     "",
-    `- project \`${project}\`; relative click-to-commit guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
+    `- project \`${project}\`; relative click-to-populated guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
     `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)${base.spec_failed ? "; scenario failed" : ""}`,
     `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)${head.spec_failed ? "; scenario failed" : ""}`,
     `- spec \`${spec}\` from the working tree; raw traces: \`${project}-base-*.json\`, \`${project}-head-*.json\``,
@@ -343,9 +344,16 @@ try {
   writeFileSync(join(outDir, `${project}-head.json`), JSON.stringify(head, null, 2));
   const totalS = seconds(totalStart);
 
+  // MUL-7095 BLOCKER ②: the old guardrail measured click→commit only, so
+  // deferred parse/view work landing after the route commit never failed
+  // the comparison. The primary metric is click→populated; click→commit
+  // stays as a diagnostic row. Old traces without `clickToPopulatedMs`
+  // (pre-revision runs) fall back to click→commit so they stay comparable.
+  const primaryKey = (traces) =>
+    pick(traces, "clickToPopulatedMs") ?? pick(traces, "clickToCommitMs");
   const regression = relativeRegression(
-    pick(base.traces, "clickToCommitMs"),
-    pick(head.traces, "clickToCommitMs"),
+    primaryKey(base.traces),
+    primaryKey(head.traces),
     maxRelativeRegression,
   );
   const summary = markdown(base, head, regression);

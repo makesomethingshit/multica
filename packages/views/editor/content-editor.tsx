@@ -125,19 +125,49 @@ function measureMountPhase(
   startMark: string,
   endMark: string,
 ): void {
+  // No per-measure `clearMarks` here: `mul7095-mount-start` is reused by
+  // both `mul7095-create-view` and `mul7095-mount-total`, so clearing on
+  // first use silently dropped the total (measure threw into the catch).
+  // Marks live until `clearMountMarks` at the end of `onMount` instead.
   try {
     if (
       typeof performance !== "undefined" &&
       typeof performance.measure === "function"
     ) {
       performance.measure(name, startMark, endMark);
-      if (typeof performance.clearMarks === "function") {
-        performance.clearMarks(startMark);
-        performance.clearMarks(endMark);
-      }
     }
   } catch {
     // A failed measure must never break editor creation.
+  }
+}
+
+/** Drop the mount-attribution marks once `onMount` has measured them all.
+ *  Called once per mount (never per measure) so a mark reused across two
+ *  spans survives until its last consumer. Measurement-only. */
+function clearMountMarks(): void {
+  try {
+    if (
+      typeof performance !== "undefined" &&
+      typeof performance.clearMarks === "function"
+    ) {
+      for (const mark of [
+        "mul7095-before-create-start",
+        "mul7095-chunk-parse-start",
+        "mul7095-chunk-parse-end",
+        "mul7095-mount-start",
+        "mul7095-mount-dispatch-start",
+        "mul7095-mount-dispatch-end",
+        "mul7095-mount-repair-start",
+        "mul7095-mount-repair-end",
+        "mul7095-mount-baseline-start",
+        "mul7095-mount-baseline-end",
+        "mul7095-mount-end",
+      ]) {
+        performance.clearMarks(mark);
+      }
+    }
+  } catch {
+    // Clearing must never break editor creation.
   }
 }
 
@@ -722,6 +752,9 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
           "mul7095-mount-start",
           "mul7095-mount-end",
         );
+        // Drop the attribution marks only after every span above consumed
+        // them (`mul7095-mount-start` feeds both create-view and total).
+        clearMountMarks();
       },
       onCreate: ({ editor: ed }) => {
         if (focusOnReadyRef.current) {
