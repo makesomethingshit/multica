@@ -173,9 +173,25 @@ const seconds = (from) => Math.round((Date.now() - from) / 100) / 10;
 const invalidForTiming = (entry) => {
   const trace = entry?.trace;
   if (!trace || trace.status !== "ok") return true;
+  // Common spec assertions (both modes): the full ordering invariant,
+  // a populated+initialized sample, and the primary metric. Only the
+  // blank-free check is accept-only — everything here must hold for a
+  // `collect` sample to count, so a baseline-broken base run can never
+  // slip in as usable on three timestamps alone.
   if (typeof trace.clickT !== "number") return true;
   if (typeof trace.firstDetailCommitT !== "number") return true;
+  if (typeof trace.firstHostT !== "number") return true;
   if (typeof trace.firstPopulatedT !== "number") return true;
+  if (typeof trace.clickToCommitMs !== "number" || trace.clickToCommitMs <= 0) return true;
+  if (trace.firstHostT < trace.firstDetailCommitT) return true;
+  if (trace.firstPopulatedT < trace.firstHostT) return true;
+  if (typeof trace.clickToPopulatedMs !== "number") return true;
+  if (trace.clickToPopulatedMs < trace.clickToCommitMs) return true;
+  if (
+    !Array.isArray(trace.samples) ||
+    !trace.samples.some((s) => s.populated && s.editorInitialized === true)
+  )
+    return true;
   if (entry.scenario_exit === 0) return false;
   // Non-zero exit in `collect` mode is an acceptance miss on a side whose
   // correctness is not under test — the timing sample still stands.
@@ -249,7 +265,11 @@ async function measure(ref, label, { collect = false } = {}) {
               ...process.env,
               PLAYWRIGHT_BASE_URL: `http://127.0.0.1:${port}`,
               NAV_TRACE_REPORT_PATH: reportPath,
-              ...(collect ? { NAV_TRACE_ACCEPTANCE: "collect" } : {}),
+              // Explicit on BOTH sides: the head must never inherit a
+              // parent `NAV_TRACE_ACCEPTANCE=collect` (which would skip
+              // its blank-free acceptance), and the base side is pinned
+              // to `collect` regardless of the parent environment.
+              NAV_TRACE_ACCEPTANCE: collect ? "collect" : "accept",
             },
           },
         );
