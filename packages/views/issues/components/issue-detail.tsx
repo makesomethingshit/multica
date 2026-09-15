@@ -3050,6 +3050,10 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
               const target = event.target as HTMLElement;
               if (target.closest(".ProseMirror")) return;
               if (target.closest("a, button, input, textarea, [role='button'], [data-node-view-wrapper]")) return;
+              // Null-window guard: a live editor owns its own clicks via
+              // the container handler — the wrapper only latches while the
+              // deferred instance does not exist yet.
+              if (descEditorRef.current?.hasEditorInstance()) return;
               descEditorRef.current?.focusAtCoords({ x: event.clientX, y: event.clientY });
             }}
           >

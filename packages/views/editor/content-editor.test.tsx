@@ -1027,8 +1027,12 @@ describe("ContentEditor — startup intent queue (MUL-7095)", () => {
     // not-yet-created editor must latch coordinates via `focusAtCoords`, and
     // releasing the instance must land the caret at that point via the
     // existing `posAtCoords` path — not degrade to document end.
+    // NOTE: the wrapper-DOM mousedown→latch path itself (exclusions +
+    // null-window guard) is pinned in issue-detail.test.tsx against the real
+    // wrapper; this pins the latch→onCreate flush half of the same path.
     deferEditor.value = true;
     let imperativeRef: {
+      hasEditorInstance: () => boolean;
       focusAtCoords: (coords: { x: number; y: number }) => void;
     } | null = null;
     const { rerender } = render(

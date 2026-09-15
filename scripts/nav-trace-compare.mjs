@@ -315,7 +315,7 @@ function markdown(base, head, regression) {
     "| --- | ---: | ---: | ---: | ---: |",
     ...rows,
     "",
-    `- project \`${project}\`; relative click-to-populated guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
+    `- project \`${project}\`; relative click-to-populated guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.invalid ? ` (INVALID: ${regression.invalid})` : regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
     `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)${base.spec_failed ? "; scenario failed" : ""}`,
     `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)${head.spec_failed ? "; scenario failed" : ""}`,
     `- spec \`${spec}\` from the working tree; raw traces: \`${project}-base-*.json\`, \`${project}-head-*.json\``,
@@ -347,15 +347,21 @@ try {
   // MUL-7095 BLOCKER ②: the old guardrail measured click→commit only, so
   // deferred parse/view work landing after the route commit never failed
   // the comparison. The primary metric is click→populated; click→commit
-  // stays as a diagnostic row. Old traces without `clickToPopulatedMs`
-  // (pre-revision runs) fall back to click→commit so they stay comparable.
+  // stays as a diagnostic row. Both sides must report the SAME metric:
+  // comparing base-commit against head-populated would pass/fail on data
+  // that never shared a scale, so a mismatch invalidates the comparison.
   const primaryKey = (traces) =>
-    pick(traces, "clickToPopulatedMs") ?? pick(traces, "clickToCommitMs");
-  const regression = relativeRegression(
-    primaryKey(base.traces),
-    primaryKey(head.traces),
-    maxRelativeRegression,
-  );
+    pick(traces, "clickToPopulatedMs") !== null ? "clickToPopulatedMs" : "clickToCommitMs";
+  const baseKey = primaryKey(base.traces);
+  const headKey = primaryKey(head.traces);
+  const metricMismatch = baseKey !== headKey;
+  const regression = metricMismatch
+    ? { available: false, ratio: null, failed: false, invalid: `primary metric mismatch: base ${baseKey} vs head ${headKey}` }
+    : relativeRegression(
+        pick(base.traces, baseKey),
+        pick(head.traces, headKey),
+        maxRelativeRegression,
+      );
   const summary = markdown(base, head, regression);
   writeFileSync(
     join(outDir, `${project}-comparison.json`),
@@ -379,11 +385,17 @@ try {
   // A sample must be usable and every scenario must exit zero. A slower head
   // only fails when it exceeds the configured relative guardrail; raw values
   // remain report data and no absolute machine-time threshold is used.
+  // A primary-metric mismatch is never a passing comparison: it means the
+  // two sides measured different things (one pre-revision, one populated).
+  if (metricMismatch) {
+    console.error(`comparison invalid: ${regression.invalid}`);
+  }
   exitCode =
     base.status === "ok" &&
     head.status === "ok" &&
     !base.spec_failed &&
     !head.spec_failed &&
+    !metricMismatch &&
     !regression.failed
       ? 0
       : 1;

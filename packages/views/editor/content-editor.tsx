@@ -338,6 +338,12 @@ interface ContentEditorRef {
    * when no position resolves (click below the last line). Must be called
    * while the editor element is laid out (not display: none).
    */
+  /**
+   * True while the deferred instance exists. Lets a host forward a click
+   * only in the pre-instance window and leave live clicks to the editor's
+   * own container handler.
+   */
+  hasEditorInstance: () => boolean;
   focusAtCoords: (coords: { x: number; y: number }) => void;
   /**
    * Focus and place the caret at the document position a text anchor
@@ -1100,6 +1106,10 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     }, [editor, placeholderText]);
 
     useImperativeHandle(ref, () => ({
+      // MUL-7095: explicit pre-instance-window probe. The description
+      // wrapper calls `focusAtCoords` only when this is false; a live
+      // editor's clicks stay with the editor's own container handler.
+      hasEditorInstance: () => !!editor && !editor.isDestroyed,
       // Intentionally NOT routed through `normalizeMarkdown` — see the "stays
       // untrimmed" safety net in content-editor.test.tsx. It used to also pass
       // through `stripBlobUrls`; that wrapper is gone because an in-flight
