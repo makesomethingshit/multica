@@ -473,6 +473,11 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     // between commit and populate. Skipped in `collect` mode — the runner
     // collects the known-bad base that way, and a base that blanks by
     // design must still yield a timing sample, never an exclusion.
+    // Sampler-infrastructure invariant (BOTH modes): a sampler throw —
+    // even one the loop recovered from — may have skipped the frames where
+    // a blank state would have been recorded. A trace with any sampler
+    // error is not a valid measurement, base or head, collect or accept.
+    expect(trace.samplerErrors).toEqual([]);
     if (acceptance === "accept") {
       expect(blankFrameCount).toBe(0);
     }

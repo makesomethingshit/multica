@@ -294,10 +294,8 @@ interface ContentEditorBaseProps {
    */
   flushPendingOnUnmount?: boolean;
   /**
-   * Create the ProseMirror view during the first client render. This is opt-in
-   * because most editor hosts preserve their existing deferred creation; the
-   * issue description uses it to keep its populated surface continuous on
-   * cached re-entry.
+   * Create the ProseMirror view during the first client render. Opt-in
+   * only; existing editor hosts keep deferred creation by default.
    */
   eagerClientRender?: boolean;
   /**

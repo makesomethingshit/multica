@@ -29,6 +29,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { connect, createServer } from "node:net";
+import { invalidForTiming } from "./nav-trace-timing.mjs";
 
 const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"]).toString().trim();
 const args = process.argv.slice(2);
@@ -167,38 +168,13 @@ const seconds = (from) => Math.round((Date.now() - from) / 100) / 10;
 // failure must not make the performance sample unusable. A `collect`-mode
 // trace whose timing fields are complete stays usable for the guardrail
 // despite a non-zero scenario exit: only runs where NO trace was written
-// (or the trace lacks the primary timing) are dropped. The head side runs
+// (or the trace lacks the primary timing) are dropped — plus one narrower
+// exclusion: a sampler-loop failure invalidates the sample in BOTH modes
+// (measured by the new `samplerErrors` gate inside `invalidForTiming`), so
+// `collect` forgives only the known-bad base's blank-frame miss, never a
+// broken measurement loop. The head side runs
 // the default `accept` mode, so
 // head acceptance failures (scenario exit ≠ 0) still exclude its samples.
-const invalidForTiming = (entry) => {
-  const trace = entry?.trace;
-  if (!trace || trace.status !== "ok") return true;
-  // Common spec assertions (both modes): the full ordering invariant,
-  // a populated+initialized sample, and the primary metric. Only the
-  // blank-free check is accept-only — everything here must hold for a
-  // `collect` sample to count, so a baseline-broken base run can never
-  // slip in as usable on three timestamps alone.
-  if (typeof trace.clickT !== "number") return true;
-  if (typeof trace.firstDetailCommitT !== "number") return true;
-  if (typeof trace.firstHostT !== "number") return true;
-  if (typeof trace.firstPopulatedT !== "number") return true;
-  if (typeof trace.clickToCommitMs !== "number" || trace.clickToCommitMs <= 0) return true;
-  if (trace.firstHostT < trace.firstDetailCommitT) return true;
-  if (trace.firstPopulatedT < trace.firstHostT) return true;
-  if (typeof trace.clickToPopulatedMs !== "number") return true;
-  if (trace.clickToPopulatedMs < trace.clickToCommitMs) return true;
-  if (
-    !Array.isArray(trace.samples) ||
-    !trace.samples.some((s) => s.populated && s.editorInitialized === true)
-  )
-    return true;
-  if (entry.scenario_exit === 0) return false;
-  // Non-zero exit in `collect` mode is an acceptance miss on a side whose
-  // correctness is not under test — the timing sample still stands.
-  if (trace.acceptance === "collect") return false;
-  return true;
-};
-
 async function measure(ref, label, { collect = false } = {}) {
   const sha = execFileSync("git", ["rev-parse", ref], { cwd: repoRoot }).toString().trim();
   const checkout = mkdtempSync(join(tmpdir(), `nav-trace-${label}-`));
