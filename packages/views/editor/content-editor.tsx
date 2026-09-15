@@ -102,6 +102,45 @@ function normalizeEditorMarkdown(editor: Editor): string {
   return normalizeMarkdown(editor.getMarkdown());
 }
 
+// MUL-7095 mount attribution: `performance.mark/measure` spans around the
+// deferred mount phases (chunk parse, view construction, fallback dispatch,
+// repair, baseline) so the navigation-trace A/B can attribute the
+// click-to-commit window without a second renderer. Measurement-only: safe
+// no-ops outside the browser and never throws into the editor lifecycle.
+function markMountPhase(name: string): void {
+  try {
+    if (
+      typeof performance !== "undefined" &&
+      typeof performance.mark === "function"
+    ) {
+      performance.mark(name);
+    }
+  } catch {
+    // A failed mark must never break editor creation.
+  }
+}
+
+function measureMountPhase(
+  name: string,
+  startMark: string,
+  endMark: string,
+): void {
+  try {
+    if (
+      typeof performance !== "undefined" &&
+      typeof performance.measure === "function"
+    ) {
+      performance.measure(name, startMark, endMark);
+      if (typeof performance.clearMarks === "function") {
+        performance.clearMarks(startMark);
+        performance.clearMarks(endMark);
+      }
+    }
+  } catch {
+    // A failed measure must never break editor creation.
+  }
+}
+
 /** True when any node in the document is mid-upload (`attrs.uploading`). The
  *  `return !found` early-out matches the original inline scans verbatim: in
  *  ProseMirror it only stops descending into the matched node's subtree (not
@@ -577,6 +616,11 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     // lives inside this mount, and the description host remounts per issue
     // (key={id}), so queued files stay issue-keyed without a shared cache.
     const pendingUploadsRef = useRef<File[]>([]);
+    // Set once per mount when `onBeforeCreate` prepares the initial JSON for
+    // a chunked document. `onMount` consults it to skip the post-mount
+    // `setContent` dispatch. This component remounts per issue (key={id}), so
+    // the prepared doc stays issue-keyed with no shared cache.
+    const preparedInitialJsonRef = useRef(false);
     // Large markdown is parsed in chunks to dodge marked's O(n²) tokenizer (see
     // parseMarkdownChunked). Small docs stay on the single-parse fast path.
     const mountChunked = initialContent.length > MARKDOWN_CHUNK_THRESHOLD;
@@ -587,32 +631,97 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       immediatelyRender: eagerClientRender && typeof window !== "undefined",
       // Explicit for clarity — the real perf win is useEditorState in BubbleMenu.
       shouldRerenderOnTransaction: false,
-      onMount: ({ editor: ed }) => {
+      onBeforeCreate: ({ editor: ed }) => {
+        // Markdown's beforeCreate hook has initialized the manager, but
+        // Tiptap has not constructed its document or view yet. Build the
+        // initial JSON once here so the first view mounts populated: this
+        // removes the post-mount `setContent` dispatch that dominated the
+        // click-to-commit LongTask (MUL-7095 deep-dive), without restoring
+        // eager creation on the route (INV-1) or an empty first frame (F3).
+        markMountPhase("mul7095-before-create-start");
+        markMountPhase("mul7095-chunk-parse-start");
         if (mountChunked) {
-          // Parse large documents during mount, before the first visible frame.
-          // This keeps chunking off the route render while avoiding an empty
-          // editor followed by a later onCreate replacement.
           const manager = (
             ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
           ).markdown?.manager;
           if (manager) {
-            ed.commands.setContent(parseMarkdownChunked(manager, initialContent), {
-              emitUpdate: false,
-            });
+            ed.options.content = parseMarkdownChunked(
+              manager,
+              initialContent,
+            );
+            preparedInitialJsonRef.current = true;
+          }
+        }
+        markMountPhase("mul7095-chunk-parse-end");
+        measureMountPhase(
+          "mul7095-chunk-parse",
+          "mul7095-chunk-parse-start",
+          "mul7095-chunk-parse-end",
+        );
+      },
+      onMount: ({ editor: ed }) => {
+        markMountPhase("mul7095-mount-start");
+        // View construction between beforeCreate and mount (createView).
+        measureMountPhase(
+          "mul7095-create-view",
+          "mul7095-before-create-start",
+          "mul7095-mount-start",
+        );
+        if (mountChunked && !preparedInitialJsonRef.current) {
+          // Fallback when the markdown manager was unavailable in
+          // onBeforeCreate: populate from markdown so the first frame is
+          // never empty. Expected to stay cold; its measure proves it.
+          const manager = (
+            ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
+          ).markdown?.manager;
+          markMountPhase("mul7095-mount-dispatch-start");
+          if (manager) {
+            ed.commands.setContent(
+              parseMarkdownChunked(manager, initialContent),
+              {
+                emitUpdate: false,
+              },
+            );
           } else {
             ed.commands.setContent(initialContent, {
               emitUpdate: false,
               contentType: "markdown",
             });
           }
+          markMountPhase("mul7095-mount-dispatch-end");
+          measureMountPhase(
+            "mul7095-mount-dispatch",
+            "mul7095-mount-dispatch-start",
+            "mul7095-mount-dispatch-end",
+          );
         }
         // Normalize the populated view and establish the save baseline before
         // it accepts input. The later create task must not reset either one.
         // A markdown draft ending in an empty list item (e.g. `"1. \n\n"` left
         // after typing `1.`) parses into a caretless, schema-invalid item;
         // repair it so the mounted editor has a real cursor in the list.
+        markMountPhase("mul7095-mount-repair-start");
         repairEmptyListItems(ed);
+        markMountPhase("mul7095-mount-repair-end");
+        measureMountPhase(
+          "mul7095-mount-repair",
+          "mul7095-mount-repair-start",
+          "mul7095-mount-repair-end",
+        );
+        markMountPhase("mul7095-mount-baseline-start");
         lastEmittedRef.current = normalizeEditorMarkdown(ed);
+        markMountPhase("mul7095-mount-baseline-end");
+        measureMountPhase(
+          "mul7095-mount-baseline",
+          "mul7095-mount-baseline-start",
+          "mul7095-mount-baseline-end",
+        );
+        markMountPhase("mul7095-mount-end");
+        measureMountPhase(
+          "mul7095-mount-total",
+          "mul7095-mount-start",
+          "mul7095-mount-end",
+        );
       },
       onCreate: ({ editor: ed }) => {
         if (focusOnReadyRef.current) {
@@ -895,7 +1004,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       lastSyncedValueRef.current = value;
 
       // The initial value was already parsed through useEditor's
-      // `content` option (or in onMount for the chunked path). Comparing that
+      // `content` option (or in onBeforeCreate for the chunked path). Comparing that
       // source Markdown to Tiptap's canonical serialization can differ even
       // when they represent the same document, and used to cause an immediate
       // second full parse. Only later prop changes belong to this sync effect.

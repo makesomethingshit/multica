@@ -104,6 +104,7 @@ const latestEditorOptions = vi.hoisted<{
 vi.mock("@tiptap/react", () => ({
   useEditor: (options: {
     immediatelyRender?: boolean;
+    onBeforeCreate?: (args: { editor: unknown }) => void;
     onMount?: (args: { editor: unknown }) => void;
     onCreate?: (args: { editor: unknown }) => void;
     onUpdate?: (args: { editor: unknown }) => void;
@@ -126,6 +127,8 @@ vi.mock("@tiptap/react", () => ({
           setContent: mockSetContent,
           setTextSelection: mockSetTextSelection,
         },
+        options: {},
+        storage: {},
         getMarkdown: () => editorState.markdown,
         on: (event: string, cb: () => void) => {
           if (event === "transaction") transactionListeners.current.push(cb);
@@ -153,13 +156,16 @@ vi.mock("@tiptap/react", () => ({
         },
       };
     }
-    // Mirror Tiptap's real ordering: `mount` fires synchronously during
-    // construction (view populated before attach), `create` in a later task.
-    // ContentEditor populates + baselines in onMount, so fire it here; the
-    // old onCreate-only mock would leave lastEmittedRef unset and mislead
-    // the dirty-guard tests.
+    // Mirror Tiptap's real ordering: `beforeCreate` prepares the initial
+    // document (manager already initialized, no view yet), then `mount`
+    // fires synchronously during construction (view populated before
+    // attach), `create` in a later task. ContentEditor prepares chunked
+    // JSON in onBeforeCreate and baselines in onMount, so fire both here;
+    // the old onCreate-only mock would leave lastEmittedRef unset and
+    // mislead the dirty-guard tests.
     if (!onCreateFired.value) {
       onCreateFired.value = true;
+      options?.onBeforeCreate?.({ editor: editorRef.current });
       options?.onMount?.({ editor: editorRef.current });
       options?.onCreate?.({ editor: editorRef.current });
     }
