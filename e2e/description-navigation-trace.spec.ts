@@ -36,10 +36,21 @@ import type { TestApiClient } from "./fixtures";
  * (`navigation-trace`) and, when `NAV_TRACE_REPORT_PATH` is set, to that
  * file for ref-to-ref A/B runners. Ordering is the only in-spec invariant:
  * `clickT < firstDetailCommitT <= firstHostT <= firstPopulatedT`, plus one
- * populated initialized sample, zero `host && !populated` frames after
- * commit, and the primary `clickToPopulatedMs` metric. A/B verdicts are relative guardrails
- * applied outside this spec via scripts/nav-trace-compare.mjs (base vs
- * head vs revised, same fixture + environment).
+ * populated initialized sample and the primary `clickToPopulatedMs` metric.
+ * A/B verdicts are relative guardrails applied outside this spec via
+ * scripts/nav-trace-compare.mjs (base vs head vs revised, same fixture +
+ * environment).
+ *
+ * Measurement vs acceptance (`NAV_TRACE_ACCEPTANCE`): the blank-free
+ * requirement (zero `host && !populated` frames after commit) is a
+ * head-acceptance assertion, not a measurement-validity check. The base
+ * under comparison is known-bad exactly there — re-entry briefly blanks
+ * the description — so gating sample usability on it would drop every
+ * base sample and make the A/B unmeasurable. With
+ * `NAV_TRACE_ACCEPTANCE=collect` (the runner uses this for the base side)
+ * the trace is still fully recorded but the blank-free assertion is
+ * skipped; the default (`accept`) enforces it for the head side. The
+ * report records which mode produced it.
  *
  * Selectors are base/main/head compatible: the commit root
  * (`[data-tab-scroll-root]`) exists on all three refs, and the description
@@ -379,7 +390,28 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       };
     });
 
-    const report = { ...trace, status: "ok", fixture: "navigation-trace-v1" };
+    // MUL-7095: measurement vs acceptance split. The runner collects the
+    // base side in `collect` mode, where the blank-free assertion below is
+    // skipped (known-bad base blanks by design); the head side runs the
+    // default `accept` mode. The mode is recorded on the report so the
+    // runner can tell a skipped acceptance check from a real one.
+    const acceptance =
+      process.env.NAV_TRACE_ACCEPTANCE === "collect" ? "collect" : "accept";
+    // Blank-free count is computed BEFORE the report is written (the write
+    // below happens before the assertions, by design, so a failing run
+    // still leaves its timing trace for the runner). In `accept` mode the
+    // assertion further below enforces zero; in `collect` mode the count
+    // is diagnosis only and never asserted.
+    const blankFrameCount = trace.samples.filter(
+      (s: NavSample) => s.detailCommitted && s.hostPresent && !s.populated,
+    ).length;
+    const report = {
+      ...trace,
+      status: "ok",
+      fixture: "navigation-trace-v1",
+      acceptance,
+      blankFrames: blankFrameCount,
+    };
     await testInfo.attach("navigation-trace", {
       body: JSON.stringify(report, null, 2),
       contentType: "application/json",
@@ -411,15 +443,17 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         (s: NavSample) => s.populated && s.editorInitialized === true,
       ),
     ).toBe(true);
-    // Blank-free requirement: once the target route commits, no sampled
-    // frame may show the host without populated content. Any such sample
-    // means the user saw an empty description between commit and populate.
-    expect(
-      trace.samples.filter(
-        (s: NavSample) =>
-          s.detailCommitted && s.hostPresent && !s.populated,
-      ),
-    ).toEqual([]);
+    // Blank-free requirement (head acceptance ONLY): once the target
+    // route commits, no sampled frame may show the host without populated
+    // content. Any such sample means the user saw an empty description
+    // between commit and populate. Skipped in `collect` mode — the runner
+    // collects the known-bad base that way, and a base that blanks by
+    // design must still yield a timing sample, never an exclusion.
+    if (acceptance === "accept") {
+      expect(blankFrameCount).toBe(0);
+    }
+    // In `collect` mode the count stays on the report as diagnosis only
+    // and is never asserted — a blanking base still yields its sample.
     // Primary metric stays defined for the relative guardrail runner.
     expect(trace.clickToPopulatedMs).not.toBeNull();
     expect(trace.clickToPopulatedMs!).toBeGreaterThanOrEqual(

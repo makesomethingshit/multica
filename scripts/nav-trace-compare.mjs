@@ -160,7 +160,30 @@ const waitForServer = async (port, timeoutMs = 120_000) => {
 
 const seconds = (from) => Math.round((Date.now() - from) / 100) / 10;
 
-async function measure(ref, label) {
+// MUL-7095: measurement vs acceptance split. The runner collects the base
+// side in `collect` mode (`NAV_TRACE_ACCEPTANCE=collect`), where the spec
+// skips the blank-free head-acceptance assertion but still records the
+// full timing trace. The known-bad base blanks by design; its correctness
+// failure must not make the performance sample unusable. A `collect`-mode
+// trace whose timing fields are complete stays usable for the guardrail
+// despite a non-zero scenario exit: only runs where NO trace was written
+// (or the trace lacks the primary timing) are dropped. The head side runs
+// the default `accept` mode, so
+// head acceptance failures (scenario exit ≠ 0) still exclude its samples.
+const invalidForTiming = (entry) => {
+  const trace = entry?.trace;
+  if (!trace || trace.status !== "ok") return true;
+  if (typeof trace.clickT !== "number") return true;
+  if (typeof trace.firstDetailCommitT !== "number") return true;
+  if (typeof trace.firstPopulatedT !== "number") return true;
+  if (entry.scenario_exit === 0) return false;
+  // Non-zero exit in `collect` mode is an acceptance miss on a side whose
+  // correctness is not under test — the timing sample still stands.
+  if (trace.acceptance === "collect") return false;
+  return true;
+};
+
+async function measure(ref, label, { collect = false } = {}) {
   const sha = execFileSync("git", ["rev-parse", ref], { cwd: repoRoot }).toString().trim();
   const checkout = mkdtempSync(join(tmpdir(), `nav-trace-${label}-`));
   liveCheckouts.add(checkout);
@@ -226,6 +249,7 @@ async function measure(ref, label) {
               ...process.env,
               PLAYWRIGHT_BASE_URL: `http://127.0.0.1:${port}`,
               NAV_TRACE_REPORT_PATH: reportPath,
+              ...(collect ? { NAV_TRACE_ACCEPTANCE: "collect" } : {}),
             },
           },
         );
@@ -239,10 +263,19 @@ async function measure(ref, label) {
       try {
         trace = JSON.parse(readFileSync(reportPath, "utf8"));
       } catch { /* no readable report for this repeat */ }
-      // The scenario process has the last word (cf. perf-compare.mjs): a
-      // report that says `ok` from a run whose process then failed — e.g.
-      // an assertion after the trace was written — is not a sample.
-      if (scenarioExit !== 0 && trace?.status === "ok") {
+      // MUL-7095: `collect`-mode traces (base side) skip the blank-free
+      // head-acceptance assertion by design, so their scenario exit is
+      // expected to be non-zero on a known-bad base. `invalidForTiming`
+      // (defined above `measure`) decides sample usability from the
+      // timing content + mode — not from the exit code alone — so what
+      // survives here as `ok` can still count for the guardrail there.
+      // Only `accept`-mode (`head`) keeps the old strict rule: an `ok`
+      // report from a failed process is not a sample.
+      if (
+        scenarioExit !== 0 &&
+        trace?.status === "ok" &&
+        trace?.acceptance !== "collect"
+      ) {
         trace.status = "invalid";
         trace.invalid = [
           ...(trace.invalid ?? []),
@@ -251,7 +284,7 @@ async function measure(ref, label) {
       }
       traces.push({ repeat: i, measure_s: measureS, scenario_exit: scenarioExit, trace });
     }
-    const usable = traces.filter((t) => t.trace?.status === "ok");
+    const usable = traces.filter((t) => !invalidForTiming(t));
     return {
       ref, sha, spec_failed: scenarioFailed, build_cached: buildCached,
       repeats, usable_repeats: usable.length, project,
@@ -267,7 +300,7 @@ async function measure(ref, label) {
 
 const pick = (traces, key) => {
   const values = traces
-    .filter((t) => t.trace?.status === "ok" && typeof t.trace[key] === "number")
+    .filter((t) => !invalidForTiming(t) && typeof t.trace[key] === "number")
     .map((t) => t.trace[key]);
   if (values.length === 0) return null;
   return values.reduce((a, b) => a + b, 0) / values.length;
@@ -338,7 +371,10 @@ let exitCode = 1;
 let base;
 let head;
 try {
-  base = await measure(baseRef, "base");
+  // The base side is collected in `collect` mode: its blank-free
+  // correctness failure must not void its timing samples. The head side
+  // runs `accept` mode, so head acceptance still gates the comparison.
+  base = await measure(baseRef, "base", { collect: true });
   writeFileSync(join(outDir, `${project}-base.json`), JSON.stringify(base, null, 2));
   head = await measure(headRef, "head");
   writeFileSync(join(outDir, `${project}-head.json`), JSON.stringify(head, null, 2));
@@ -390,10 +426,15 @@ try {
   if (metricMismatch) {
     console.error(`comparison invalid: ${regression.invalid}`);
   }
+  // MUL-7095: base `spec_failed` no longer gates the exit — the base side
+  // is collected in `collect` mode where the blank-free acceptance miss is
+  // EXPECTED on a known-bad base (its samples stay usable via
+  // `invalidForTiming`). Only head acceptance failures fail the run.
+  // `base.status` still gates: with zero timing-usable base samples there
+  // is no baseline to compare against.
   exitCode =
     base.status === "ok" &&
     head.status === "ok" &&
-    !base.spec_failed &&
     !head.spec_failed &&
     !metricMismatch &&
     !regression.failed
