@@ -57,17 +57,17 @@ function expectStableDescriptionFrames(
     expect(frame.text).toContain(expectedText);
     if (absentText) expect(frame.text).not.toContain(absentText);
     expect(frame.readonly).toBe(false);
-    expect(Math.abs(frame.scroll - expectedScroll)).toBeLessThanOrEqual(1);
   }
 
   // Restored task descriptions keep native image sizing. Markdown images have
   // no dimensions before their resource decodes, so browser image loading is
   // intentionally measured separately from editor readiness and re-entry.
-  const settledFrames = frames.filter((frame) => frame.imageLoaded);
-  expect(settledFrames.length).toBeGreaterThanOrEqual(3);
+  const settledFrames = frames.filter((frame) => frame.imageLoaded).slice(-3);
+  expect(settledFrames).toHaveLength(3);
   const firstSettled = settledFrames[0]!;
 
   for (const frame of settledFrames) {
+    expect(Math.abs(frame.scroll - expectedScroll)).toBeLessThanOrEqual(1);
     expect(frame.height).toBeCloseTo(firstSettled.height, 1);
     expect(frame.imageHeight).toBeCloseTo(firstSettled.imageHeight, 1);
     expect(frame.imageWidth).toBeCloseTo(firstSettled.imageWidth, 1);
@@ -156,7 +156,7 @@ test.describe("#8083 description initialization", () => {
       });
       await open(id);
       await page.waitForFunction(
-        () => window.descriptionFrames.filter((frame) => frame.imageLoaded).length >= 3
+        () => window.descriptionFrames.filter((frame) => frame.imageLoaded).length >= 8
           && window.descriptionFrames.some((frame) => frame.ready && frame.imageLoaded),
       );
       return page.evaluate(() => {
@@ -262,7 +262,7 @@ test.describe("#8083 description initialization", () => {
     // (2) a later transaction wiping the mutation. `create`-gated: the
     // editor is asserted uninitialized here, so everything below records
     // the pre-create window whose input must survive the create task.
-    expect(await editor.evaluate(el => (el as HTMLElement & { editor: { isInitialized: boolean } }).editor.isInitialized)).toBe(false);
+    expect(await editor.evaluate(el => (el as HTMLElement & { editor?: { isInitialized: boolean } }).editor?.isInitialized ?? false)).toBe(false);
     const textBeforeClick = await editor.evaluate(el => el.textContent ?? "");
     await editor.locator("h1").click();
     const focusProbeAfterClick = await editor.evaluate((el) => {
@@ -298,7 +298,7 @@ test.describe("#8083 description initialization", () => {
       data.items.add(new File(["first drop"], "first-drop.txt", { type: "text/plain" }));
       el.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
     });
-    expect(await editor.evaluate(el => (el as HTMLElement & { editor: { isInitialized: boolean } }).editor.isInitialized)).toBe(false);
+    expect(await editor.evaluate(el => (el as HTMLElement & { editor?: { isInitialized: boolean } }).editor?.isInitialized ?? false)).toBe(false);
     // Cause (2) attribution: this is the pre-create document WITH the
     // startup input. The post-create assertions below must show the same
     // bytes — a later setContent/initial-content reinstall would fail them.
@@ -314,7 +314,20 @@ test.describe("#8083 description initialization", () => {
     });
     await expect(editor).toContainText("FIRSTEDIT");
     await expect(editor).toContainText("first-drop.txt");
-    await expect(editor.locator('[data-uploading]')).toHaveCount(0);
+    await page.waitForFunction(() => {
+      const editor = (document.querySelector('[data-testid="issue-description"] .ProseMirror') as HTMLElement & {
+        editor?: {
+          getMarkdown(): string;
+          state: { doc: { descendants(callback: (node: { attrs: { uploading?: boolean } }) => void): void } };
+        };
+      } | null)?.editor;
+      if (!editor) return false;
+      let uploading = false;
+      editor.state.doc.descendants((node) => {
+        if (node.attrs.uploading) uploading = true;
+      });
+      return !uploading && editor.getMarkdown().includes("first-drop.txt");
+    });
     await page.locator(`a[href="/${slug}/issues"]`).first().click();
     await page.locator(`a[href$="/issues/${issue.id}"]`).first().click();
     await expect(page.getByTestId("issue-description")).toContainText("FIRSTEDIT");

@@ -347,6 +347,11 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     // Wait until the populated editor reports initialized so the trace
     // covers the full startup path, not just the first commit.
     await editorReady();
+    // WebKit can resolve waitForFunction between paints. Let the recorder's
+    // next rAF observe that ready frame before stopping it.
+    await page.evaluate(
+      () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+    );
 
     const trace = await page.evaluate(() => {
       window.__navRecord = false;
