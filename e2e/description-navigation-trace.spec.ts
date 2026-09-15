@@ -102,6 +102,7 @@ declare global {
     __navFirstDetailCommitT: number | null;
     __navFirstHostT: number | null;
     __navFirstPopulatedT: number | null;
+    __navSamplerErrors: Array<{ t: number; message: string }>;
     __startNavRecording: (targetId: string) => void;
     __armNavRecording: (targetId: string) => void;
   }
@@ -166,6 +167,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       window.__navFirstDetailCommitT = null;
       window.__navFirstHostT = null;
       window.__navFirstPopulatedT = null;
+      window.__navSamplerErrors = [];
       // Started pre-click with buffered:true so tasks straddling navigation
       // are still observed; only the intersection with [click, first
       // populated] is counted at analysis time.
@@ -180,7 +182,14 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       });
       observer.observe({ type: "longtask", buffered: true });
       const sample = () => {
-        if (window.__navRecord) {
+        // Schedule the next frame FIRST: if the body below throws, the
+        // loop survives and the failure is recorded instead of the
+        // sampler going silently dark (MUL-7095 WebKit warm-run
+        // diagnosis — the sampler fell silent ~70-90ms after click with
+        // only 1-2 post-click frames).
+        requestAnimationFrame(sample);
+        if (!window.__navRecord) return;
+        try {
           const now = performance.now();
           // Target-locked root: the exact `main:<targetId>` element, not
           // the first scroll root in the document. The list's `list` root
@@ -245,8 +254,13 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
             editorInitialized: initialized ?? null,
             descriptionTextLength: text.length,
           });
+        } catch (err) {
+          // Never swallow: record the sampler failure and keep looping.
+          window.__navSamplerErrors.push({
+            t: performance.now(),
+            message: err instanceof Error ? err.message : String(err),
+          });
         }
-        requestAnimationFrame(sample);
       };
       requestAnimationFrame(sample);
       // Arm the click stamp: the target link's own click event (capture)
@@ -256,6 +270,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       // idempotent per navigation and scoped to the target href.
       window.__armNavRecording = (targetId: string) => {
         window.__navSamples = [];
+        window.__navSamplerErrors = [];
         window.__navTargetId = targetId;
         window.__navClickT = null;
         window.__navArmed = true;
@@ -387,6 +402,10 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         // (populated) description, not just click → route commit.
         clickToPopulatedMs:
           clickT !== null && firstPopulated !== null ? firstPopulated - clickT : null,
+        // Sampler-loop diagnosis: entries here mean the old code would
+        // have gone dark at that frame (an empty array is the healthy
+        // case and keeps the report schema backward compatible).
+        samplerErrors: window.__navSamplerErrors ?? [],
       };
     });
 
