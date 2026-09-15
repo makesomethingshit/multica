@@ -403,8 +403,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         ),
         clickToCommitMs:
           clickT !== null && firstCommit !== null ? firstCommit - clickT : null,
-        // Primary metric for the relative guardrail: click → usable
-        // (populated) description, not just click → route commit.
+        // Keep usable-description timing beside the first-commit metric.
         clickToPopulatedMs:
           clickT !== null && firstPopulated !== null ? firstPopulated - clickT : null,
         // Sampler-loop diagnosis: entries here mean the old code would
@@ -483,7 +482,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     }
     // In `collect` mode the count stays on the report as diagnosis only
     // and is never asserted — a blanking base still yields its sample.
-    // Primary metric stays defined for the relative guardrail runner.
+    // Populated timing stays defined for the relative guardrail report.
     expect(trace.clickToPopulatedMs).not.toBeNull();
     expect(trace.clickToPopulatedMs!).toBeGreaterThanOrEqual(
       trace.clickToCommitMs!,

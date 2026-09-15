@@ -218,7 +218,8 @@ async function measure(ref, label, { collect = false } = {}) {
     const buildS = seconds(buildStart);
     const buildCached = /cache hit/.test(buildLog);
 
-    port = await freePort();
+    port = Number(process.env.FRONTEND_PORT) || await freePort();
+    if (await portBound(port)) throw new Error(`frontend port ${port} is already in use`);
     const startStart = Date.now();
     // Own environment passes through (backend/database wiring included);
     // only the frontend port is overridden per side.
