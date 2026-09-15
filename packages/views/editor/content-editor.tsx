@@ -102,6 +102,24 @@ function normalizeEditorMarkdown(editor: Editor): string {
   return normalizeMarkdown(editor.getMarkdown());
 }
 
+// Cached re-entry is the hot path for MUL-7095. Keep only the most recently
+// parsed large document: enough to skip its next navigation-critical parse
+// without turning editor documents into another application cache.
+let lastChunkedMarkdown = "";
+let lastChunkedDocument: ReturnType<typeof parseMarkdownChunked> | null = null;
+
+function parseInitialMarkdown(
+  manager: MarkdownManagerLike,
+  markdown: string,
+): ReturnType<typeof parseMarkdownChunked> {
+  if (markdown === lastChunkedMarkdown && lastChunkedDocument) {
+    return lastChunkedDocument;
+  }
+  lastChunkedMarkdown = markdown;
+  lastChunkedDocument = parseMarkdownChunked(manager, markdown);
+  return lastChunkedDocument;
+}
+
 // MUL-7095 mount attribution: `performance.mark/measure` spans around the
 // deferred mount phases (chunk parse, view construction, fallback dispatch,
 // repair, baseline) so the navigation-trace A/B can attribute the
@@ -652,8 +670,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     const pendingUploadsRef = useRef<File[]>([]);
     // Set once per mount when `onBeforeCreate` prepares the initial JSON for
     // a chunked document. `onMount` consults it to skip the post-mount
-    // `setContent` dispatch. This component remounts per issue (key={id}), so
-    // the prepared doc stays issue-keyed with no shared cache.
+    // `setContent` dispatch.
     const preparedInitialJsonRef = useRef(false);
     // Large markdown is parsed in chunks to dodge marked's O(n²) tokenizer (see
     // parseMarkdownChunked). Small docs stay on the single-parse fast path.
@@ -666,12 +683,6 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       // Explicit for clarity — the real perf win is useEditorState in BubbleMenu.
       shouldRerenderOnTransaction: false,
       onBeforeCreate: ({ editor: ed }) => {
-        // Markdown's beforeCreate hook has initialized the manager, but
-        // Tiptap has not constructed its document or view yet. Build the
-        // initial JSON once here so the first view mounts populated: this
-        // removes the post-mount `setContent` dispatch that dominated the
-        // click-to-commit LongTask (MUL-7095 deep-dive), without restoring
-        // eager creation on the route (INV-1) or an empty first frame (F3).
         markMountPhase("mul7095-before-create-start");
         markMountPhase("mul7095-chunk-parse-start");
         if (mountChunked) {
@@ -679,10 +690,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
             ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
           ).markdown?.manager;
           if (manager) {
-            ed.options.content = parseMarkdownChunked(
-              manager,
-              initialContent,
-            );
+            ed.options.content = parseInitialMarkdown(manager, initialContent);
             preparedInitialJsonRef.current = true;
           }
         }
@@ -702,9 +710,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
           "mul7095-mount-start",
         );
         if (mountChunked && !preparedInitialJsonRef.current) {
-          // Fallback when the markdown manager was unavailable in
-          // onBeforeCreate: populate from markdown so the first frame is
-          // never empty. Expected to stay cold; its measure proves it.
+          // Fallback when the markdown manager was unavailable before create.
           const manager = (
             ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
           ).markdown?.manager;

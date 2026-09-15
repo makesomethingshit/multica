@@ -36,7 +36,7 @@ import type { TestApiClient } from "./fixtures";
  * (`navigation-trace`) and, when `NAV_TRACE_REPORT_PATH` is set, to that
  * file for ref-to-ref A/B runners. Ordering is the only in-spec invariant:
  * `clickT < firstDetailCommitT <= firstHostT <= firstPopulatedT`, plus one
- * populated initialized sample and the primary `clickToPopulatedMs` metric.
+ * populated initialized sample and both commit/populated timings.
  * A/B verdicts are relative guardrails applied outside this spec via
  * scripts/nav-trace-compare.mjs (base vs head vs revised, same fixture +
  * environment).

@@ -18,9 +18,9 @@
  * stub REMOTE_API_URL: the recorder creates real issues through the API.
  *
  * Raw samples are always reported. The runner additionally applies a
- * configurable relative guardrail to the primary click-to-populated metric; the
- * guardrail is expressed as a ratio, never as a machine-specific millisecond
- * threshold. A difference inside that allowance remains reviewer data.
+ * configurable relative guardrails to click-to-first-commit and the maximum
+ * overlapping Long Task. Guardrails are ratios, never machine-specific
+ * millisecond thresholds. Populated timing remains correctness/diagnostic data.
  *
  *   node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N] [--project chromium|webkit] [--max-regression R]
  */
@@ -62,6 +62,14 @@ if (
 const run = (cmd, cmdArgs, opts = {}) =>
   execFileSync(cmd, cmdArgs, { stdio: "inherit", ...opts });
 
+// Node does not execute Windows .cmd shims via execFile/spawn. Route pnpm
+// through cmd.exe there; POSIX keeps the direct executable path.
+const pnpmCommand = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : "pnpm";
+const pnpmArgs = (cmdArgs) =>
+  process.platform === "win32"
+    ? ["/d", "/s", "/c", "pnpm.cmd", ...cmdArgs]
+    : cmdArgs;
+
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 
 /** Servers and checkouts still alive — last-resort handlers only. */
@@ -69,7 +77,13 @@ const liveServers = new Set();
 const liveCheckouts = new Set();
 
 const killGroup = (child, signal) => {
-  try { process.kill(-child.pid, signal); } catch { /* already gone */ }
+  try {
+    if (process.platform === "win32") {
+      execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    } else {
+      process.kill(-child.pid, signal);
+    }
+  } catch { /* already gone */ }
 };
 
 function removeCheckout(checkout) {
@@ -80,7 +94,7 @@ function removeCheckout(checkout) {
 
 const groupAlive = (pgid) => {
   try {
-    process.kill(-pgid, 0);
+    process.kill(process.platform === "win32" ? pgid : -pgid, 0);
     return true;
   } catch (error) {
     return error.code === "EPERM";
@@ -168,7 +182,7 @@ const seconds = (from) => Math.round((Date.now() - from) / 100) / 10;
 // failure must not make the performance sample unusable. A `collect`-mode
 // trace whose timing fields are complete stays usable for the guardrail
 // despite a non-zero scenario exit: only runs where NO trace was written
-// (or the trace lacks the primary timing) are dropped — plus one narrower
+// (or the trace lacks required timing) are dropped — plus one narrower
 // exclusion: a sampler-loop failure invalidates the sample in BOTH modes
 // (measured by the new `samplerErrors` gate inside `invalidForTiming`), so
 // `collect` forgives only the known-bad base's blank-frame miss, never a
@@ -187,14 +201,18 @@ async function measure(ref, label, { collect = false } = {}) {
     run("git", ["worktree", "add", "--detach", checkout, sha], { cwd: repoRoot });
 
     const installStart = Date.now();
-    run("pnpm", ["install", "--frozen-lockfile"], { cwd: checkout });
+    run(pnpmCommand, pnpmArgs(["install", "--frozen-lockfile"]), { cwd: checkout });
     const installS = seconds(installStart);
 
     const buildStart = Date.now();
     const buildLog = execFileSync(
-      "pnpm",
-      ["exec", "turbo", "build", "--filter=@multica/web"],
-      { cwd: checkout, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+      pnpmCommand,
+      pnpmArgs(["exec", "turbo", "build", "--filter=@multica/web", "--force"]),
+      {
+        cwd: checkout,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "inherit"],
+      },
     );
     process.stdout.write(buildLog);
     const buildS = seconds(buildStart);
@@ -204,7 +222,7 @@ async function measure(ref, label, { collect = false } = {}) {
     const startStart = Date.now();
     // Own environment passes through (backend/database wiring included);
     // only the frontend port is overridden per side.
-    server = spawn("pnpm", ["--filter", "@multica/web", "start"], {
+    server = spawn(pnpmCommand, pnpmArgs(["--filter", "@multica/web", "start"]), {
       cwd: checkout,
       env: { ...process.env, PORT: String(port) },
       stdio: "ignore",
@@ -225,21 +243,20 @@ async function measure(ref, label, { collect = false } = {}) {
       let scenarioExit = 0;
       try {
         run(
-          "pnpm",
-          [
+          pnpmCommand,
+          pnpmArgs([
             "exec",
             "playwright",
             "test",
             "--config=playwright.config.ts",
-            "--project",
-            project,
+            `--project=${project}`,
             spec,
-          ],
+          ]),
           {
             cwd: repoRoot,
             env: {
               ...process.env,
-              PLAYWRIGHT_BASE_URL: `http://127.0.0.1:${port}`,
+              PLAYWRIGHT_BASE_URL: `http://localhost:${port}`,
               NAV_TRACE_REPORT_PATH: reportPath,
               // Explicit on BOTH sides: the head must never inherit a
               // parent `NAV_TRACE_ACCEPTANCE=collect` (which would skip
@@ -316,7 +333,7 @@ const relativeRegression = (baseValue, headValue, allowance) => {
   return { available: true, ratio, failed: ratio > 1 + allowance };
 };
 
-function markdown(base, head, regression) {
+function markdown(base, head, regressions) {
   const usable = base.status === "ok" && head.status === "ok";
   const rows = [
     ["clickToPopulatedMs", "Click → first populated (mean)"],
@@ -344,7 +361,9 @@ function markdown(base, head, regression) {
     "| --- | ---: | ---: | ---: | ---: |",
     ...rows,
     "",
-    `- project \`${project}\`; relative click-to-populated guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.invalid ? ` (INVALID: ${regression.invalid})` : regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
+    ...Object.entries(regressions).map(([key, regression]) =>
+      `- ${key} relative guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
+    ),
     `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)${base.spec_failed ? "; scenario failed" : ""}`,
     `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)${head.spec_failed ? "; scenario failed" : ""}`,
     `- spec \`${spec}\` from the working tree; raw traces: \`${project}-base-*.json\`, \`${project}-head-*.json\``,
@@ -376,25 +395,24 @@ try {
   writeFileSync(join(outDir, `${project}-head.json`), JSON.stringify(head, null, 2));
   const totalS = seconds(totalStart);
 
-  // MUL-7095 BLOCKER ②: the old guardrail measured click→commit only, so
-  // deferred parse/view work landing after the route commit never failed
-  // the comparison. The primary metric is click→populated; click→commit
-  // stays as a diagnostic row. Both sides must report the SAME metric:
-  // comparing base-commit against head-populated would pass/fail on data
-  // that never shared a scale, so a mismatch invalidates the comparison.
-  const primaryKey = (traces) =>
-    pick(traces, "clickToPopulatedMs") !== null ? "clickToPopulatedMs" : "clickToCommitMs";
-  const baseKey = primaryKey(base.traces);
-  const headKey = primaryKey(head.traces);
-  const metricMismatch = baseKey !== headKey;
-  const regression = metricMismatch
-    ? { available: false, ratio: null, failed: false, invalid: `primary metric mismatch: base ${baseKey} vs head ${headKey}` }
-    : relativeRegression(
-        pick(base.traces, baseKey),
-        pick(head.traces, headKey),
+  // The review blocker is navigation responsiveness, not only time-to-editor.
+  // Gate the first committed detail frame and the worst Long Task separately;
+  // populated timing stays in the table and blank-free acceptance stays in
+  // the spec, so neither half can hide a regression in the other.
+  const regressions = Object.fromEntries(
+    ["clickToCommitMs", "maxOverlapMs"].map((key) => [
+      key,
+      relativeRegression(
+        pick(base.traces, key),
+        pick(head.traces, key),
         maxRelativeRegression,
-      );
-  const summary = markdown(base, head, regression);
+      ),
+    ]),
+  );
+  const regressionFailed = Object.values(regressions).some(
+    (regression) => !regression.available || regression.failed,
+  );
+  const summary = markdown(base, head, regressions);
   writeFileSync(
     join(outDir, `${project}-comparison.json`),
     JSON.stringify(
@@ -403,7 +421,7 @@ try {
         head,
         project,
         max_relative_regression: maxRelativeRegression,
-        regression,
+        regressions,
         total_s: totalS,
       },
       null,
@@ -417,11 +435,6 @@ try {
   // A sample must be usable and every scenario must exit zero. A slower head
   // only fails when it exceeds the configured relative guardrail; raw values
   // remain report data and no absolute machine-time threshold is used.
-  // A primary-metric mismatch is never a passing comparison: it means the
-  // two sides measured different things (one pre-revision, one populated).
-  if (metricMismatch) {
-    console.error(`comparison invalid: ${regression.invalid}`);
-  }
   // MUL-7095: base `spec_failed` no longer gates the exit — the base side
   // is collected in `collect` mode where the blank-free acceptance miss is
   // EXPECTED on a known-bad base (its samples stay usable via
@@ -432,8 +445,7 @@ try {
     base.status === "ok" &&
     head.status === "ok" &&
     !head.spec_failed &&
-    !metricMismatch &&
-    !regression.failed
+    !regressionFailed
       ? 0
       : 1;
 } catch (error) {

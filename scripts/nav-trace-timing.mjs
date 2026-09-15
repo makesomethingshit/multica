@@ -2,8 +2,8 @@
  * MUL-7095: timing-sample validity shared by the runner and its unit pin.
  *
  * A trace is timing-usable only when its full content matches the common
- * spec assertions (ordering invariant, populated+initialized sample,
- * primary metric) AND the sampler loop itself stayed healthy.
+ * spec assertions (ordering invariant and populated+initialized sample)
+ * AND the sampler loop itself stayed healthy.
  *
  * `collect` mode (base side) forgives ONLY the known-bad base's
  * blank-frame acceptance miss — a sampler-loop failure invalidates the
@@ -21,7 +21,7 @@ export const invalidForTiming = (entry) => {
   if (!Array.isArray(trace.samplerErrors) || trace.samplerErrors.length > 0)
     return true;
   // Common spec assertions (both modes): the full ordering invariant,
-  // a populated+initialized sample, and the primary metric.
+  // a populated+initialized sample, and both navigation timings.
   if (typeof trace.clickT !== "number") return true;
   if (typeof trace.firstDetailCommitT !== "number") return true;
   if (typeof trace.firstHostT !== "number") return true;
