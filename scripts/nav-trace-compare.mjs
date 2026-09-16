@@ -22,7 +22,12 @@
  * overlapping Long Task. Guardrails are ratios, never machine-specific
  * millisecond thresholds. Populated timing remains correctness/diagnostic data.
  *
- *   node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N] [--project chromium|webkit] [--max-regression R]
+ * Chromium only: the comparison drives `playwright.config.ts`, whose project
+ * matrix is Chromium, so `--project` accepts `chromium` and nothing else.
+ * WebKit is not an A/B axis here — its acceptance is owned by the scoped gate
+ * in `playwright.webkit.config.ts` (`scripts/check.sh` step [6/6]).
+ *
+ *   node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N] [--project chromium] [--max-regression R]
  */
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "node:fs";
@@ -58,11 +63,11 @@ const maxRelativeRegression = Number(
 const outDir = resolve(flag("out", join(repoRoot, "nav-trace-report")));
 if (
   !baseRef ||
-  !["chromium", "webkit"].includes(project) ||
+  project !== "chromium" ||
   !Number.isFinite(maxRelativeRegression) ||
   maxRelativeRegression < 0
 ) {
-  console.error("usage: node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N] [--project chromium|webkit] [--max-regression R]");
+  console.error("usage: node scripts/nav-trace-compare.mjs --base <ref> [--head <ref>] [--out <dir>] [--repeats N] [--project chromium] [--max-regression R]");
   process.exit(2);
 }
 
