@@ -102,75 +102,6 @@ function normalizeEditorMarkdown(editor: Editor): string {
   return normalizeMarkdown(editor.getMarkdown());
 }
 
-// MUL-7095 mount attribution: `performance.mark/measure` spans around the
-// deferred mount phases (chunk parse, view construction, fallback dispatch,
-// repair, baseline) so the navigation-trace A/B can attribute the
-// click-to-commit window without a second renderer. Measurement-only: safe
-// no-ops outside the browser and never throws into the editor lifecycle.
-function markMountPhase(name: string): void {
-  try {
-    if (
-      typeof performance !== "undefined" &&
-      typeof performance.mark === "function"
-    ) {
-      performance.mark(name);
-    }
-  } catch {
-    // A failed mark must never break editor creation.
-  }
-}
-
-function measureMountPhase(
-  name: string,
-  startMark: string,
-  endMark: string,
-): void {
-  // No per-measure `clearMarks` here: `mul7095-mount-start` is reused by
-  // both `mul7095-create-view` and `mul7095-mount-total`, so clearing on
-  // first use silently dropped the total (measure threw into the catch).
-  // Marks live until `clearMountMarks` at the end of `onMount` instead.
-  try {
-    if (
-      typeof performance !== "undefined" &&
-      typeof performance.measure === "function"
-    ) {
-      performance.measure(name, startMark, endMark);
-    }
-  } catch {
-    // A failed measure must never break editor creation.
-  }
-}
-
-/** Drop the mount-attribution marks once `onMount` has measured them all.
- *  Called once per mount (never per measure) so a mark reused across two
- *  spans survives until its last consumer. Measurement-only. */
-function clearMountMarks(): void {
-  try {
-    if (
-      typeof performance !== "undefined" &&
-      typeof performance.clearMarks === "function"
-    ) {
-      for (const mark of [
-        "mul7095-before-create-start",
-        "mul7095-chunk-parse-start",
-        "mul7095-chunk-parse-end",
-        "mul7095-mount-start",
-        "mul7095-mount-dispatch-start",
-        "mul7095-mount-dispatch-end",
-        "mul7095-mount-repair-start",
-        "mul7095-mount-repair-end",
-        "mul7095-mount-baseline-start",
-        "mul7095-mount-baseline-end",
-        "mul7095-mount-end",
-      ]) {
-        performance.clearMarks(mark);
-      }
-    }
-  } catch {
-    // Clearing must never break editor creation.
-  }
-}
-
 /** True when any node in the document is mid-upload (`attrs.uploading`). The
  *  `return !found` early-out matches the original inline scans verbatim: in
  *  ProseMirror it only stops descending into the matched node's subtree (not
@@ -293,11 +224,6 @@ interface ContentEditorBaseProps {
    * before the modal closes.
    */
   flushPendingOnUnmount?: boolean;
-  /**
-   * Create the ProseMirror view during the first client render. Opt-in
-   * only; existing editor hosts keep deferred creation by default.
-   */
-  eagerClientRender?: boolean;
   /**
    * Called once the initial document is usable in the connected editor DOM.
    * This also waits for the client commit when hydrating. Readonly-first
@@ -460,7 +386,6 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       quickActionMenu,
       attachments,
       flushPendingOnUnmount = false,
-      eagerClientRender = false,
       onReady,
     },
     ref,
@@ -659,14 +584,14 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     const mountChunked = initialContent.length > MARKDOWN_CHUNK_THRESHOLD;
 
     const editor = useEditor({
-      // Keep deferred creation as the default for existing hosts. Explicit
-      // eager opt-ins remain available for hydration-sensitive test hosts.
-      immediatelyRender: eagerClientRender && typeof window !== "undefined",
+      // The populated-first strategy depends on this: the initial document is
+      // committed before Tiptap's create task (see onMount), so the first frame
+      // already shows content. Creating the view during render instead makes
+      // the first click/drop race the editor's own setup (MUL-7095).
+      immediatelyRender: false,
       // Explicit for clarity — the real perf win is useEditorState in BubbleMenu.
       shouldRerenderOnTransaction: false,
       onBeforeCreate: ({ editor: ed }) => {
-        markMountPhase("mul7095-before-create-start");
-        markMountPhase("mul7095-chunk-parse-start");
         if (mountChunked) {
           const manager = (
             ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
@@ -676,27 +601,13 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
             preparedInitialJsonRef.current = true;
           }
         }
-        markMountPhase("mul7095-chunk-parse-end");
-        measureMountPhase(
-          "mul7095-chunk-parse",
-          "mul7095-chunk-parse-start",
-          "mul7095-chunk-parse-end",
-        );
       },
       onMount: ({ editor: ed }) => {
-        markMountPhase("mul7095-mount-start");
-        // View construction between beforeCreate and mount (createView).
-        measureMountPhase(
-          "mul7095-create-view",
-          "mul7095-before-create-start",
-          "mul7095-mount-start",
-        );
         if (mountChunked && !preparedInitialJsonRef.current) {
           // Fallback when the markdown manager was unavailable before create.
           const manager = (
             ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
           ).markdown?.manager;
-          markMountPhase("mul7095-mount-dispatch-start");
           if (manager) {
             ed.commands.setContent(
               parseMarkdownChunked(manager, initialContent),
@@ -710,43 +621,14 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
               contentType: "markdown",
             });
           }
-          markMountPhase("mul7095-mount-dispatch-end");
-          measureMountPhase(
-            "mul7095-mount-dispatch",
-            "mul7095-mount-dispatch-start",
-            "mul7095-mount-dispatch-end",
-          );
         }
         // Normalize the populated view and establish the save baseline before
         // it accepts input. The later create task must not reset either one.
         // A markdown draft ending in an empty list item (e.g. `"1. \n\n"` left
         // after typing `1.`) parses into a caretless, schema-invalid item;
         // repair it so the mounted editor has a real cursor in the list.
-        markMountPhase("mul7095-mount-repair-start");
         repairEmptyListItems(ed);
-        markMountPhase("mul7095-mount-repair-end");
-        measureMountPhase(
-          "mul7095-mount-repair",
-          "mul7095-mount-repair-start",
-          "mul7095-mount-repair-end",
-        );
-        markMountPhase("mul7095-mount-baseline-start");
         lastEmittedRef.current = normalizeEditorMarkdown(ed);
-        markMountPhase("mul7095-mount-baseline-end");
-        measureMountPhase(
-          "mul7095-mount-baseline",
-          "mul7095-mount-baseline-start",
-          "mul7095-mount-baseline-end",
-        );
-        markMountPhase("mul7095-mount-end");
-        measureMountPhase(
-          "mul7095-mount-total",
-          "mul7095-mount-start",
-          "mul7095-mount-end",
-        );
-        // Drop the attribution marks only after every span above consumed
-        // them (`mul7095-mount-start` feeds both create-view and total).
-        clearMountMarks();
       },
       onCreate: ({ editor: ed }) => {
         if (focusOnReadyRef.current) {

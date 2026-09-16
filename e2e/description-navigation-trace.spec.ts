@@ -417,14 +417,6 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         // have gone dark at that frame (an empty array is the healthy
         // case and keeps the report schema backward compatible).
         samplerErrors: window.__navSamplerErrors ?? [],
-        mountPhases: performance
-          .getEntriesByType("measure")
-          .filter(
-            (entry) =>
-              entry.name.startsWith("mul7095-") &&
-              (clickT === null || entry.startTime >= clickT),
-          )
-          .map((entry) => ({ name: entry.name, duration: entry.duration })),
       };
     });
 

@@ -181,7 +181,6 @@ vi.mock("../../editor", async () => ({
       onUpdate,
       placeholder,
       flushPendingOnUnmount,
-      eagerClientRender,
       onReady,
       selectionAction,
     }: any,
@@ -250,7 +249,6 @@ vi.mock("../../editor", async () => ({
         placeholder={placeholder}
         data-testid="rich-text-editor"
         data-flush-on-unmount={flushPendingOnUnmount ? "true" : undefined}
-        data-eager-client-render={eagerClientRender ? "true" : undefined}
       />
     );
   }),
@@ -952,17 +950,6 @@ describe("IssueDetail (shared)", () => {
 
     const description = await screen.findByDisplayValue("Add JWT auth to the backend");
     expect(description).toHaveAttribute("data-flush-on-unmount", "true");
-  });
-
-  it("keeps the description editor on the deferred default (no eager client render)", async () => {
-    // MUL-7095 Revision 3: IssueDetail must not opt the description into
-    // eager client rendering — synchronous ProseMirror construction in the
-    // route render regresses navigation. The deferred default keeps one
-    // continuously mounted editor per issue (see the remount test below).
-    renderIssueDetail();
-
-    const description = await screen.findByDisplayValue("Add JWT auth to the backend");
-    expect(description).not.toHaveAttribute("data-eager-client-render");
   });
 
   // MUL-7095: the wrapper owns the pre-instance click window. These fire a

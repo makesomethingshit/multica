@@ -233,13 +233,10 @@ describe("ContentEditor", () => {
     expect(mockFocus).not.toHaveBeenCalled();
   });
 
-  it("keeps client rendering deferred unless a host explicitly opts in", () => {
-    const defaultEditor = render(<ContentEditor value="Deferred by default." />);
-    expect(latestEditorOptions.current?.immediatelyRender).toBe(false);
+  it("always defers view creation past the first render", () => {
+    render(<ContentEditor value="Deferred by default." />);
 
-    defaultEditor.unmount();
-    render(<ContentEditor value="Eager issue description." eagerClientRender />);
-    expect(latestEditorOptions.current?.immediatelyRender).toBe(true);
+    expect(latestEditorOptions.current?.immediatelyRender).toBe(false);
   });
 
   it("syncs editor content when value changes externally and editor is unfocused", () => {
