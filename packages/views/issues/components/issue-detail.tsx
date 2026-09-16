@@ -1979,6 +1979,9 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   }, [highlightCommentId, highlightRequestToken, id, writeViewState, items, targetIdx, scrollContainerEl, replyToRoot, expandedResolved, timelineView, toggleResolvedExpand]);
 
   const descEditorRef = useRef<ContentEditorRef>(null);
+  const [descriptionReadyIssueId, setDescriptionReadyIssueId] = useState<
+    string | null
+  >(null);
   const descriptionEditingRef = useRef(false);
   const descriptionSaveInFlightRef = useRef(false);
   const descriptionSaveIssueIdRef = useRef(id);
@@ -2205,7 +2208,11 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   useIssueDetailScrollRestore({
     restoreKey: `${wsId}:${id}`,
     scrollContainerEl,
-    ready: !!issue && !loading && !timelineLoading,
+    ready:
+      !!issue &&
+      !loading &&
+      !timelineLoading &&
+      descriptionReadyIssueId === id,
     // Disabled only while the comment deep link still has a landing to run —
     // the jump owns the scroll then. Once the landing is consumed (a tab
     // switch back), this hook's retry loop IS the restore: the one-shot
@@ -3103,6 +3110,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                 currentIssueId={id}
                 selectionAction={descriptionSelectionAction}
                 attachments={descEditorAttachments}
+                onReady={() => setDescriptionReadyIssueId(id)}
               />
             </div>
 

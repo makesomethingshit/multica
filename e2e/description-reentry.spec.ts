@@ -146,7 +146,7 @@ test.describe("#8083 description initialization", () => {
     const description = page.getByTestId("issue-description");
     const list = page.locator(`a[href="/${slug}/issues"]`).first();
     const open = async (id: string) => {
-      await page.locator(`a[href$="/issues/${id}"]`).first().click();
+      await page.locator(`a[href$="/issues/${id}"]:visible`).first().click();
       await expect(description.locator(".ProseMirror")).toBeVisible({ timeout: 30000 });
     };
     const leaveDetail = async () => {
@@ -257,7 +257,7 @@ test.describe("#8083 description initialization", () => {
     });
     const slug = await loginAsDefault(page);
     await reloadAppPage(page);
-    await page.locator(`a[href$="/issues/${issue.id}"]`).first().click();
+    await page.locator(`a[href$="/issues/${issue.id}"]:visible`).first().click();
     const host = page.getByTestId("issue-description");
     const editor = host.locator(".ProseMirror");
     await expect(editor).toBeVisible();
@@ -334,7 +334,8 @@ test.describe("#8083 description initialization", () => {
       return !uploading && editor.getMarkdown().includes("first-drop.txt");
     });
     await page.locator(`a[href="/${slug}/issues"]`).first().click();
-    await page.locator(`a[href$="/issues/${issue.id}"]`).first().click();
+    await expect(page.getByTestId("issue-description")).toBeHidden();
+    await page.locator(`a[href$="/issues/${issue.id}"]:visible`).first().click();
     await expect(page.getByTestId("issue-description")).toBeVisible();
     await expect(page.getByTestId("issue-description")).toContainText("FIRSTEDIT");
     await expect(page.getByTestId("issue-description")).toContainText("first-drop.txt");
