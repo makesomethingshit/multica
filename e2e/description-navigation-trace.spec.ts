@@ -28,6 +28,12 @@ import type { TestApiClient } from "./fixtures";
  *   after this navigation's commit (`firstHostT`);
  * - first frame containing populated description content (`.ProseMirror`
  *   with non-empty text, at or after commit, `firstPopulatedT`);
+ * - pre-click state of the target surface (`preClickTextLength`): the
+ *   `.ProseMirror` text length at arm time, before the click. A non-zero
+ *   value means the surface was already mounted and populated, which forces
+ *   `firstPopulatedT` onto the commit frame and collapses
+ *   `clickToPopulatedMs` onto `clickToCommitMs`. It is the auditable
+ *   marker for that warm-retained condition, not a second timing signal.
  * - editor `isInitialized` at each sample;
  * - Long Tasks clipped to [click, first populated] (falls back to first
  *   commit only when the populated mark never fires — such a run fails the
@@ -41,7 +47,9 @@ import type { TestApiClient } from "./fixtures";
  * (`navigation-trace`) and, when `NAV_TRACE_REPORT_PATH` is set, to that
  * file for ref-to-ref A/B runners. Ordering is the only in-spec invariant:
  * `clickT < firstDetailCommitT <= firstHostT <= firstPopulatedT`, plus one
- * populated initialized sample and both commit/populated timings.
+ * populated initialized sample taken at or after the commit (an unqualified
+ * `some(...)` would be satisfied by a retained surface's pre-click frames)
+ * and both commit/populated timings.
  * A/B verdicts are relative guardrails applied outside this spec via
  * scripts/nav-trace-compare.mjs (base vs head vs revised, same fixture +
  * environment).
@@ -107,6 +115,7 @@ declare global {
     __navFirstDetailCommitT: number | null;
     __navFirstHostT: number | null;
     __navFirstPopulatedT: number | null;
+    __navPreClickTextLength: number | null;
     __navSamplerErrors: Array<{ t: number; message: string }>;
     __startNavRecording: (targetId: string) => void;
     __armNavRecording: (targetId: string) => void;
@@ -172,6 +181,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       window.__navFirstDetailCommitT = null;
       window.__navFirstHostT = null;
       window.__navFirstPopulatedT = null;
+      window.__navPreClickTextLength = null;
       window.__navSamplerErrors = [];
       // Started pre-click with buffered:true so tasks straddling navigation
       // are still observed; only the intersection with [click, first
@@ -275,6 +285,21 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       // billed to click-to-commit or its LongTask window. Arming is
       // idempotent per navigation and scoped to the target href.
       window.__armNavRecording = (targetId: string) => {
+        // Snapshot the target surface BEFORE the click. On a retained
+        // surface the description is already mounted (hidden) here, so the
+        // populated mark can only land on the commit frame; a non-zero
+        // length makes that degenerate case auditable in the report.
+        const want = `main:${targetId}`;
+        const rootAtArm =
+          Array.from(
+            document.querySelectorAll<HTMLElement>("[data-tab-scroll-root]"),
+          ).find(
+            (candidate) =>
+              candidate.getAttribute("data-tab-scroll-root") === want,
+          ) ?? null;
+        window.__navPreClickTextLength =
+          rootAtArm?.querySelector<HTMLElement>(".ProseMirror")?.textContent
+            ?.length ?? null;
         window.__navSamples = [];
         window.__navSamplerErrors = [];
         window.__navTargetId = targetId;
@@ -416,6 +441,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         firstDetailCommitT: firstCommit,
         firstHostT: window.__navFirstHostT,
         firstPopulatedT: firstPopulated,
+        preClickTextLength: window.__navPreClickTextLength,
         samples: window.__navSamples,
         overlappingLongTasks: overlapping,
         maxOverlapMs: overlapping.reduce(
@@ -486,10 +512,15 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     expect(trace.firstPopulatedT!).toBeGreaterThanOrEqual(
       trace.firstHostT!,
     );
-    // At least one populated sample with an initialized editor.
+    // At least one populated sample with an initialized editor, taken at or
+    // after this navigation's commit. Pre-click samples are excluded on
+    // purpose: a retained surface is already mounted and populated before
+    // the click, so an unqualified `some(...)` would be satisfied by frames
+    // that predate the navigation and prove nothing about it.
     expect(
       trace.samples.some(
-        (s: NavSample) => s.populated && s.editorInitialized === true,
+        (s: NavSample) =>
+          s.detailCommitted && s.populated && s.editorInitialized === true,
       ),
     ).toBe(true);
     // Blank-free requirement (head acceptance ONLY): once the target
