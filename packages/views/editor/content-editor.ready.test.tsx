@@ -74,26 +74,6 @@ describe("ContentEditor initial document (real Tiptap)", () => {
     expect(onUpdate).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("FIRSTEDIT"), long);
   });
 
-  it("reuses the parsed large document on cached re-entry", async () => {
-    vi.useFakeTimers();
-    const parse = vi.spyOn(MarkdownManager.prototype, "parse");
-    const cachedReentryLong = `${long}\n\nCached re-entry sentinel.`;
-    const first = render(
-      host(<ContentEditor value={cachedReentryLong} showBubbleMenu={false} eagerClientRender />),
-    );
-    await act(() => vi.advanceTimersByTimeAsync(1));
-    first.unmount();
-    const parsedOnce = parse.mock.calls.length;
-
-    render(
-      host(<ContentEditor value={cachedReentryLong} showBubbleMenu={false} eagerClientRender />),
-    );
-    await act(() => vi.advanceTimersByTimeAsync(1));
-
-    expect(parse).toHaveBeenCalledTimes(parsedOnce);
-    expect(mountedEditor().getMarkdown()).toContain("Cached re-entry sentinel.");
-  });
-
   it("retains the first upload inserted before create", async () => {
     vi.useFakeTimers();
     const ref = createRef<ContentEditorRef>();

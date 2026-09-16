@@ -102,24 +102,6 @@ function normalizeEditorMarkdown(editor: Editor): string {
   return normalizeMarkdown(editor.getMarkdown());
 }
 
-// Cached re-entry is the hot path for MUL-7095. Keep only the most recently
-// parsed large document: enough to skip its next navigation-critical parse
-// without turning editor documents into another application cache.
-let lastChunkedMarkdown = "";
-let lastChunkedDocument: ReturnType<typeof parseMarkdownChunked> | null = null;
-
-function parseInitialMarkdown(
-  manager: MarkdownManagerLike,
-  markdown: string,
-): ReturnType<typeof parseMarkdownChunked> {
-  if (markdown === lastChunkedMarkdown && lastChunkedDocument) {
-    return lastChunkedDocument;
-  }
-  lastChunkedMarkdown = markdown;
-  lastChunkedDocument = parseMarkdownChunked(manager, markdown);
-  return lastChunkedDocument;
-}
-
 // MUL-7095 mount attribution: `performance.mark/measure` spans around the
 // deferred mount phases (chunk parse, view construction, fallback dispatch,
 // repair, baseline) so the navigation-trace A/B can attribute the
@@ -690,7 +672,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
             ed.storage as { markdown?: { manager?: MarkdownManagerLike } }
           ).markdown?.manager;
           if (manager) {
-            ed.options.content = parseInitialMarkdown(manager, initialContent);
+            ed.options.content = parseMarkdownChunked(manager, initialContent);
             preparedInitialJsonRef.current = true;
           }
         }
