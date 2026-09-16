@@ -3,11 +3,15 @@ import { defineConfig } from "@playwright/test";
 
 /**
  * MUL-7095 / PR #8092: WebKit first-edit and drop determinism is a merge
- * blocker for the description startup specs (10 consecutive clean passes),
+ * blocker for `description-reentry.spec.ts` (10 consecutive clean passes),
  * but it is not a second axis for the whole suite. The default config stays
  * Chromium-only so a bare `playwright test` neither doubles the canonical
  * suite nor starts requiring a browser CI does not install; WebKit runs from
- * this config, scoped to those specs.
+ * this config, scoped to that spec.
+ *
+ * `description-navigation-trace.spec.ts` is deliberately NOT matched here:
+ * it is a Long Tasks API recorder (`PerformanceObserver` `longtask`), an
+ * entry type WebKit does not implement, so its acceptance is Chromium-only.
  *
  *   pnpm exec playwright test --config=playwright.webkit.config.ts
  *
@@ -17,7 +21,7 @@ import { defineConfig } from "@playwright/test";
  */
 export default defineConfig({
   testDir: "./e2e",
-  testMatch: /description-(reentry|navigation-trace)\.spec\.ts/,
+  testMatch: /description-reentry\.spec\.ts/,
   timeout: 60000,
   workers: 1,
   retries: 0,

@@ -5,6 +5,11 @@ import type { TestApiClient } from "./fixtures";
 /**
  * MUL-7095 / PR #8092 Revision 3 — navigation performance recorder.
  *
+ * Chromium only: the Long Tasks API (`PerformanceObserver` `longtask`) is
+ * not implemented in WebKit, so `playwright.webkit.config.ts` does not match
+ * this spec. It also asserts that support before measuring, so an engine
+ * without it fails loudly instead of reporting an empty, clean-looking 0 ms.
+ *
  * §0-A requirement: measurement must begin BEFORE issue navigation (at link
  * activation), not once the description host already exists. This spec
  * records, per navigation:
@@ -302,6 +307,19 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
   test("click-to-commit navigation trace with clipped Long Tasks", async ({
     page,
   }, testInfo) => {
+    // Refuse to measure without the API this recorder is built on. The
+    // Long Task list is empty on an engine that does not implement
+    // `longtask`, and an empty list reads as a perfect 0 ms overlap — the
+    // trace would pass as clean data instead of failing. Check the entry
+    // type up front so the failure names the missing API.
+    const longTaskSupported = await page.evaluate(() =>
+      (PerformanceObserver.supportedEntryTypes ?? []).includes("longtask"),
+    );
+    expect(
+      longTaskSupported,
+      "This spec needs the Long Tasks API (PerformanceObserver 'longtask'), which WebKit does not implement — run it on Chromium.",
+    ).toBe(true);
+
     const a = await api.createIssue(`E2E Nav A ${Date.now()}`, {
       description: LONG_BODY,
     });

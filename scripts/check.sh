@@ -135,11 +135,14 @@ echo "==> [5/6] E2E tests (Playwright, chromium)..."
 pnpm exec playwright test || { EXIT_CODE=1; exit 1; }
 
 # --------------------------------------------------------------------------
-# Step 6: E2E tests (Playwright, webkit — MUL-7095 description startup specs)
+# Step 6: E2E tests (Playwright, webkit — MUL-7095 description-reentry spec)
 #
 # WebKit is deliberately outside the default project matrix: it is a gate for
-# first-edit/drop determinism on the description specs only, not a second axis
-# for every spec, and it needs its own browser install:
+# re-entry/geometry/scroll plus first-edit/drop determinism on
+# `e2e/description-reentry.spec.ts` only, not a second axis for every spec.
+# `e2e/description-navigation-trace.spec.ts` stays Chromium-only (its Long
+# Tasks API recorder has no WebKit entry type), so the webkit config does not
+# match it. WebKit needs its own browser install:
 #   pnpm exec playwright install --with-deps webkit
 # --------------------------------------------------------------------------
 echo ""

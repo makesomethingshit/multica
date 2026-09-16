@@ -17,7 +17,7 @@ export default defineConfig({
   // the canonical suite once, and this repo's Playwright browsers are
   // installed Chromium-only (.github/workflows/ui-performance.yml). WebKit is
   // a separate, explicitly invoked config (`playwright.webkit.config.ts`)
-  // scoped to the MUL-7095 description startup specs.
+  // scoped to the MUL-7095 description re-entry spec.
   projects: [
     {
       name: "chromium",
