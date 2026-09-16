@@ -209,8 +209,9 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
           // Pre-click frames (clickT null, or now < clickT) never count,
           // even if a rAF fired between arming and the actual click.
           const clicked = window.__navClickT !== null;
+          const visible = (targetRoot?.getClientRects().length ?? 0) > 0;
           const committed =
-            clicked && now >= (window.__navClickT as number) && targetRoot !== null;
+            clicked && now >= (window.__navClickT as number) && visible;
           // Host is resolved independently inside the TARGET root — head's
           // testid div, else the structurally identical drop-zone container
           // on base/main — never via `.ProseMirror.closest(...)`, so a
@@ -333,8 +334,12 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     await expect(surface().locator(".ProseMirror")).toBeVisible({
       timeout: 30000,
     });
+    const retainedToken = crypto.randomUUID();
+    await surface().evaluate((node, token) => {
+      node.setAttribute("data-nav-retained-token", token);
+    }, retainedToken);
     await list.click();
-    await expect(surface()).toHaveCount(0);
+    await expect(surface()).toBeHidden();
 
     // Measured navigation: arm the recorder, then click. The click stamp
     // lands at the target link's own click event (target-locked), so the
@@ -344,6 +349,8 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     await expect(surface().locator(".ProseMirror")).toBeVisible({
       timeout: 30000,
     });
+    const retainedSurface =
+      (await surface().getAttribute("data-nav-retained-token")) === retainedToken;
     // Wait until the populated editor reports initialized so the trace
     // covers the full startup path, not just the first commit.
     await editorReady();
@@ -410,6 +417,14 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
         // have gone dark at that frame (an empty array is the healthy
         // case and keeps the report schema backward compatible).
         samplerErrors: window.__navSamplerErrors ?? [],
+        mountPhases: performance
+          .getEntriesByType("measure")
+          .filter(
+            (entry) =>
+              entry.name.startsWith("mul7095-") &&
+              (clickT === null || entry.startTime >= clickT),
+          )
+          .map((entry) => ({ name: entry.name, duration: entry.duration })),
       };
     });
 
@@ -434,6 +449,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
       fixture: "navigation-trace-v1",
       acceptance,
       blankFrames: blankFrameCount,
+      retainedSurface,
     };
     await testInfo.attach("navigation-trace", {
       body: JSON.stringify(report, null, 2),
@@ -479,6 +495,7 @@ test.describe("MUL-7095 navigation performance (link-activation recorder)", () =
     expect(trace.samplerErrors).toEqual([]);
     if (acceptance === "accept") {
       expect(blankFrameCount).toBe(0);
+      expect(retainedSurface).toBe(true);
     }
     // In `collect` mode the count stays on the report as diagnosis only
     // and is never asserted — a blanking base still yields its sample.

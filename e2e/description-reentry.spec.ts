@@ -100,7 +100,12 @@ test.describe("#8083 description initialization", () => {
       window.descriptionFrames = [];
       window.recordDescription = false;
       function sample() {
-        const host = document.querySelector('[data-testid="issue-description"]');
+        // MUL-7095: the detail surface is retained (hidden) while the list
+        // is on screen, so a frame must record the VISIBLE surface — never a
+        // retained hidden one still holding the previous issue's document.
+        const host = Array.from(
+          document.querySelectorAll<HTMLElement>('[data-testid="issue-description"]'),
+        ).find((candidate) => candidate.getClientRects().length > 0);
         const editor = host?.querySelector<HTMLElement>(".ProseMirror");
         const image = host?.querySelector("img");
         const anchor = Array.from(editor?.querySelectorAll<HTMLElement>("h2") ?? [])
@@ -146,10 +151,10 @@ test.describe("#8083 description initialization", () => {
     };
     const leaveDetail = async () => {
       await list.click();
-      await expect(description).toHaveCount(0);
+      await expect(description).toBeHidden();
     };
     const captureReentry = async (id: string) => {
-      await expect(description).toHaveCount(0);
+      await expect(description).toBeHidden();
       await page.evaluate(() => {
         window.descriptionFrames = [];
         window.recordDescription = true;
@@ -330,6 +335,7 @@ test.describe("#8083 description initialization", () => {
     });
     await page.locator(`a[href="/${slug}/issues"]`).first().click();
     await page.locator(`a[href$="/issues/${issue.id}"]`).first().click();
+    await expect(page.getByTestId("issue-description")).toBeVisible();
     await expect(page.getByTestId("issue-description")).toContainText("FIRSTEDIT");
     await expect(page.getByTestId("issue-description")).toContainText("first-drop.txt");
   });
