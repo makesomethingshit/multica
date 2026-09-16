@@ -2,13 +2,15 @@
  * MUL-7095: timing-sample validity shared by the runner and its unit pin.
  *
  * A trace is timing-usable only when its full content matches the common
- * spec assertions (ordering invariant and populated+initialized sample)
- * AND the sampler loop itself stayed healthy.
+ * spec assertions (ordering invariant and populated+initialized sample),
+ * the sampler loop stayed healthy, and the scenario process exited zero.
  *
- * `collect` mode (base side) forgives ONLY the known-bad base's
- * blank-frame acceptance miss — a sampler-loop failure invalidates the
- * sample in BOTH modes, since a throw may have skipped exactly the frames
- * where a blank state would have been recorded.
+ * `collect` mode (base side) relaxes the ACCEPTANCE defects only:
+ * the spec itself skips the blank-frame and retained-surface assertions
+ * there, so the known-bad base still exits 0 in `collect` mode
+ * (measured: 5/5 repeats, nav-fix-r6). A non-zero exit is therefore never
+ * that expected miss, and it invalidates the sample in BOTH modes —
+ * exactly like a sampler-loop failure.
  *
  * @param entry runner repeat entry `{ scenario_exit, trace }`
  * @returns `true` when the sample must NOT count for the guardrail.
@@ -37,9 +39,10 @@ export const invalidForTiming = (entry) => {
     !trace.samples.some((s) => s.populated && s.editorInitialized === true)
   )
     return true;
-  if (entry.scenario_exit === 0) return false;
-  // Non-zero exit in `collect` mode is an acceptance miss on a side whose
-  // correctness is not under test — the timing sample still stands.
-  if (trace.acceptance === "collect") return false;
-  return true;
+  // Non-zero exit is not a usable sample in either mode. `collect` mode
+  // already skips the known-bad base's acceptance assertions and that base
+  // exits 0, so any non-zero exit is a failure outside the recorded status
+  // (assertion, teardown, worker) and must never turn a partial run into a
+  // measured sample.
+  return entry.scenario_exit !== 0;
 };

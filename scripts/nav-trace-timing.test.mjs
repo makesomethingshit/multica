@@ -3,8 +3,8 @@ import test from "node:test";
 
 import { invalidForTiming } from "./nav-trace-timing.mjs";
 
-// MUL-7095: pin sampler-error handling without breaking the
-// collect/accept split (Case 1~3 from the follow-up spec).
+// MUL-7095: pin sampler-error and exit-code handling across the
+// collect/accept split (Case 1~5 from the follow-up spec).
 const validTrace = () => ({
   status: "ok",
   acceptance: "accept",
@@ -28,8 +28,26 @@ test("Case 2: one sampler error invalidates even with perfect timing", () => {
   assert.equal(invalidForTiming({ scenario_exit: 0, trace }), true);
 });
 
-test("Case 3: collect + non-zero exit + empty errors keeps known-bad timing", () => {
+test("Case 3: collect mode does not forgive a non-zero exit", () => {
   const trace = validTrace();
   trace.acceptance = "collect";
-  assert.equal(invalidForTiming({ scenario_exit: 1, trace }), false);
+  assert.equal(invalidForTiming({ scenario_exit: 1, trace }), true);
+});
+
+// The known-bad base is still measured: it exits 0 in collect mode because
+// the spec skips the blank-frame and retained-surface assertions there
+// (measured 5/5, nav-fix-r6). Only that, never a failed process.
+test("Case 4: the known-bad base stays usable when its collect run exits 0", () => {
+  const trace = validTrace();
+  trace.acceptance = "collect";
+  trace.blankFrames = 2;
+  trace.retainedSurface = false;
+  assert.equal(invalidForTiming({ scenario_exit: 0, trace }), false);
+});
+
+test("Case 5: accept mode with a non-zero exit stays unusable", () => {
+  assert.equal(
+    invalidForTiming({ scenario_exit: 1, trace: validTrace() }),
+    true,
+  );
 });

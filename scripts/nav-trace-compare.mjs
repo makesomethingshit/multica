@@ -42,6 +42,13 @@ const headRef = flag("head", "HEAD");
 const spec = flag("spec", "e2e/description-navigation-trace.spec.ts");
 const repeats = Math.max(1, Number(flag("repeats", "1")) || 1);
 const project = flag("project", "chromium");
+// Default relative allowance and its measured basis (MUL-7095):
+// `--repeats 5` on the A/B fixture spreads 16.3% base-side and 4.5%
+// head-side for click-to-commit (nav-fix-r6), while a genuine regression
+// measured one-repeat-per-side reached 1.97x on click-to-commit and 1.53x
+// on maxOverlap (nav-final-chromium-r3). 25% clears the spread of the
+// repeated sampling this runner is meant to be run with and still fails the
+// smallest real regression observed. Run the comparison with `--repeats 5`.
 const maxRelativeRegression = Number(
   flag(
     "max-regression",
@@ -177,18 +184,15 @@ const seconds = (from) => Math.round((Date.now() - from) / 100) / 10;
 
 // MUL-7095: measurement vs acceptance split. The runner collects the base
 // side in `collect` mode (`NAV_TRACE_ACCEPTANCE=collect`), where the spec
-// skips the blank-free head-acceptance assertion but still records the
-// full timing trace. The known-bad base blanks by design; its correctness
-// failure must not make the performance sample unusable. A `collect`-mode
-// trace whose timing fields are complete stays usable for the guardrail
-// despite a non-zero scenario exit: only runs where NO trace was written
-// (or the trace lacks required timing) are dropped — plus one narrower
-// exclusion: a sampler-loop failure invalidates the sample in BOTH modes
-// (measured by the new `samplerErrors` gate inside `invalidForTiming`), so
-// `collect` forgives only the known-bad base's blank-frame miss, never a
-// broken measurement loop. The head side runs
-// the default `accept` mode, so
-// head acceptance failures (scenario exit ≠ 0) still exclude its samples.
+// skips the blank-frame and retained-surface acceptance assertions but
+// still records the full timing trace: the known-bad base blanks by
+// design, and that defect must not make its performance sample unusable.
+// The relaxation is scoped to exactly those acceptance defects. Sample
+// usability is decided by `invalidForTiming` from the timing content, the
+// sampler loop AND the process exit code, and it requires exit 0 in BOTH
+// modes — the collect run of the known-bad base exits 0 (measured 5/5 in
+// nav-fix-r6) — so a non-zero exit is a failure outside the recorded
+// status and can never count as a sample.
 async function measure(ref, label, { collect = false } = {}) {
   const sha = execFileSync("git", ["rev-parse", ref], { cwd: repoRoot }).toString().trim();
   const checkout = mkdtempSync(join(tmpdir(), `nav-trace-${label}-`));
@@ -277,25 +281,9 @@ async function measure(ref, label, { collect = false } = {}) {
       try {
         trace = JSON.parse(readFileSync(reportPath, "utf8"));
       } catch { /* no readable report for this repeat */ }
-      // MUL-7095: `collect`-mode traces (base side) skip the blank-free
-      // head-acceptance assertion by design, so their scenario exit is
-      // expected to be non-zero on a known-bad base. `invalidForTiming`
-      // (defined above `measure`) decides sample usability from the
-      // timing content + mode — not from the exit code alone — so what
-      // survives here as `ok` can still count for the guardrail there.
-      // Only `accept`-mode (`head`) keeps the old strict rule: an `ok`
-      // report from a failed process is not a sample.
-      if (
-        scenarioExit !== 0 &&
-        trace?.status === "ok" &&
-        trace?.acceptance !== "collect"
-      ) {
-        trace.status = "invalid";
-        trace.invalid = [
-          ...(trace.invalid ?? []),
-          `the scenario reported ok but its process exited ${scenarioExit}`,
-        ];
-      }
+      // No exit-code forgiveness here: invalidForTiming requires exit 0 in
+      // BOTH modes (the known-bad base exits 0 in collect mode), so the raw
+      // scenario_exit recorded below is the whole record.
       traces.push({ repeat: i, measure_s: measureS, scenario_exit: scenarioExit, trace });
     }
     const usable = traces.filter((t) => !invalidForTiming(t));
@@ -387,9 +375,10 @@ let exitCode = 1;
 let base;
 let head;
 try {
-  // The base side is collected in `collect` mode: its blank-free
-  // correctness failure must not void its timing samples. The head side
-  // runs `accept` mode, so head acceptance still gates the comparison.
+  // The base side is collected in `collect` mode: the spec skips the
+  // known-bad base's acceptance assertions there so its timing samples
+  // survive. Both sides still have to exit 0 (see invalidForTiming), and the
+  // head side runs accept mode, so head acceptance stays part of the gate.
   base = await measure(baseRef, "base", { collect: true });
   writeFileSync(join(outDir, `${project}-base.json`), JSON.stringify(base, null, 2));
   head = await measure(headRef, "head");
@@ -436,15 +425,14 @@ try {
   // A sample must be usable and every scenario must exit zero. A slower head
   // only fails when it exceeds the configured relative guardrail; raw values
   // remain report data and no absolute machine-time threshold is used.
-  // MUL-7095: base `spec_failed` no longer gates the exit — the base side
-  // is collected in `collect` mode where the blank-free acceptance miss is
-  // EXPECTED on a known-bad base (its samples stay usable via
-  // `invalidForTiming`). Only head acceptance failures fail the run.
-  // `base.status` still gates: with zero timing-usable base samples there
-  // is no baseline to compare against.
+  // MUL-7095: neither side is exempt from the exit-zero rule — collect mode
+  // relaxes acceptance defects only, and the known-bad base still exits 0
+  // there. `base.status` additionally gates: with zero timing-usable base
+  // samples there is no baseline to compare against.
   exitCode =
     base.status === "ok" &&
     head.status === "ok" &&
+    !base.spec_failed &&
     !head.spec_failed &&
     !regressionFailed
       ? 0

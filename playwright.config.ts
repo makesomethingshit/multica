@@ -13,20 +13,15 @@ export default defineConfig({
     baseURL: process.env.PLAYWRIGHT_BASE_URL ?? process.env.FRONTEND_ORIGIN ?? "http://localhost:3000",
     headless: true,
   },
+  // Chromium is the whole default matrix: a bare `playwright test` must run
+  // the canonical suite once, and this repo's Playwright browsers are
+  // installed Chromium-only (.github/workflows/ui-performance.yml). WebKit is
+  // a separate, explicitly invoked config (`playwright.webkit.config.ts`)
+  // scoped to the MUL-7095 description startup specs.
   projects: [
     {
       name: "chromium",
       use: { browserName: "chromium" },
-    },
-    // MUL-7095 / PR #8092 Revision 3 §4: the same description specs also
-    // run on WebKit, where first edit/drop determinism is a merge blocker
-    // (spec: 10 consecutive passes from a clean checkout). WebKit browsers
-    // install via `pnpm exec playwright install --with-deps webkit`; the
-    // Chromium project stays first so a bare `playwright test` keeps its
-    // existing default-project behavior.
-    {
-      name: "webkit",
-      use: { browserName: "webkit" },
     },
   ],
   // Don't auto-start servers — they must be running already
