@@ -185,7 +185,7 @@ func TestBuildClaimedTaskResponseRejectsAgentOwnerChangedAfterClaim(t *testing.T
 	}
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
 		testWorkspaceID, "claim-then-owner-change")
-	_, _, _, _, failure := testHandler.buildClaimedTaskResponse(
+	_, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(
 		req, task, runtime, runtimeID, testWorkspaceID,
 	)
 	if failure == nil || failure.status != http.StatusForbidden || failure.outcome != "error_runtime_access_denied" {
@@ -240,7 +240,7 @@ func TestBuildClaimedTaskResponseRejectsAgentReboundAfterClaim(t *testing.T) {
 	}
 	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+oldRuntimeID+"/tasks/claim", nil,
 		testWorkspaceID, "claim-then-rebind")
-	_, _, _, _, failure := testHandler.buildClaimedTaskResponse(
+	_, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(
 		req, task, runtime, oldRuntimeID, testWorkspaceID,
 	)
 	if failure == nil || failure.status != http.StatusConflict || failure.outcome != "error_agent_runtime_changed" {
@@ -293,7 +293,7 @@ func (h *Handler) finalizeClaimDeliveryForTest(
 func (h *Handler) finalizeClaimDeliveryForTestWithRuntime(
 	r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string,
 ) (AgentTaskResponse, []pgtype.UUID, int, int, *claimBuildFailure, error) {
-	resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, buildFailure := h.buildClaimedTaskResponse(
+	resp, deliveredCommentIDs, _, agentSkillCount, builtinSkillCount, buildFailure := h.buildClaimedTaskResponse(
 		r, task, runtime, runtimeID, runtimeWorkspaceID,
 	)
 	if buildFailure != nil {
@@ -320,7 +320,7 @@ func (h *Handler) finalizeClaimDeliveryForTestWithRuntime(
 		WorkspaceID: parseUUID(resp.WorkspaceID),
 		UserID:      runtime.OwnerID,
 		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-	}, deliveredCommentIDs, commentBackedTask, daemonTokens...)
+	}, deliveredCommentIDs, commentBackedTask, nil, daemonTokens...)
 	if ferr != nil {
 		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, nil, ferr
 	}

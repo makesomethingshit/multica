@@ -140,11 +140,12 @@ func repoCheckoutModeFor(provider, goos string) string {
 	}
 }
 
-var (
+const (
 	taskPrepareLeaseRefresh = 15 * time.Second
 	taskPrepareLeaseTimeout = 10 * time.Second
-	errInvalidTaskIdentity  = errors.New("invalid task identity")
 )
+
+var errInvalidTaskIdentity = errors.New("invalid task identity")
 
 func validateTaskIdentity(task Task) error {
 	if strings.TrimSpace(task.AgentID) == "" {
@@ -275,20 +276,15 @@ var (
 	// process PATH. Mirrors the detectAgentVersion hook above.
 	lookPath = exec.LookPath
 
-	// profilePathExecutable reports whether path points at an existing,
-	// non-directory file with at least one executable bit set. It is the
-	// gate appendProfileRuntimes uses before trusting a per-machine command
-	// path override (MUL-3284) — a stale or mistyped override must fall back
-	// to the PATH lookup rather than register a runtime that can't launch.
-	// Indirected as a package var so tests can assert override preference
-	// without staging a real executable on disk.
-	profilePathExecutable = func(path string) bool {
-		info, err := os.Stat(path)
-		if err != nil || info.IsDir() {
-			return false
-		}
-		return info.Mode().Perm()&0o111 != 0
-	}
+	// resolveProfileOverridePath is what appendProfileRuntimes uses before
+	// trusting a per-machine command path override (MUL-3284). It must be the
+	// same contract agent launches use — resolveAgentExecutablePath /
+	// exec.LookPath — so Windows PATHEXT completion (.cmd shims, extension-less
+	// pins) and unix exec-bit checks stay in one place. A stale or mistyped
+	// override must fall back to PATH rather than register a runtime that
+	// can't launch. Indirected as a package var so override-preference tests
+	// can decide which paths resolve without staging real files on disk.
+	resolveProfileOverridePath = resolveAgentExecutablePath
 )
 
 // workspaceState tracks registered runtimes for a single workspace.
@@ -653,6 +649,9 @@ type Daemon struct {
 
 	runner             taskRunner    // executes agent tasks; set to d.runTask by New(), overridable in tests
 	cancelPollInterval time.Duration // how often handleTask polls for server-side cancellation; overridable in tests
+	// taskSlotWait is the brief semaphore wait before the capacity backoff.
+	// New sets the production default; tests shorten it to reach that branch.
+	taskSlotWait time.Duration
 	// envRootBusyWait is how long a task that is entitled to a prior env root
 	// waits for the previous run to let go of it before giving up and preparing
 	// a fresh one. New() sets it; the zero value means "do not wait", which is
@@ -665,6 +664,10 @@ type Daemon struct {
 	// the production default; zero-valued test daemons fall back to the same
 	// default in effectiveTaskPrepareTimeout.
 	taskPrepareTimeout time.Duration
+	// prepareLeaseRefresh is how often a preparing task extends its prepare
+	// lease. New sets the production default; zero-valued test daemons fall
+	// back to the same default in startTaskPrepareLeaseExtender.
+	prepareLeaseRefresh time.Duration
 	// runUpdateFn executes the brew-or-download upgrade. Set to d.runUpdate by
 	// New() and overridable in tests so the auto-update poller can be exercised
 	// without touching the real network or the brew CLI.
@@ -711,8 +714,10 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		reregisterNextAttempt:     make(map[string]time.Time),
 		reregisterLastCompletedAt: make(map[string]time.Time),
 		cancelPollInterval:        5 * time.Second,
+		taskSlotWait:              taskSlotWaitTimeout,
 		envRootBusyWait:           15 * time.Second,
 		taskPrepareTimeout:        defaultTaskPrepareTimeout,
+		prepareLeaseRefresh:       taskPrepareLeaseRefresh,
 		reconcile:                 newReconcileBroadcaster(),
 		workspaceChanges:          newWorkspaceChangeSignal(),
 		wsRPC:                     newWSRPCClient(wsRPCResponseGrace),
@@ -3078,8 +3083,8 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		var resolved string
 		var failureReason string
 		if override := strings.TrimSpace(d.cfg.ProfileCommandOverrides[profile.ID]); override != "" {
-			if profilePathExecutable(override) {
-				resolved = override
+			if path, err := resolveProfileOverridePath(override); err == nil {
+				resolved = path
 				d.logger.Info("custom runtime profile: using per-machine command path override",
 					"workspace_id", workspaceID, "profile_id", profile.ID, "command_path", resolved)
 			} else {
@@ -5390,7 +5395,11 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 
 		// Acquire at least one slot (blocking briefly), then grab any other free
 		// slots so a single batch claim can fill them all.
-		slot, acquired, woke, err := waitForTaskSlot(pollerCtx, sem, wakeup, taskSlotWaitTimeout)
+		slotWait := d.taskSlotWait
+		if slotWait <= 0 {
+			slotWait = taskSlotWaitTimeout
+		}
+		slot, acquired, woke, err := waitForTaskSlot(pollerCtx, sem, wakeup, slotWait)
 		if err != nil {
 			return
 		}
@@ -7095,11 +7104,15 @@ func skillBundleResolveTimeout(sizeBytes int64) time.Duration {
 }
 
 func (d *Daemon) startTaskPrepareLeaseExtender(ctx context.Context, task Task, taskLog *slog.Logger) func() {
+	refresh := d.prepareLeaseRefresh
+	if refresh <= 0 {
+		refresh = taskPrepareLeaseRefresh
+	}
 	leaseCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(taskPrepareLeaseRefresh)
+		ticker := time.NewTicker(refresh)
 		defer ticker.Stop()
 		for {
 			select {
@@ -8749,7 +8762,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Convert agent usage map to task usage entries.
 	var usageEntries []TaskUsageEntry
 	for model, u := range result.Usage {
-		if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheWriteTokens == 0 {
+		if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheWriteTokens == 0 && u.CostUSDTicks <= 0 {
 			continue
 		}
 		usageEntries = append(usageEntries, TaskUsageEntry{
@@ -9279,37 +9292,51 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	go func() {
 		defer close(drainFinished)
 		var mu sync.Mutex
-		var pendingText strings.Builder
-		var pendingThinking strings.Builder
-		var pendingTextAt time.Time
-		var pendingThinkingAt time.Time
+		var pendingContent strings.Builder
+		var pendingType string
+		var pendingAt time.Time
 		var batch []TaskMessageData
 		callIDToTool := map[string]string{}
 
+		// sealPendingLocked turns the current contiguous text/thinking frame
+		// into a sequenced row. Callers hold mu so a ticker flush cannot assign
+		// a later seq between sealing the frame and appending the event that
+		// followed it.
+		sealPendingLocked := func() {
+			if pendingContent.Len() == 0 {
+				return
+			}
+			s := msgSeq.Add(1)
+			batch = append(batch, TaskMessageData{
+				Seq:       int(s),
+				Type:      pendingType,
+				Content:   pendingContent.String(),
+				CreatedAt: pendingAt,
+			})
+			pendingContent.Reset()
+			pendingType = ""
+			pendingAt = time.Time{}
+		}
+
+		appendPending := func(messageType, content string, observedAt time.Time) {
+			if content == "" {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if pendingType != "" && pendingType != messageType {
+				sealPendingLocked()
+			}
+			if pendingContent.Len() == 0 {
+				pendingType = messageType
+				pendingAt = observedAt
+			}
+			pendingContent.WriteString(content)
+		}
+
 		flush := func() {
 			mu.Lock()
-			if pendingThinking.Len() > 0 {
-				s := msgSeq.Add(1)
-				batch = append(batch, TaskMessageData{
-					Seq:       int(s),
-					Type:      "thinking",
-					Content:   pendingThinking.String(),
-					CreatedAt: pendingThinkingAt,
-				})
-				pendingThinking.Reset()
-				pendingThinkingAt = time.Time{}
-			}
-			if pendingText.Len() > 0 {
-				s := msgSeq.Add(1)
-				batch = append(batch, TaskMessageData{
-					Seq:       int(s),
-					Type:      "text",
-					Content:   pendingText.String(),
-					CreatedAt: pendingTextAt,
-				})
-				pendingText.Reset()
-				pendingTextAt = time.Time{}
-			}
+			sealPendingLocked()
 			toSend := batch
 			batch = nil
 			mu.Unlock()
@@ -9400,13 +9427,12 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					n := toolCount.Add(1)
 					inFlightTools.Add(1)
 					taskLog.Info(fmt.Sprintf("tool #%d: %s", n, msg.Tool))
+					mu.Lock()
+					sealPendingLocked()
 					if msg.CallID != "" {
-						mu.Lock()
 						callIDToTool[msg.CallID] = msg.Tool
-						mu.Unlock()
 					}
 					s := msgSeq.Add(1)
-					mu.Lock()
 					batch = append(batch, TaskMessageData{
 						Seq:       int(s),
 						Type:      "tool_use",
@@ -9439,16 +9465,15 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 							break
 						}
 					}
-					s := msgSeq.Add(1)
 					output, outputTruncated := toolOutputPreview(msg.Output)
+					mu.Lock()
+					sealPendingLocked()
 					toolName := msg.Tool
 					if toolName == "" && msg.CallID != "" {
-						mu.Lock()
 						toolName = callIDToTool[msg.CallID]
-						mu.Unlock()
 					}
+					s := msgSeq.Add(1)
 					taskLog.Info("tool_result observed", "seq", s, "tool", toolName, "call_id", msg.CallID)
-					mu.Lock()
 					batch = append(batch, TaskMessageData{
 						Seq:       int(s),
 						Type:      "tool_result",
@@ -9463,28 +9488,17 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					})
 					mu.Unlock()
 				case agent.MessageThinking:
-					if msg.Content != "" {
-						mu.Lock()
-						pendingThinking.WriteString(msg.Content)
-						if pendingThinkingAt.IsZero() {
-							pendingThinkingAt = observedAt
-						}
-						mu.Unlock()
-					}
+					appendPending("thinking", msg.Content, observedAt)
 				case agent.MessageText:
 					if msg.Content != "" {
 						taskLog.Debug("agent", "text", truncateLog(msg.Content, 200))
-						mu.Lock()
-						pendingText.WriteString(msg.Content)
-						if pendingTextAt.IsZero() {
-							pendingTextAt = observedAt
-						}
-						mu.Unlock()
 					}
+					appendPending("text", msg.Content, observedAt)
 				case agent.MessageError:
 					taskLog.Error("agent error", "content", msg.Content)
-					s := msgSeq.Add(1)
 					mu.Lock()
+					sealPendingLocked()
+					s := msgSeq.Add(1)
 					batch = append(batch, TaskMessageData{
 						Seq:       int(s),
 						Type:      "error",

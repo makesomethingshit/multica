@@ -22,7 +22,7 @@
   },
   "status_catalog_error": {
     "title": "ステータス一覧を読み込めませんでした",
-    "hint": "これがないとステータスの絞り込みを適用できないため、タスクは表示されません。",
+    "hint": "ステータスを読み込むまでタスクを表示できません。",
     "retry": "再試行"
   },
   "source_context": {
@@ -99,7 +99,6 @@
     "breadcrumb_title": "タスク",
     "breadcrumb_workspace_fallback": "ワークスペース",
     "empty_title": "まだタスクがありません",
-    "empty_hint": "タスクを作成して始めましょう。",
     "move_failed": "タスクを移動できませんでした"
   },
   "status": {
@@ -110,6 +109,12 @@
     "done": "完了",
     "blocked": "ブロック中",
     "cancelled": "キャンセル済み"
+  },
+  "status_category": {
+    "unstarted": "未着手",
+    "started": "開始済み",
+    "done": "完了",
+    "closed": "終了"
   },
   "priority": {
     "urgent": "緊急",
@@ -313,12 +318,10 @@
     },
     "empty": {
       "assigned": {
-        "title": "割り当てられたタスクはありません",
-        "description": "ここに割り当てられたタスクがこの表示に表示されます。"
+        "title": "割り当てられたタスクはありません"
       },
       "created": {
-        "title": "作成したタスクはありません",
-        "description": "ここで作成したタスクがこの表示に表示されます。"
+        "title": "作成したタスクはありません"
       }
     },
     "search_placeholder": "タスクを検索...",
@@ -379,7 +382,6 @@
     "quick_action_blocked_body": "「{{name}}」は、あなたが実行を許可されていないエージェントで動作します。ワークスペース管理者にそのエージェントをチームへ公開してもらうか、共有エージェントへの変更を依頼してください。",
     "quick_action_blocked_ok": "了解",
     "pull_requests_loading": "読み込み中...",
-    "pull_requests_empty": "まだリンクされた Pull request がありません。このタスクの識別子を PR のブランチ名かタイトルに入れるか、本文で Closes の直後に書くと、自動的にリンクされます。",
     "pull_request_state_open": "オープン",
     "pull_request_state_draft": "ドラフト",
     "pull_request_state_merged": "マージ済み",
@@ -450,7 +452,8 @@
     "project_directory_path_copied": "プロジェクトディレクトリのパスをコピーしました",
     "project_directory_path_copied_with_branch": "プロジェクトディレクトリのパスをコピーしました — 作業は {{branch}} ブランチにあります",
     "workdir_path_copy_failed": "作業ディレクトリのパスをコピーできませんでした",
-    "workdir_path_unavailable": "まだローカルの作業ディレクトリがありません。ローカルエージェントがこのタスクを実行していません"
+    "workdir_path_unavailable": "まだローカルの作業ディレクトリがありません。ローカルエージェントがこのタスクを実行していません",
+    "pull_requests_empty_title": "関連する PR はありません。"
   },
   "timeline": {
     "loading": "読み込み中..."
@@ -489,6 +492,8 @@
     "delete_title": "コメントを削除",
     "delete_desc": "このコメントは完全に削除されます。この操作は元に戻せません。",
     "delete_desc_with_replies": "このコメントとすべての返信が完全に削除されます。この操作は元に戻せません。",
+    "delete_desc_replies_kept": "このコメントは完全に削除されます。返信はスレッドに残ります。この操作は元に戻せません。",
+    "deleted_placeholder": "このコメントは削除されました",
     "delete_action": "削除",
     "cancel_action": "キャンセル",
     "edit_placeholder": "コメントを編集...",
@@ -594,7 +599,6 @@
   },
   "filtered_empty": {
     "title": "フィルター条件に一致するタスクがありません",
-    "hint": "フィルターを変更または解除すると、このビューのタスクが表示されます。",
     "clear_button": "フィルターを解除"
   },
   "agent_live": {
