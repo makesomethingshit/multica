@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -441,7 +442,10 @@ func TestHoldTaskRepoActivityClaimsEveryTaskRepo(t *testing.T) {
 		t.Fatal("BarePath returned an empty path")
 	}
 
-	release := d.holdTaskRepoActivity(task)
+	release, err := d.holdTaskRepoActivity(task)
+	if err != nil {
+		t.Fatalf("hold task repo activity: %v", err)
+	}
 	claim, ok, err := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bare))
 	if err != nil {
 		t.Fatalf("probe activity claim: %v", err)
@@ -457,4 +461,146 @@ func TestHoldTaskRepoActivityClaimsEveryTaskRepo(t *testing.T) {
 		t.Fatalf("activity claim still held after release: ok=%v err=%v", ok, err)
 	}
 	claim.Release()
+}
+
+// TestHoldTaskRepoActivityFailsClosedWhileMaintenanceOwnsTheRepo is the
+// reverse-order case the previous best-effort helper could not survive: heavy
+// maintenance in another daemon already owns the repository exclusively, so this
+// task must not start at all - a warning would have let the agent and a
+// concurrent prune share the object store.
+func TestHoldTaskRepoActivityFailsClosedWhileMaintenanceOwnsTheRepo(t *testing.T) {
+	lockDir := scopeLockDirForTest(t, "repo-activity-order")
+	root := filepath.Join(t.TempDir(), ".repos")
+	locks := execenv.NewScopeLocks(lockDir)
+	// Two daemons of one work state, sharing the cache root and the scope locks.
+	maintenanceDaemon := newScopeGuardDaemon(t, lockDir, t.TempDir())
+	maintenanceDaemon.repoCache = repocache.NewScoped(root, quietTaskLog(), locks)
+	taskDaemon := newScopeGuardDaemon(t, lockDir, t.TempDir())
+	taskDaemon.repoCache = repocache.NewScoped(root, quietTaskLog(), locks)
+	_ = maintenanceDaemon
+
+	const repoURL = "https://example.com/org/repo.git"
+	task := Task{
+		WorkspaceID: "11111111-1111-1111-1111-111111111111",
+		Repos:       []RepoData{{URL: repoURL}},
+	}
+	bare := taskDaemon.repoCache.BarePath(task.WorkspaceID, repoURL)
+	if bare == "" {
+		t.Fatal("BarePath returned an empty path")
+	}
+
+	// The sibling daemon is running heavy maintenance: it owns the activity
+	// target exclusively.
+	maintenance, ok, err := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bare))
+	if err != nil {
+		t.Fatalf("maintenance activity claim: %v", err)
+	}
+	if !ok {
+		t.Fatal("could not take the exclusive activity claim for the test")
+	}
+
+	release, err := taskDaemon.holdTaskRepoActivity(task)
+	if err == nil {
+		if release != nil {
+			release()
+		}
+		t.Fatal("a task claimed repository activity while another daemon owned it exclusively")
+	}
+	if release != nil {
+		t.Fatal("a failed activity claim still handed back a release")
+	}
+	if !errors.Is(err, execenv.ErrScopeLockTimeout) {
+		t.Fatalf("err = %v, want the scope-lock timeout cause", err)
+	}
+	if !strings.Contains(err.Error(), "did not start") {
+		t.Fatalf("err = %v, want an explicit task-did-not-start failure", err)
+	}
+
+	maintenance.Release()
+	release, err = taskDaemon.holdTaskRepoActivity(task)
+	if err != nil {
+		t.Fatalf("claim after maintenance released: %v", err)
+	}
+	if claim, ok, probeErr := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bare)); probeErr != nil {
+		t.Fatalf("probe activity claim: %v", probeErr)
+	} else if ok {
+		claim.Release()
+		t.Fatal("the task holds no shared activity claim after a successful acquire")
+	}
+	release()
+	claim, ok, err := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bare))
+	if err != nil || !ok {
+		t.Fatalf("exclusive activity ownership after the task finished: ok=%v err=%v", ok, err)
+	}
+	claim.Release()
+}
+
+// TestHoldTaskRepoActivityReleasesPartialClaims covers multi-repo atomicity: a
+// task naming several repositories must not start with only some of them
+// protected, and the claims it did take must not leak when a later one fails.
+func TestHoldTaskRepoActivityReleasesPartialClaims(t *testing.T) {
+	lockDir := scopeLockDirForTest(t, "repo-activity-partial")
+	root := filepath.Join(t.TempDir(), ".repos")
+	locks := execenv.NewScopeLocks(lockDir)
+	blocker := newScopeGuardDaemon(t, lockDir, t.TempDir())
+	blocker.repoCache = repocache.NewScoped(root, quietTaskLog(), locks)
+	taskDaemon := newScopeGuardDaemon(t, lockDir, t.TempDir())
+	taskDaemon.repoCache = repocache.NewScoped(root, quietTaskLog(), locks)
+	_ = blocker
+
+	const (
+		repoA = "https://example.com/org/repo-a.git"
+		repoB = "https://example.com/org/repo-b.git"
+	)
+	task := Task{
+		WorkspaceID: "11111111-1111-1111-1111-111111111111",
+		// repo-b twice: duplicate bare paths must still mean one claim.
+		Repos: []RepoData{{URL: repoA}, {URL: repoB}, {URL: repoB}},
+	}
+	bareA := taskDaemon.repoCache.BarePath(task.WorkspaceID, repoA)
+	bareB := taskDaemon.repoCache.BarePath(task.WorkspaceID, repoB)
+	if bareA == "" || bareB == "" {
+		t.Fatal("BarePath returned an empty path")
+	}
+
+	held, ok, err := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bareB))
+	if err != nil || !ok {
+		t.Fatalf("block repo B: ok=%v err=%v", ok, err)
+	}
+
+	release, err := taskDaemon.holdTaskRepoActivity(task)
+	if err == nil {
+		if release != nil {
+			release()
+		}
+		t.Fatal("a task started with one of its repositories owned exclusively elsewhere")
+	}
+	if release != nil {
+		t.Fatal("a failed multi-repo claim still handed back a release")
+	}
+	if !strings.Contains(err.Error(), filepath.Base(bareB)) {
+		t.Fatalf("err = %v, want the blocked repository named", err)
+	}
+
+	// The claim taken for repo A before B failed must already be released.
+	claimA, ok, err := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bareA))
+	if err != nil || !ok {
+		t.Fatalf("repo A activity claim leaked from the failed attempt: ok=%v err=%v", ok, err)
+	}
+	claimA.Release()
+
+	// With B free the whole set claims, and releasing it frees both repos.
+	held.Release()
+	release, err = taskDaemon.holdTaskRepoActivity(task)
+	if err != nil {
+		t.Fatalf("claim with both repos free: %v", err)
+	}
+	release()
+	for _, bare := range []string{bareA, bareB} {
+		claim, ok, err := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bare))
+		if err != nil || !ok {
+			t.Fatalf("activity claim still held for %s after release: ok=%v err=%v", filepath.Base(bare), ok, err)
+		}
+		claim.Release()
+	}
 }

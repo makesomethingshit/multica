@@ -7832,11 +7832,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	defer releaseRootScope()
 
 	// A run that may check out workspace repositories holds the scope-level
-	// activity claim for each bare repo for the whole run. Heavy maintenance and
-	// eviction take the exclusive side of that claim, so reflog expiry, git gc, or
-	// a cache eviction in ANY daemon of this work state cannot run while this task
-	// might be touching the repository (GH #8280).
-	releaseRepoActivity := d.holdTaskRepoActivity(task)
+	// activity claim for each bare repo for the whole run, and it must hold all of
+	// them before the agent starts: heavy maintenance and eviction take the
+	// exclusive side of that claim, so a run that cannot claim a repository would
+	// otherwise put this run's git activity and another daemon's prune on the same
+	// object store. Claimed here, before any repository-sensitive preparation, and
+	// released with the run (GH #8280).
+	releaseRepoActivity, err := d.holdTaskRepoActivity(task)
+	if err != nil {
+		return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("claim repository activity: %w", err))
+	}
 	defer releaseRepoActivity()
 
 	d.markActiveEnvRoot(resolvedRoot)
@@ -10205,14 +10210,20 @@ func (d *Daemon) scopeLockTimeout() time.Duration {
 // bare repo this task may check out, for the lifetime of the run, and returns
 // the release.
 //
-// The claims are best effort on purpose: a task whose repository claim cannot be
-// taken still runs (failing a task over a maintenance race would be worse than
-// running it), but the failure is logged and the cost is bounded - that repo
-// falls back, for this run, to the pre-change behaviour where maintenance could
-// overlap it.
-func (d *Daemon) holdTaskRepoActivity(task Task) func() {
+// The claims are REQUIRED, not best effort. They are the only thing that stops a
+// sibling daemon from running heavy maintenance or an eviction against the same
+// repository - reflog expire, git gc --prune, a cache removal - while this run's
+// agent works in a linked worktree, and agent-side git activity is precisely
+// what the repo mutation lock does NOT cover. So a run that cannot claim every
+// repository it may touch does not start: failing the task is the safe answer,
+// and continuing would put an agent and a prune on the same object store.
+//
+// Multi-repo acquisition is all-or-nothing from the caller's point of view: if
+// any claim fails, the ones already taken are released in reverse order and the
+// error names the repository plus the underlying scope-lock cause.
+func (d *Daemon) holdTaskRepoActivity(task Task) (func(), error) {
 	if d.repoCache == nil || len(task.Repos) == 0 {
-		return func() {}
+		return func() {}, nil
 	}
 	releases := make([]func(), 0, len(task.Repos))
 	claimed := make(map[string]bool, len(task.Repos))
@@ -10228,17 +10239,20 @@ func (d *Daemon) holdTaskRepoActivity(task Task) func() {
 		claimed[barePath] = true
 		claim, err := d.scopeLocks.AcquireTargetUse(execenv.RepoActivityTarget(barePath), d.scopeLockTimeout())
 		if err != nil {
-			d.logger.Warn("repo activity claim failed; heavy maintenance may overlap this run",
-				"repo", filepath.Base(barePath), "error", err)
-			continue
+			for i := len(releases) - 1; i >= 0; i-- {
+				releases[i]()
+			}
+			return nil, fmt.Errorf(
+				"repository %s is owned exclusively by another daemon in this work state, so this task did not start: %w",
+				filepath.Base(barePath), err)
 		}
 		releases = append(releases, claim.Release)
 	}
 	return func() {
-		for _, release := range releases {
-			release()
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
 		}
-	}
+	}, nil
 }
 
 // holdStoreForTask takes the store for the lifetime of one task: a SHARED claim
