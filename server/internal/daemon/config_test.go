@@ -111,7 +111,7 @@ func TestPatternsFromEnv_DefaultsWhenUnset(t *testing.T) {
 // an operator opts in, and a daemon upgrade never starts deleting on its own.
 func TestLoadConfig_CompletedTaskTTLDefaultsDisabledOnSelfHostAndReadsEnv(t *testing.T) {
 	stageFakeAgent(t)
-	t.Setenv("HOME", t.TempDir())
+	stageTestHome(t, t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
 	t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "")
 
@@ -144,7 +144,7 @@ func TestLoadConfig_CompletedTaskTTLDefaultsDisabledOnSelfHostAndReadsEnv(t *tes
 
 func TestLoadConfig_WSClaimPollIntervalPrecedence(t *testing.T) {
 	stageFakeAgent(t)
-	t.Setenv("HOME", t.TempDir())
+	stageTestHome(t, t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
 	t.Setenv("MULTICA_DAEMON_WS_CLAIM_POLL_INTERVAL", "")
 	base := Overrides{ServerURL: "http://localhost:0", WorkspacesRoot: t.TempDir()}
@@ -184,7 +184,7 @@ func TestLoadConfig_WSClaimPollIntervalPrecedence(t *testing.T) {
 
 func TestLoadConfig_CompletedTaskTTLDefaultsBoundedOnOfficialCloud(t *testing.T) {
 	stageFakeAgent(t)
-	t.Setenv("HOME", t.TempDir())
+	stageTestHome(t, t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
 	t.Setenv("MULTICA_GC_COMPLETED_TASK_TTL", "")
 
@@ -1355,6 +1355,8 @@ func TestLoadConfig_SkipsLoginShellWhenLookPathSucceeds(t *testing.T) {
 }
 
 func TestLoadConfig_UsesCodexDesktopAppBundleFallback(t *testing.T) {
+	// LoadConfig persists a scope mapping under HOME; keep it in this test own home.
+	stageTestHome(t, t.TempDir())
 	pathDir := t.TempDir()
 	fakeCodex := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
 	if err := os.MkdirAll(filepath.Dir(fakeCodex), 0o755); err != nil {
@@ -1397,6 +1399,8 @@ func TestLoadConfig_UsesCodexDesktopAppBundleFallback(t *testing.T) {
 // Multica must resolve the bundled CLI under ChatGPT.app (and prefer it over
 // the legacy Codex.app path when both exist).
 func TestLoadConfig_UsesChatGPTAppBundleCodexPath(t *testing.T) {
+	// LoadConfig persists a scope mapping under HOME; keep it in this test own home.
+	stageTestHome(t, t.TempDir())
 	pathDir := t.TempDir()
 	fakeChatGPT := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex")
 	fakeLegacy := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
@@ -1468,6 +1472,8 @@ func TestCodexDesktopAppBundlePaths_IncludesChatGPTAndLegacy(t *testing.T) {
 }
 
 func TestLoadConfig_CodexDesktopFallbackDoesNotOverrideExplicitPath(t *testing.T) {
+	// LoadConfig persists a scope mapping under HOME; keep it in this test own home.
+	stageTestHome(t, t.TempDir())
 	pathDir := t.TempDir()
 	fakeCodex := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
 	if err := os.MkdirAll(filepath.Dir(fakeCodex), 0o755); err != nil {
@@ -1722,7 +1728,7 @@ func TestLoadConfig_BackendOverrides_BackwardCompat_NoConfigFile(t *testing.T) {
 	stageFakeAgent(t)
 
 	// Point HOME at an empty dir — no config.json present.
-	t.Setenv("HOME", t.TempDir())
+	stageTestHome(t, t.TempDir())
 	os.Unsetenv("MULTICA_OPENCLAW_PATH")
 	os.Unsetenv("OPENCLAW_STATE_DIR")
 	t.Cleanup(func() {
@@ -1821,4 +1827,15 @@ func TestApplyOpenclawOverride_CLITimeout(t *testing.T) {
 			t.Errorf("%s must not be set when the field is empty", execenv.OpenclawCLITimeoutEnv)
 		}
 	})
+}
+
+// stageTestHome points HOME at dir and USERPROFILE with it. os.UserHomeDir
+// reads %USERPROFILE% on Windows, so a test that only sets HOME resolves the
+// developer real home there - and LoadConfig now persists the work-state
+// mapping under it, which would both fail the assertion and write machine state
+// belonging to nobody.
+func stageTestHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
 }

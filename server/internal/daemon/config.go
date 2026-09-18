@@ -531,10 +531,12 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	// Work state: the persistent-state identity of this machine + backend, which
 	// is what the runtime row is already keyed on. The workspaces root is one of
 	// the trees it owns, so it resolves here rather than from the profile name.
-	// An existing profile-scoped tree is adopted as-is (an upgrade must not orphan
-	// a resumable conversation), and two competing non-empty trees fail startup
-	// instead of one being picked silently (GH #8280).
-	workState, err := ResolveWorkStateScope(WorkStateScopeParams{
+	// The resolution is persisted once per backend (workstate.go), and it adopts
+	// an existing profile-scoped tree as-is (an upgrade must not orphan a
+	// resumable conversation). Two competing non-empty trees, an ambiguous legacy
+	// tree, and an override that disagrees with the persisted mapping all fail
+	// startup instead of one being picked silently (GH #8280).
+	workState, err := ResolveOrCreateWorkStateScope(WorkStateScopeParams{
 		ServerBaseURL:          serverBaseURL,
 		Profile:                profile,
 		ExplicitWorkspacesRoot: overrides.WorkspacesRoot,
@@ -728,7 +730,15 @@ func defaultGCCompletedTaskTTL(serverBaseURL string) time.Duration {
 	return DefaultGCCompletedTaskTTLSelfHost
 }
 
-// NormalizeServerBaseURL converts a WebSocket or HTTP URL to a base HTTP URL.
+// NormalizeServerBaseURL converts a WebSocket or HTTP URL to a base HTTP URL,
+// folding the two components that are case-insensitive by contract: the scheme
+// and the host. The path is left exactly as given - it is not case-insensitive,
+// so two spellings that differ only there are two different backends and must
+// stay two different work states (GH #8280).
+//
+// This is also the single URL-normalization contract the work-state key hashes:
+// WorkStateKey applies no normalization of its own, so whatever this function
+// considers one backend is one scope.
 func NormalizeServerBaseURL(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -745,6 +755,10 @@ func NormalizeServerBaseURL(raw string) (string, error) {
 	}
 	if u.Path == "/ws" {
 		u.Path = ""
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	if u.Host != "" {
+		u.Host = strings.ToLower(u.Host)
 	}
 	u.RawPath = ""
 	u.RawQuery = ""

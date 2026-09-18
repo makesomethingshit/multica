@@ -637,6 +637,15 @@ type Daemon struct {
 	activeStoresCond *sync.Cond      // signalled when an in-flight store deletion finishes, so a blocked markActive can proceed
 	activeStores     map[string]int  // persistent store path (per-conversation Codex sessions, per-agent Hermes memories) -> live-task refcount; guards the store from GC mid-task (MUL-4424)
 	deletingStores   map[string]bool // store paths a GC delete has reserved; markActive waits these out so a task never mounts a store mid-removal
+	// scopeLocks carries the cross-process half of both guards above. A
+	// work-state scope is shared by every daemon process that serves the backend,
+	// and the maps right above are per process — so they stay as the local
+	// reference count and the fast path, while the OS locks in this scope are the
+	// authoritative boundary between daemons (GH #8280).
+	scopeLocks execenv.ScopeLocks
+	// storeClaimTimeout bounds how long a task waits for a store another daemon
+	// in this scope is deleting. Zero means the default; tests shorten it.
+	storeClaimTimeout time.Duration
 
 	// repoCheckoutTasks binds the localhost /repo/checkout endpoint to the
 	// task-scoped bearer token of a currently running agent. The request body is
@@ -723,6 +732,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		deletingEnvRoots:          make(map[string]bool),
 		activeStores:              make(map[string]int),
 		deletingStores:            make(map[string]bool),
+		scopeLocks:                execenv.NewScopeLocks(cfg.WorkState.LockDir),
 		localPathLocks:            NewLocalPathLocker(),
 		runtimeGoneInflight:       make(map[string]struct{}),
 		pendingWorkInflight:       make(map[string]struct{}),
@@ -8005,9 +8015,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// memory line, matching Hermes' own "a profile is an isolated instance"
 		// model. Guarded from the GC for the whole task, as the Codex store below.
 		if store := execenv.HermesMemoryStorePath(d.cfg.WorkState.StateRoot, task.AgentID, res.SourceHome); store != "" {
+			release, err := d.holdStoreForTask(store)
+			if err != nil {
+				return TaskResult{}, fmt.Errorf("claim hermes memory store: %w", err)
+			}
 			hermesMemoryStore = store
-			d.markActiveStore(store)
-			defer d.unmarkActiveStore(store)
+			defer release()
 		}
 		// The overlay links state.db here so the conversation transcript
 		// survives the task and a follow-up turn can actually resume it
@@ -8016,9 +8029,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// writer, while two issues never share a database. Guarded from the GC
 		// for the whole task, as the stores above and below.
 		if store := execenv.HermesSessionStorePath(d.cfg.WorkState.StateRoot, task.AgentID, res.SourceHome, taskCtx); store != "" {
+			release, err := d.holdStoreForTask(store)
+			if err != nil {
+				return TaskResult{}, fmt.Errorf("claim hermes session store: %w", err)
+			}
 			hermesSessionStore = store
-			d.markActiveStore(store)
-			defer d.unmarkActiveStore(store)
+			defer release()
 		}
 	}
 	// Reasonix locates its user config from the environment (REASONIX_HOME, and
@@ -8037,8 +8053,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// of a long-idle issue (MUL-4424). No-op for non-Codex tasks / no stable key.
 	if provider == "codex" {
 		if store := execenv.CodexSessionStorePath(d.cfg.WorkState.CodexNamespace, taskCtx); store != "" {
-			d.markActiveStore(store)
-			defer d.unmarkActiveStore(store)
+			release, err := d.holdStoreForTask(store)
+			if err != nil {
+				return TaskResult{}, fmt.Errorf("claim codex session store: %w", err)
+			}
+			defer release()
 		}
 	}
 	envReused := false
@@ -10039,14 +10058,31 @@ func (d *Daemon) ensureActiveEnvRootStateLocked() {
 // check-then-remove race between the GC loop and task startup: either GC sees
 // the active task and skips, or task startup waits for the mutation to finish
 // and recreates/uses the post-GC environment.
+//
+// Two layers, and only the outer one is authoritative across processes. Any
+// daemon in this work-state scope may be running a task on this env root, and
+// the task's own .task_lock is the one signal that answers "is that execution
+// still alive?" regardless of which process started it, so the claim below
+// acquires that lock and holds it for the whole mutation. The in-process maps
+// then do what they always did — reference count this daemon's own tasks, and
+// keep a same-process task from entering mid-mutation.
 func (d *Daemon) reserveEnvRootForGC(envRoot string) (release func(), ok bool) {
 	if envRoot == "" {
+		return nil, false
+	}
+	claim, owned, err := execenv.AcquireEnvRootGCClaim(envRoot)
+	if err != nil {
+		d.logger.Warn("gc: could not take the env root execution lock; skipping", "dir", envRoot, "error", err)
+		return nil, false
+	}
+	if !owned {
 		return nil, false
 	}
 	d.activeEnvRootsMu.Lock()
 	defer d.activeEnvRootsMu.Unlock()
 	d.ensureActiveEnvRootStateLocked()
 	if d.activeEnvRoots[envRoot] > 0 || d.deletingEnvRoots[envRoot] {
+		claim.Release()
 		return nil, false
 	}
 	d.deletingEnvRoots[envRoot] = true
@@ -10055,7 +10091,33 @@ func (d *Daemon) reserveEnvRootForGC(envRoot string) (release func(), ok bool) {
 		delete(d.deletingEnvRoots, envRoot)
 		d.activeEnvRootsCond.Broadcast()
 		d.activeEnvRootsMu.Unlock()
+		claim.Release()
 	}, true
+}
+
+// holdStoreForTask takes the store for the lifetime of one task: a SHARED claim
+// in the work-state scope (other tasks of the same store coexist — two tasks of
+// one Hermes agent share one memory store by design), plus the in-process mark.
+//
+// Order matters, and it is the reverse of the GC's. The scope claim is taken
+// first so a store some other daemon is reclaiming right now is waited out
+// (bounded) rather than mounted mid-removal; the in-process mark follows, which
+// is what makes THIS daemon's GC wait for this task. A scope with no lock
+// directory (hand-built configurations) degrades to the in-process guard alone.
+func (d *Daemon) holdStoreForTask(store string) (release func(), err error) {
+	timeout := d.storeClaimTimeout
+	if timeout <= 0 {
+		timeout = execenv.DefaultScopeLockTimeout
+	}
+	claim, err := d.scopeLocks.AcquireTargetUse(store, timeout)
+	if err != nil {
+		return nil, err
+	}
+	d.markActiveStore(store)
+	return func() {
+		d.unmarkActiveStore(store)
+		claim.Release()
+	}, nil
 }
 
 // markActiveStore records that a task is about to use the given persistent
@@ -10098,10 +10160,25 @@ func (d *Daemon) unmarkActiveStore(store string) {
 // the "confirm inactive" and the mark happen under one lock acquisition, so a
 // markActiveStore either loses the check (store stays) or blocks on the
 // reservation, closing the stat->remove race (MUL-4424).
+//
+// The scope claim is the half that spans processes: any daemon serving this
+// backend may hold the store, and only its own process knows that. Acquiring the
+// exclusive claim first means a store another daemon is using is skipped rather
+// than deleted out from under it, while the in-process reservation below still
+// closes the same-process race on its own.
 func (d *Daemon) reserveStoreForDeletion(store string) (commit func(), ok bool) {
+	claim, owned, err := d.scopeLocks.TryAcquireTargetDelete(store)
+	if err != nil {
+		d.logger.Warn("gc: could not take the store deletion claim; skipping", "store", store, "error", err)
+		return nil, false
+	}
+	if !owned {
+		return nil, false
+	}
 	d.activeStoresMu.Lock()
 	defer d.activeStoresMu.Unlock()
 	if d.activeStores[store] > 0 || d.deletingStores[store] {
+		claim.Release()
 		return nil, false
 	}
 	d.deletingStores[store] = true
@@ -10110,6 +10187,7 @@ func (d *Daemon) reserveStoreForDeletion(store string) (commit func(), ok bool) 
 		delete(d.deletingStores, store)
 		d.activeStoresCond.Broadcast()
 		d.activeStoresMu.Unlock()
+		claim.Release()
 	}, true
 }
 

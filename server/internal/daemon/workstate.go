@@ -3,12 +3,15 @@ package daemon
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
@@ -50,6 +53,15 @@ import (
 // before) gets the backend-scoped default. When two non-empty legacy trees claim
 // the same backend the daemon refuses to start rather than guessing - see
 // WorkStateConflictError.
+//
+// The decision is persisted, once, in ~/.multica/work-state/<key>/scope.json.
+// Without that record the mapping would be re-derived by every process from
+// whatever it can see, and a selection that exists only in one process
+// environment - MULTICA_WORKSPACES_ROOT exported for the CLI daemon but not for
+// the Desktop daemon, say - would silently recreate the split-brain this whole
+// change exists to close. The manifest is the machine-visible answer: whoever
+// creates it first wins, everyone else reads it, and a conflicting explicit
+// override is refused instead of quietly taking effect.
 
 const (
 	// workStateRootDirName is the machine-scoped directory under ~/.multica that
@@ -86,6 +98,12 @@ var workStateTreeNames = []string{
 type WorkStateScope struct {
 	// Key is the fixed-length, filesystem-safe digest of the normalized backend.
 	Key string
+	// ScopeDir is the machine-scoped directory holding this backend scope record
+	// and its cross-process lock files: <multica root>/work-state/<key>.
+	ScopeDir string
+	// LockDir holds the cross-process exclusion files for this scope, shared by
+	// every daemon process that serves it.
+	LockDir string
 	// WorkspacesRoot is the base directory for task execution environments
 	// (workdirs, repo caches, GC ownership checks).
 	WorkspacesRoot string
@@ -101,7 +119,8 @@ type WorkStateScope struct {
 	Profiles []string
 }
 
-// WorkStateScopeParams are the inputs to ResolveWorkStateScope.
+// WorkStateScopeParams are the inputs to ReadWorkStateScope and
+// ResolveOrCreateWorkStateScope.
 type WorkStateScopeParams struct {
 	// ServerBaseURL is the normalized backend base URL of the daemon that is
 	// starting (LoadConfig serverBaseURL).
@@ -115,27 +134,111 @@ type WorkStateScopeParams struct {
 }
 
 // WorkStateKey returns the digest that namespaces this backend persistent work
-// state. The input is the normalized base URL, so equivalent spellings resolve
-// to one key: case is folded, and two profiles that reach the same backend write
-// the same tree.
+// state. The input is the NORMALIZED base URL (NormalizeServerBaseURL, which is
+// where scheme and host case are folded), and it is hashed exactly as given.
+//
+// Hashing the normalized string rather than re-normalizing here keeps one URL
+// contract in the codebase: whatever NormalizeServerBaseURL considers the same
+// backend is the same key, and a path it deliberately preserves stays
+// significant. Lowercasing the whole URL would collapse https://host/TenantA
+// into https://host/tenanta, which are different HTTP resources and must stay
+// different work states.
 //
 // Fixed length and hex-only: safe as a single path segment at any backend URL
 // length, and collision-free without a lossy "strip unsafe characters" scheme.
 func WorkStateKey(normalizedServerBaseURL string) string {
-	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(normalizedServerBaseURL))))
+	sum := sha256.Sum256([]byte(strings.TrimSpace(normalizedServerBaseURL)))
 	return hex.EncodeToString(sum[:8])
 }
 
-// ResolveWorkStateScope resolves the persistent work-state scope for one
-// machine + backend, adopting existing profile-scoped state where there is
-// exactly one such tree and refusing to start where two compete.
-func ResolveWorkStateScope(p WorkStateScopeParams) (WorkStateScope, error) {
+// ReadWorkStateScope resolves the persistent work-state scope for one machine +
+// backend WITHOUT writing anything.
+//
+// It is the read-only half of the pair: the persisted mapping when one exists,
+// and a pure derivation (adoption rules included) when none does yet. Callers
+// that only report - `daemon disk-usage`, status and other diagnostics - use
+// this, so a diagnostic can never become the process that claims an ambiguous
+// legacy tree or freezes a decision into the manifest. It refuses a genuinely
+// competing pair of trees exactly like the creating path does; the ambiguity
+// rule that needs to persist an answer only applies where an answer is being
+// persisted.
+func ReadWorkStateScope(p WorkStateScopeParams) (WorkStateScope, error) {
 	key := WorkStateKey(p.ServerBaseURL)
 	multicaRoot, err := cli.ProfileDir("")
 	if err != nil {
 		return WorkStateScope{}, fmt.Errorf("resolve daemon work state: %w", err)
 	}
+	if m, ok, err := readWorkStateManifest(multicaRoot, key, p.ServerBaseURL); err != nil {
+		return WorkStateScope{}, err
+	} else if ok {
+		return m.scope(workStateScopeDir(multicaRoot, key), key), nil
+	}
+	return computeWorkStateScope(p, key, multicaRoot, explicitWorkspacesRoot(p), false)
+}
 
+// ResolveOrCreateWorkStateScope is the daemon startup path: it returns the
+// persisted mapping for this machine + backend, creating it - exactly once,
+// under a machine-visible lock - when this is the first daemon to serve the
+// backend here.
+//
+// Creating it is a decision, so this is also where an ambiguous legacy tree
+// fails closed rather than being guessed at, and where an explicit override that
+// disagrees with the persisted mapping is refused.
+func ResolveOrCreateWorkStateScope(p WorkStateScopeParams) (WorkStateScope, error) {
+	key := WorkStateKey(p.ServerBaseURL)
+	multicaRoot, err := cli.ProfileDir("")
+	if err != nil {
+		return WorkStateScope{}, fmt.Errorf("resolve daemon work state: %w", err)
+	}
+	explicit := explicitWorkspacesRoot(p)
+
+	if m, ok, err := readWorkStateManifest(multicaRoot, key, p.ServerBaseURL); err != nil {
+		return WorkStateScope{}, err
+	} else if ok {
+		return m.adopt(workStateScopeDir(multicaRoot, key), key, explicit)
+	}
+
+	scopeDir := workStateScopeDir(multicaRoot, key)
+	if err := os.MkdirAll(scopeDir, 0o755); err != nil {
+		return WorkStateScope{}, fmt.Errorf("resolve daemon work state: create %s: %w", scopeDir, err)
+	}
+	lock, err := acquireScopeManifestLock(scopeDir)
+	if err != nil {
+		return WorkStateScope{}, err
+	}
+	defer lock.Release()
+
+	// A second daemon may have committed the mapping while this one waited for
+	// the lock. The committed record wins; this process must not re-adopt a
+	// different legacy tree just because it computed its answer first.
+	if m, ok, err := readWorkStateManifest(multicaRoot, key, p.ServerBaseURL); err != nil {
+		return WorkStateScope{}, err
+	} else if ok {
+		return m.adopt(workStateScopeDir(multicaRoot, key), key, explicit)
+	}
+
+	scope, err := computeWorkStateScope(p, key, multicaRoot, explicit, true)
+	if err != nil {
+		return WorkStateScope{}, err
+	}
+	manifest := workStateManifest{
+		Version:        scopeManifestVersion,
+		Backend:        strings.TrimSpace(p.ServerBaseURL),
+		Key:            key,
+		WorkspacesRoot: scope.WorkspacesRoot,
+		StateRoot:      scope.StateRoot,
+		CodexNamespace: scope.CodexNamespace,
+	}
+	if err := writeWorkStateManifest(scopeDir, manifest); err != nil {
+		return WorkStateScope{}, err
+	}
+	return scope, nil
+}
+
+// explicitWorkspacesRoot returns the operator-selected root for the starting
+// profile: the process override, else MULTICA_WORKSPACES_ROOT, else that
+// profile's persisted value.
+func explicitWorkspacesRoot(p WorkStateScopeParams) string {
 	explicit := strings.TrimSpace(p.ExplicitWorkspacesRoot)
 	if explicit == "" {
 		explicit = strings.TrimSpace(os.Getenv(workspacesRootEnv))
@@ -149,13 +252,32 @@ func ResolveWorkStateScope(p WorkStateScopeParams) (WorkStateScope, error) {
 			explicit = strings.TrimSpace(cfg.WorkspacesRoot)
 		}
 	}
+	return explicit
+}
 
+// computeWorkStateScope derives the scope for one machine + backend, adopting
+// existing profile-scoped state where there is exactly one such tree and
+// refusing to resolve where two compete. strictAmbiguity adds the rule that only
+// a decision-making caller may apply: another profile's non-empty legacy state
+// whose backend cannot be proven must not be guessed at (see
+// AmbiguousLegacyStateError).
+func computeWorkStateScope(p WorkStateScopeParams, key, multicaRoot, explicit string, strictAmbiguity bool) (WorkStateScope, error) {
 	owners, err := workStateOwners(multicaRoot, key, p.Profile, explicit)
 	if err != nil {
 		return WorkStateScope{}, err
 	}
+	if strictAmbiguity {
+		if err := rejectAmbiguousLegacyState(multicaRoot, key, p.Profile, p.ServerBaseURL); err != nil {
+			return WorkStateScope{}, err
+		}
+	}
 
-	scope := WorkStateScope{Key: key, Profiles: make([]string, 0, len(owners))}
+	scope := WorkStateScope{
+		Key:      key,
+		ScopeDir: workStateScopeDir(multicaRoot, key),
+		Profiles: make([]string, 0, len(owners)),
+	}
+	scope.LockDir = filepath.Join(scope.ScopeDir, workStateLockDirName)
 	for _, o := range owners {
 		scope.Profiles = append(scope.Profiles, o.name)
 	}
@@ -223,10 +345,11 @@ func ResolveWorkStateScope(p WorkStateScopeParams) (WorkStateScope, error) {
 }
 
 // WorkStateScopeForProfile resolves the scope for a profile from its recorded
-// backend. Read-only callers (daemon disk-usage, aggregate scans) use this so
-// they land on the same directory the running daemon uses. A profile with no
-// recorded server_url resolves against the built-in default backend, the same
-// fallback LoadConfig applies.
+// backend, reading the persisted mapping when one exists. Read-only callers
+// (daemon disk-usage, aggregate scans) use this so they land on the same
+// directory the running daemon uses, without ever creating or claiming one. A
+// profile with no recorded server_url resolves against the built-in default
+// backend, the same fallback LoadConfig applies.
 func WorkStateScopeForProfile(profile, explicitWorkspacesRoot string) (WorkStateScope, error) {
 	raw := ""
 	if cfg, err := cli.LoadCLIConfigForProfile(profile); err == nil {
@@ -239,7 +362,7 @@ func WorkStateScopeForProfile(profile, explicitWorkspacesRoot string) (WorkState
 	if err != nil {
 		return WorkStateScope{}, fmt.Errorf("resolve work state for profile %q: %w", profile, err)
 	}
-	return ResolveWorkStateScope(WorkStateScopeParams{
+	return ReadWorkStateScope(WorkStateScopeParams{
 		ServerBaseURL:          baseURL,
 		Profile:                profile,
 		ExplicitWorkspacesRoot: explicitWorkspacesRoot,
@@ -508,8 +631,260 @@ func (e *WorkStateConflictError) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "daemon work state conflict: the %s for backend %s is not unique on this machine: %s:", e.Tree, e.Backend, e.Choosing)
 	for _, c := range e.Candidates {
-		b.WriteString("\n  - " + c.path + " (" + c.label + ")")
+		b.WriteString("  - " + c.path + " (" + c.label + ")")
 	}
-	b.WriteString("\nThis machine has one daemon id shared by every profile, so serving this backend from more than one of these trees loses the workdir and provider session of every task created under the other (GH #8280). Nothing was moved or deleted. " + e.Hint)
+	b.WriteString("This machine has one daemon id shared by every profile, so serving this backend from more than one of these trees loses the workdir and provider session of every task created under the other (GH #8280). Nothing was moved or deleted. " + e.Hint)
 	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// Persisted canonical mapping: ~/.multica/work-state/<key>/scope.json
+
+const (
+	// scopeManifestVersion guards the on-disk record against a future shape.
+	scopeManifestVersion = 1
+	// scopeManifestFile is the record name inside the scope directory.
+	scopeManifestFile = "scope.json"
+	// scopeManifestLockFile serialises creation of that record between daemon
+	// processes starting at the same time. It lives beside the record rather than
+	// inside any state tree, so it can never be swept away by the GC it orders.
+	scopeManifestLockFile = ".scope.lock"
+	// workStateLockDirName holds the cross-process exclusion files of a scope.
+	workStateLockDirName = "locks"
+	// scopeManifestLockTimeout bounds the wait for another process that is
+	// creating the record. Creation is one small atomic write; a wait longer than
+	// this means something is wrong and the daemon must not start on a guess.
+	scopeManifestLockTimeout = 30 * time.Second
+	scopeManifestLockPoll    = 20 * time.Millisecond
+)
+
+// workStateManifest is the machine + backend -> persistent state locations
+// record. It is deliberately not profile configuration: no tokens, no workspace
+// ids, no device names, nothing that belongs to an account. It is the ownership
+// record that stops a later process - or a later profile - from independently
+// choosing a different tree for the same runtime.
+type workStateManifest struct {
+	Version        int    `json:"version"`
+	Backend        string `json:"backend"`
+	Key            string `json:"key"`
+	WorkspacesRoot string `json:"workspaces_root"`
+	StateRoot      string `json:"state_root"`
+	CodexNamespace string `json:"codex_namespace"`
+}
+
+// workStateScopeDir is the machine-scoped directory for one backend scope. The
+// manifest and the scope lock files live here, and it is also the canonical
+// provider state root a machine with no legacy tree uses.
+func workStateScopeDir(multicaRoot, key string) string {
+	return filepath.Join(multicaRoot, workStateRootDirName, key)
+}
+
+// scope returns the scope a committed manifest describes.
+func (m workStateManifest) scope(scopeDir, key string) WorkStateScope {
+	return WorkStateScope{
+		Key:            key,
+		ScopeDir:       scopeDir,
+		LockDir:        filepath.Join(scopeDir, workStateLockDirName),
+		WorkspacesRoot: m.WorkspacesRoot,
+		StateRoot:      m.StateRoot,
+		CodexNamespace: m.CodexNamespace,
+	}
+}
+
+// adopt returns the committed mapping after checking that this process is not
+// asking for a different workspaces root than the one the backend is bound to.
+// The manifest is authoritative: silently honouring the process-local override
+// here is exactly the split-brain this record exists to prevent.
+func (m workStateManifest) adopt(scopeDir, key, explicit string) (WorkStateScope, error) {
+	scope := m.scope(scopeDir, key)
+	if explicit == "" {
+		return scope, nil
+	}
+	requested := absWorkStatePath(explicit)
+	if sameWorkStatePath(requested, scope.WorkspacesRoot) {
+		return scope, nil
+	}
+	return WorkStateScope{}, &WorkStateConflictError{
+		Tree:     "workspaces root",
+		Backend:  m.Backend,
+		Choosing: "this backend is already bound to a different workspaces root on this machine",
+		Candidates: []workStateCandidate{
+			{label: "persisted mapping", path: scope.WorkspacesRoot},
+			{label: "this process requested", path: requested},
+		},
+		Hint: "Run without the override to follow the persisted mapping, or point the override at " +
+			"the persisted root. The mapping is never overwritten silently.",
+	}
+}
+
+// readWorkStateManifest loads and validates the persisted mapping for key. A
+// missing record is (zero, false, nil). A record that cannot be trusted -
+// unparseable, a different version, or describing a different backend or key -
+// fails closed instead of being treated as absent: re-deriving the answer could
+// adopt a different tree than the one the machine is already serving.
+func readWorkStateManifest(multicaRoot, key, backend string) (workStateManifest, bool, error) {
+	path := filepath.Join(workStateScopeDir(multicaRoot, key), scopeManifestFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return workStateManifest{}, false, nil
+		}
+		return workStateManifest{}, false, fmt.Errorf("daemon work state: read %s: %w", path, err)
+	}
+	var m workStateManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return workStateManifest{}, false, fmt.Errorf("daemon work state: %s is not readable JSON (%w); fix or remove it to re-establish the mapping", path, err)
+	}
+	switch {
+	case m.Version != scopeManifestVersion:
+		return workStateManifest{}, false, fmt.Errorf("daemon work state: %s has version %d, this daemon understands %d", path, m.Version, scopeManifestVersion)
+	case m.Key != "" && m.Key != key:
+		return workStateManifest{}, false, fmt.Errorf("daemon work state: %s describes key %s, want %s", path, m.Key, key)
+	case strings.TrimSpace(m.Backend) != strings.TrimSpace(backend):
+		return workStateManifest{}, false, fmt.Errorf("daemon work state: %s is bound to backend %s, want %s", path, m.Backend, backend)
+	case strings.TrimSpace(m.WorkspacesRoot) == "" || strings.TrimSpace(m.StateRoot) == "" || strings.TrimSpace(m.CodexNamespace) == "":
+		return workStateManifest{}, false, fmt.Errorf("daemon work state: %s is incomplete (workspaces_root, state_root and codex_namespace are all required)", path)
+	}
+	return m, true, nil
+}
+
+// acquireScopeManifestLock serialises creation of a backend mapping across
+// processes. The lock is an OS lock on a file outside every state tree, so a
+// crashed creator releases it automatically and no stale file has to be
+// interpreted.
+func acquireScopeManifestLock(scopeDir string) (*execenv.ScopeClaim, error) {
+	path := filepath.Join(scopeDir, scopeManifestLockFile)
+	deadline := time.Now().Add(scopeManifestLockTimeout)
+	for {
+		claim, ok, err := execenv.TryLockFileExclusiveNonBlocking(path)
+		if err != nil {
+			return nil, fmt.Errorf("daemon work state: lock %s: %w", path, err)
+		}
+		if ok {
+			return claim, nil
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("daemon work state: another process is still creating %s after %s", path, scopeManifestLockTimeout)
+		}
+		time.Sleep(scopeManifestLockPoll)
+	}
+}
+
+// writeWorkStateManifest publishes the record atomically: same-directory temp
+// file, fsync, rename. A reader - or a daemon that starts mid-write - sees
+// either no record or the complete one, never a partial JSON document.
+func writeWorkStateManifest(scopeDir string, m workStateManifest) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("daemon work state: encode manifest: %w", err)
+	}
+	data = append(data, '\n')
+	return writeWorkStateFileAtomic(filepath.Join(scopeDir, scopeManifestFile), data)
+}
+
+func writeWorkStateFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("daemon work state: create temp for %s: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpPath)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return fmt.Errorf("daemon work state: write %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("daemon work state: sync %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("daemon work state: close %s: %w", tmpPath, err)
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("daemon work state: chmod %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("daemon work state: publish %s: %w", path, err)
+	}
+	return nil
+}
+
+// rejectAmbiguousLegacyState refuses to decide a backend scope while another
+// profile on this machine holds non-empty legacy state whose backend cannot be
+// proven.
+//
+// The starting profile is exempt: the process that is running proves which
+// backend its own profile belongs to, so its legacy tree is a candidate for
+// this scope by construction. Any other profile only counts when its recorded
+// server_url normalizes to this backend, so a profile with no recorded backend
+// is genuinely unknowable - it could be this backend (in which case adopting
+// this scope's tree would strand a second one) or another backend (in which case
+// it is none of this scope's business). Neither answer can be derived, so the
+// daemon stops instead of guessing, and the operator resolves it by persisting
+// that profile's backend or starting it once.
+func rejectAmbiguousLegacyState(multicaRoot, key, currentProfile, backend string) error {
+	namesOnDisk, err := profileNamesOnDisk(multicaRoot)
+	if err != nil {
+		return err
+	}
+	var ambiguous []string
+	for _, name := range append([]string{""}, namesOnDisk...) {
+		if name == currentProfile {
+			continue
+		}
+		cfg, err := cli.LoadCLIConfigForProfile(name)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(cfg.ServerURL) != "" {
+			continue // attributable: the candidate scan already handles it
+		}
+		owner, err := newWorkStateOwner(name, "")
+		if err != nil {
+			continue
+		}
+		if workStateRootHasState(owner.legacyWorkspacesRoot()) || profileDirHasProviderState(owner.profileDir) ||
+			execenv.CodexSessionNamespaceHasState(execenv.CodexSessionNamespaceForProfile(name)) {
+			ambiguous = append(ambiguous, name)
+		}
+	}
+	if len(ambiguous) == 0 {
+		return nil
+	}
+	return &AmbiguousLegacyStateError{Backend: backend, Profiles: ambiguous}
+}
+
+// AmbiguousLegacyStateError reports non-empty legacy state that belongs to a
+// profile with no recorded backend, so this machine cannot prove whether it
+// belongs to the backend being resolved.
+type AmbiguousLegacyStateError struct {
+	Backend  string
+	Profiles []string
+}
+
+func (e *AmbiguousLegacyStateError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "daemon work state is ambiguous: this machine has non-empty legacy state for %s, but that profile has no recorded backend, so Multica cannot prove whether it belongs to backend %s.",
+		strings.Join(profileLabels(e.Profiles), ", "), e.Backend)
+	b.WriteString("Start or migrate that profile first (which records its backend and its own mapping), or persist its server_url, then start this daemon again. Nothing was moved or deleted.")
+	return b.String()
+}
+
+func profileLabels(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" {
+			out = append(out, "the default profile")
+			continue
+		}
+		out = append(out, "profile "+name)
+	}
+	return out
 }

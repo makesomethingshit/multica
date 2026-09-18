@@ -100,7 +100,7 @@ func seedWorkspaceState(t *testing.T, root string) {
 
 func resolveScope(t *testing.T, baseURL, profile, explicitRoot string) WorkStateScope {
 	t.Helper()
-	scope, err := ResolveWorkStateScope(WorkStateScopeParams{
+	scope, err := ResolveOrCreateWorkStateScope(WorkStateScopeParams{
 		ServerBaseURL:          baseURL,
 		Profile:                profile,
 		ExplicitWorkspacesRoot: explicitRoot,
@@ -111,10 +111,16 @@ func resolveScope(t *testing.T, baseURL, profile, explicitRoot string) WorkState
 	return scope
 }
 
-// TestWorkStateKey_StableAndNormalized pins the key itself: fixed length,
-// filesystem-safe, insensitive to URL spelling that reaches the same backend,
-// and distinct per backend.
-func TestWorkStateKey_StableAndNormalized(t *testing.T) {
+// TestWorkStateKey_FollowsURLNormalization pins the key itself: fixed length,
+// filesystem-safe, stable, and derived from the NORMALIZED base URL rather than
+// from a second normalization of its own.
+//
+// Case folding belongs to NormalizeServerBaseURL, which folds exactly the two
+// components that are case-insensitive by contract (scheme and host). The path
+// is not one of them: https://host/TenantA and https://host/tenanta are two HTTP
+// resources, so they must stay two work states rather than being collapsed by a
+// blanket ToLower over the whole URL.
+func TestWorkStateKey_FollowsURLNormalization(t *testing.T) {
 	t.Parallel()
 
 	key := WorkStateKey(testBackendA)
@@ -129,13 +135,41 @@ func TestWorkStateKey_StableAndNormalized(t *testing.T) {
 	if key != WorkStateKey(testBackendA) {
 		t.Fatal("key must be stable across calls")
 	}
-	// Normalization: case and surrounding whitespace reach the same backend, so
-	// they must reach the same tree.
-	if got := WorkStateKey("  HTTPS://Same.Example  "); got != key {
-		t.Fatalf("key for a differently spelled same backend = %q, want %q", got, key)
-	}
 	if other := WorkStateKey(testBackendB); other == key {
 		t.Fatalf("two backends share key %q", key)
+	}
+
+	// Scheme and host case reach one backend, so they must reach one key.
+	upper, err := NormalizeServerBaseURL("HTTPS://Same.Example")
+	if err != nil {
+		t.Fatalf("normalize upper-case backend: %v", err)
+	}
+	lower, err := NormalizeServerBaseURL("https://same.example")
+	if err != nil {
+		t.Fatalf("normalize lower-case backend: %v", err)
+	}
+	if upper != lower {
+		t.Fatalf("normalization disagrees on one backend: %q vs %q", upper, lower)
+	}
+	if WorkStateKey(upper) != WorkStateKey(lower) {
+		t.Fatalf("two spellings of one backend got keys %q and %q", WorkStateKey(upper), WorkStateKey(lower))
+	}
+
+	// A path difference is a backend difference, and it must survive both the
+	// normalizer and the key.
+	tenantA, err := NormalizeServerBaseURL("https://example.com/TenantA")
+	if err != nil {
+		t.Fatalf("normalize TenantA: %v", err)
+	}
+	tenantLower, err := NormalizeServerBaseURL("https://example.com/tenanta")
+	if err != nil {
+		t.Fatalf("normalize tenanta: %v", err)
+	}
+	if tenantA == tenantLower {
+		t.Fatal("normalization folded a case-significant path into one backend")
+	}
+	if WorkStateKey(tenantA) == WorkStateKey(tenantLower) {
+		t.Fatal("two distinct backends share one work-state key")
 	}
 }
 
@@ -287,7 +321,7 @@ func TestWorkStateScope_ConflictingLegacyStateFailsClosed(t *testing.T) {
 			writeProfileConfig(t, testDesktop, testBackendA, "")
 			tc.seed(t, home)
 
-			_, err := ResolveWorkStateScope(WorkStateScopeParams{
+			_, err := ResolveOrCreateWorkStateScope(WorkStateScopeParams{
 				ServerBaseURL: testBackendA,
 				Profile:       testDesktop,
 			})
@@ -351,7 +385,7 @@ func TestWorkStateScope_ConflictingExplicitRootsAreRejected(t *testing.T) {
 	writeProfileConfig(t, "", testBackendA, filepath.Join(t.TempDir(), "root-a"))
 	writeProfileConfig(t, testDesktop, testBackendA, filepath.Join(t.TempDir(), "root-b"))
 
-	_, err := ResolveWorkStateScope(WorkStateScopeParams{
+	_, err := ResolveOrCreateWorkStateScope(WorkStateScopeParams{
 		ServerBaseURL: testBackendA,
 		Profile:       testDesktop,
 	})
@@ -364,7 +398,7 @@ func TestWorkStateScope_ConflictingExplicitRootsAreRejected(t *testing.T) {
 	}
 
 	// A per-process override is a third selection, and conflicts just the same.
-	_, err = ResolveWorkStateScope(WorkStateScopeParams{
+	_, err = ResolveOrCreateWorkStateScope(WorkStateScopeParams{
 		ServerBaseURL:          testBackendA,
 		Profile:                testDesktop,
 		ExplicitWorkspacesRoot: filepath.Join(t.TempDir(), "root-c"),
