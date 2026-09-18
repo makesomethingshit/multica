@@ -8004,7 +8004,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// the resolved source home so switching an agent's profile switches its
 		// memory line, matching Hermes' own "a profile is an isolated instance"
 		// model. Guarded from the GC for the whole task, as the Codex store below.
-		if store := execenv.HermesMemoryStorePath(d.cfg.Profile, task.AgentID, res.SourceHome); store != "" {
+		if store := execenv.HermesMemoryStorePath(d.cfg.WorkState.StateRoot, task.AgentID, res.SourceHome); store != "" {
 			hermesMemoryStore = store
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
@@ -8015,7 +8015,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// tasks of one conversation are serial, so the shard has a single
 		// writer, while two issues never share a database. Guarded from the GC
 		// for the whole task, as the stores above and below.
-		if store := execenv.HermesSessionStorePath(d.cfg.Profile, task.AgentID, res.SourceHome, taskCtx); store != "" {
+		if store := execenv.HermesSessionStorePath(d.cfg.WorkState.StateRoot, task.AgentID, res.SourceHome, taskCtx); store != "" {
 			hermesSessionStore = store
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
@@ -8036,7 +8036,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// store's stale (pre-remount) mtime cannot reclaim it out from under a resume
 	// of a long-idle issue (MUL-4424). No-op for non-Codex tasks / no stable key.
 	if provider == "codex" {
-		if store := execenv.CodexSessionStorePath(d.cfg.Profile, taskCtx); store != "" {
+		if store := execenv.CodexSessionStorePath(d.cfg.WorkState.CodexNamespace, taskCtx); store != "" {
 			d.markActiveStore(store)
 			defer d.unmarkActiveStore(store)
 		}
@@ -8062,6 +8062,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		env, err = d.reuseExecutionEnvironment(prepareCtx, execenv.ReuseParams{
 			WorkspacesRoot: d.cfg.WorkspacesRoot,
 			Profile:        d.cfg.Profile,
+			// Persistent session state follows the machine + backend scope, not
+			// the profile, so a conversation started under another profile aimed
+			// at this backend resumes here (#8280).
+			CodexSessionNamespace: d.cfg.WorkState.CodexNamespace,
 			// The canonical path the lock was taken on. Handing Reuse the raw
 			// PriorWorkDir instead would re-resolve it, so the directory we
 			// locked and the directory we use could differ.
@@ -8107,13 +8111,16 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if env == nil {
 		var err error
 		prepParams := execenv.PrepareParams{
-			WorkspacesRoot:  d.cfg.WorkspacesRoot,
-			Profile:         d.cfg.Profile,
-			WorkspaceID:     task.WorkspaceID,
-			WorkspaceSlug:   task.WorkspaceSlug,
-			TaskID:          task.ID,
-			IssueIdentifier: task.IssueIdentifier,
-			AgentName:       agentName,
+			WorkspacesRoot: d.cfg.WorkspacesRoot,
+			Profile:        d.cfg.Profile,
+			// See ReuseParams above: session state is keyed on the work-state
+			// scope, never on the profile name (#8280).
+			CodexSessionNamespace: d.cfg.WorkState.CodexNamespace,
+			WorkspaceID:           task.WorkspaceID,
+			WorkspaceSlug:         task.WorkspaceSlug,
+			TaskID:                task.ID,
+			IssueIdentifier:       task.IssueIdentifier,
+			AgentName:             agentName,
 			// This run already holds the claim (envClaim above) and the reset
 			// it implies; preparation must not try to take it again.
 			EnvRootPreclaimed:     true,
@@ -8509,14 +8516,14 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	layerCustomEnvAndHermesHome(agentEnv, agentCustomEnv, env.HermesHome, d.logger)
 	if provider == "reasonix" {
-		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.Profile, task.RuntimeID, task.AgentID)
+		reasonixStateHome, err := prepareReasonixTaskStateHome(d.cfg.WorkState.StateRoot, task.RuntimeID, task.AgentID)
 		if err != nil {
 			return TaskResult{}, fmt.Errorf("prepare reasonix state home: %w", err)
 		}
 		agentEnv["REASONIX_STATE_HOME"] = reasonixStateHome
 	}
 	if provider == "dsh" {
-		dshSessionRoot, err := prepareDshTaskSessionRoot(d.cfg.Profile, task.RuntimeID, task.AgentID)
+		dshSessionRoot, err := prepareDshTaskSessionRoot(d.cfg.WorkState.StateRoot, task.RuntimeID, task.AgentID)
 		if err != nil {
 			return TaskResult{}, fmt.Errorf("prepare dsh session root: %w", err)
 		}
@@ -10436,15 +10443,27 @@ func layerCustomEnvAndHermesHome(agentEnv, customEnv map[string]string, overlayH
 	}
 }
 
+// reasonixStateDirName and dshSessionDirName are the work-state subtrees holding
+// those providers' persisted transcripts and leases. They are listed in
+// workStateTreeNames (workstate.go) because adoption has to recognize them.
+const (
+	reasonixStateDirName = "reasonix-state"
+	dshSessionDirName    = "dsh-sessions"
+)
+
 // prepareReasonixTaskStateHome isolates persisted transcripts and leases per
 // (runtime, agent) while leaving REASONIX_HOME untouched. Current Reasonix
 // reads credentials/config from REASONIX_HOME and state from
 // REASONIX_STATE_HOME, so `reasonix setup` remains the sole credential owner
 // and Multica never copies API keys into task-managed files.
-func prepareReasonixTaskStateHome(profile, runtimeID, agentID string) (string, error) {
-	profileDir, err := cli.ProfileDir(profile)
-	if err != nil {
-		return "", err
+//
+// stateRoot is the daemon's work-state root (machine + backend), not the Multica
+// profile directory: a transcript has to outlive whichever profile launched the
+// daemon that serves it, so a task started under one profile can be continued
+// under another aimed at the same backend (GH #8280).
+func prepareReasonixTaskStateHome(stateRoot, runtimeID, agentID string) (string, error) {
+	if strings.TrimSpace(stateRoot) == "" {
+		return "", fmt.Errorf("work-state root is required")
 	}
 	runtimeSegment, err := validateReasonixStateSegment("runtime", runtimeID)
 	if err != nil {
@@ -10454,7 +10473,7 @@ func prepareReasonixTaskStateHome(profile, runtimeID, agentID string) (string, e
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(profileDir, "reasonix-state", runtimeSegment, agentSegment)
+	path := filepath.Join(stateRoot, reasonixStateDirName, runtimeSegment, agentSegment)
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return "", err
 	}
@@ -10467,10 +10486,12 @@ func prepareReasonixTaskStateHome(profile, runtimeID, agentID string) (string, e
 // prepareDshTaskSessionRoot keeps DSH transcripts private to one Multica
 // runtime/agent pair. Credentials and the user's DSH profile remain in the
 // ordinary DSH_HOME; only session persistence is redirected.
-func prepareDshTaskSessionRoot(profile, runtimeID, agentID string) (string, error) {
-	profileDir, err := cli.ProfileDir(profile)
-	if err != nil {
-		return "", err
+//
+// stateRoot is the daemon's work-state root (machine + backend), for the same
+// reason as prepareReasonixTaskStateHome (GH #8280).
+func prepareDshTaskSessionRoot(stateRoot, runtimeID, agentID string) (string, error) {
+	if strings.TrimSpace(stateRoot) == "" {
+		return "", fmt.Errorf("work-state root is required")
 	}
 	runtimeSegment, err := validateReasonixStateSegment("runtime", runtimeID)
 	if err != nil {
@@ -10480,7 +10501,7 @@ func prepareDshTaskSessionRoot(profile, runtimeID, agentID string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(profileDir, "dsh-sessions", runtimeSegment, agentSegment)
+	path := filepath.Join(stateRoot, dshSessionDirName, runtimeSegment, agentSegment)
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return "", err
 	}

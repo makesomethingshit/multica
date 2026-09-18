@@ -137,7 +137,11 @@ func (d *Daemon) runGC(ctx context.Context) {
 	// Reclaim per-issue Codex session stores idle past their TTL. These live
 	// under the shared ~/.codex home (outside WorkspacesRoot) so resume survives
 	// the task GC, which means they need their own bounded lifecycle (MUL-4424).
-	if storesRemoved, storeBytes := execenv.PruneCodexSessionStores(d.cfg.Profile, d.cfg.GCCodexSessionTTL, time.Now(), d.reserveStoreForDeletion, d.logger); storesRemoved > 0 {
+	// Every pruner below takes the daemon's work-state scope — the same identity
+	// task preparation mounts — so the GC can only ever reclaim state this daemon
+	// is authorized to serve. Two profiles aimed at one backend share one scope and
+	// therefore both prune it; a daemon on another backend never sees it (#8280).
+	if storesRemoved, storeBytes := execenv.PruneCodexSessionStores(d.cfg.WorkState.CodexNamespace, d.cfg.GCCodexSessionTTL, time.Now(), d.reserveStoreForDeletion, d.logger); storesRemoved > 0 {
 		stats.storesReclaimed += storesRemoved
 		stats.bytesReclaimed += storeBytes
 	}
@@ -146,7 +150,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 	// (that is what fixes #6638), so a deleted agent's memory needs its own
 	// bounded lifecycle. Retention is much longer than the Codex one — these are
 	// a few markdown files, and reclaiming them is user-visible amnesia.
-	if storesRemoved, storeBytes := execenv.PruneHermesMemoryStores(d.cfg.Profile, d.cfg.GCHermesMemoryTTL, time.Now(), d.reserveStoreForDeletion, d.logger); storesRemoved > 0 {
+	if storesRemoved, storeBytes := execenv.PruneHermesMemoryStores(d.cfg.WorkState.StateRoot, d.cfg.GCHermesMemoryTTL, time.Now(), d.reserveStoreForDeletion, d.logger); storesRemoved > 0 {
 		stats.hermesMemoryStoresReclaimed += storesRemoved
 		stats.bytesReclaimed += storeBytes
 	}
@@ -154,7 +158,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 	// And per-conversation Hermes session stores, which outlive the task for the
 	// same reason (that is what fixes #6806) but hold transcripts rather than
 	// notes — so they get the shorter, Codex-like retention.
-	if storesRemoved, storeBytes := execenv.PruneHermesSessionStores(d.cfg.Profile, d.cfg.GCHermesSessionTTL, time.Now(), d.reserveStoreForDeletion, d.logger); storesRemoved > 0 {
+	if storesRemoved, storeBytes := execenv.PruneHermesSessionStores(d.cfg.WorkState.StateRoot, d.cfg.GCHermesSessionTTL, time.Now(), d.reserveStoreForDeletion, d.logger); storesRemoved > 0 {
 		stats.hermesSessionStoresReclaimed += storesRemoved
 		stats.bytesReclaimed += storeBytes
 	}
