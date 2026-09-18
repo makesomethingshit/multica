@@ -6,7 +6,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
 )
+
+// withRuntimeID supplies the {runtimeId} path parameter these handlers read from
+// the chi route context, which a directly-invoked handler does not have. Its
+// peers in this package do the same.
+func withRuntimeID(req *http.Request, runtimeID string) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("runtimeId", runtimeID)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
 
 // TestReportRuntimeResumeWarning covers the daemon-authenticated endpoint that
 // records a prior-session continuity warning on the runtime.
@@ -66,10 +77,10 @@ func TestReportRuntimeResumeWarning(t *testing.T) {
 
 	// A. The owning daemon reports; the server builds the stored object.
 	w = httptest.NewRecorder()
-	testHandler.ReportRuntimeResumeWarning(w, newDaemonTokenRequest("POST",
+	testHandler.ReportRuntimeResumeWarning(w, withRuntimeID(newDaemonTokenRequest("POST",
 		"/api/daemon/runtimes/"+runtimeID+"/resume-warning",
 		map[string]any{"code": ResumeWarningPriorSessionUnavailable, "task_id": "task-1"},
-		testWorkspaceID, daemonID))
+		testWorkspaceID, daemonID), runtimeID))
 	if w.Code != http.StatusOK {
 		t.Fatalf("report: %d: %s", w.Code, w.Body.String())
 	}
@@ -91,10 +102,10 @@ func TestReportRuntimeResumeWarning(t *testing.T) {
 
 	// D. An unknown code is refused and changes nothing.
 	w = httptest.NewRecorder()
-	testHandler.ReportRuntimeResumeWarning(w, newDaemonTokenRequest("POST",
+	testHandler.ReportRuntimeResumeWarning(w, withRuntimeID(newDaemonTokenRequest("POST",
 		"/api/daemon/runtimes/"+runtimeID+"/resume-warning",
 		map[string]any{"code": "something_else", "task_id": "task-2"},
-		testWorkspaceID, daemonID))
+		testWorkspaceID, daemonID), runtimeID))
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("unknown code: %d: %s", w.Code, w.Body.String())
 	}
@@ -104,10 +115,10 @@ func TestReportRuntimeResumeWarning(t *testing.T) {
 
 	// C. A daemon authenticated for another workspace cannot report on this one.
 	w = httptest.NewRecorder()
-	testHandler.ReportRuntimeResumeWarning(w, newDaemonTokenRequest("POST",
+	testHandler.ReportRuntimeResumeWarning(w, withRuntimeID(newDaemonTokenRequest("POST",
 		"/api/daemon/runtimes/"+runtimeID+"/resume-warning",
 		map[string]any{"code": ResumeWarningPriorSessionUnavailable, "task_id": "task-3"},
-		"00000000-0000-0000-0000-000000000000", daemonID))
+		"00000000-0000-0000-0000-000000000000", daemonID), runtimeID))
 	if w.Code == http.StatusOK {
 		t.Fatalf("a foreign workspace reported on this runtime: %d: %s", w.Code, w.Body.String())
 	}
