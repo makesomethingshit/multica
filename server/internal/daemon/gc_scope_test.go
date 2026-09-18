@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
+	"github.com/multica-ai/multica/server/internal/daemon/repocache"
 )
 
 // Cross-process lifecycle safety (GH #8280 Blocker A).
@@ -32,7 +33,7 @@ func newScopeGuardDaemon(t *testing.T, lockDir, workspacesRoot string) *Daemon {
 		},
 		logger:            quietTaskLog(),
 		scopeLocks:        execenv.NewScopeLocks(lockDir),
-		storeClaimTimeout: 250 * time.Millisecond,
+		scopeClaimTimeout: 250 * time.Millisecond,
 		activeEnvRoots:    map[string]int{},
 		deletingEnvRoots:  map[string]bool{},
 		activeStores:      map[string]int{},
@@ -48,33 +49,56 @@ func scopeLockDirForTest(t *testing.T, key string) string {
 	return filepath.Join(t.TempDir(), workStateRootDirName, key, workStateLockDirName)
 }
 
-// TestGCScope_EnvRootActiveInAnotherDaemon is case A: a task running in one
-// daemon owns its env root through .task_lock, so a GC in another daemon of the
-// same scope must skip every mutation of that root - full removal and the
-// artifact paths, which share the reservation.
-func TestGCScope_EnvRootActiveInAnotherDaemon(t *testing.T) {
-	lockDir := scopeLockDirForTest(t, "key-a")
-	daemonA := newScopeGuardDaemon(t, lockDir, "")
-	daemonB := newScopeGuardDaemon(t, lockDir, "")
-
-	wsRoot := t.TempDir()
-	daemonA.cfg.WorkspacesRoot = wsRoot
-	daemonB.cfg.WorkspacesRoot = wsRoot
-	claim, err := execenv.ClaimEnvRoot(execenv.RootDirParams{
-		WorkspacesRoot: wsRoot,
+// envRootTestTask is the (workspaces root, workspace, task) triple the env-root
+// tests claim paths for.
+func envRootTestTask(t *testing.T) (execenv.RootDirParams, string) {
+	t.Helper()
+	params := execenv.RootDirParams{
+		WorkspacesRoot: t.TempDir(),
 		WorkspaceID:    "11111111-1111-1111-1111-111111111111",
 		TaskID:         "22222222-2222-2222-2222-222222222222",
-	})
-	if err != nil {
-		t.Fatalf("daemon B claim env root: %v", err)
 	}
-	root := claim.RootDir()
-	mustWriteFile(t, filepath.Join(root, "workdir", "main.go"), "package main")
+	root, err := execenv.ResolveRootDir(params)
+	if err != nil {
+		t.Fatalf("resolve env root: %v", err)
+	}
+	return params, root
+}
+
+// startTaskOnEnvRoot mirrors what runTask does, in the order it does it: the
+// stable scope-level use claim first, then the env root own .task_lock.
+func startTaskOnEnvRoot(t *testing.T, d *Daemon, params execenv.RootDirParams, root string) (*execenv.EnvRootClaim, func()) {
+	t.Helper()
+	releaseScope, err := d.holdEnvRootForTask(root)
+	if err != nil {
+		t.Fatalf("scope claim for %s: %v", root, err)
+	}
+	claim, err := execenv.ClaimEnvRoot(params)
+	if err != nil {
+		releaseScope()
+		t.Fatalf("env root claim for %s: %v", root, err)
+	}
+	return claim, releaseScope
+}
+
+// TestGCScope_EnvRootActiveInAnotherDaemon is case A: a task running in one
+// daemon owns its env root through the stable scope claim and its .task_lock, so
+// a GC in another daemon of the same scope must skip every mutation of that root
+// — including the artifact path, which shares the reservation, and the full
+// removal, which runs the production mutation under the claim.
+func TestGCScope_EnvRootActiveInAnotherDaemon(t *testing.T) {
+	lockDir := scopeLockDirForTest(t, "key-a")
+	params, root := envRootTestTask(t)
+	daemonA := newScopeGuardDaemon(t, lockDir, params.WorkspacesRoot)
+	daemonB := newScopeGuardDaemon(t, lockDir, params.WorkspacesRoot)
+
+	claim, releaseScope := startTaskOnEnvRoot(t, daemonB, params, root)
+	defer releaseScope()
+	defer claim.Release()
 	artifact := filepath.Join(root, "workdir", "node_modules", "pkg", "index.js")
 	mustWriteFile(t, artifact, "module.exports = 1")
+	mustWriteFile(t, filepath.Join(root, "workdir", "main.go"), "package main")
 
-	// Daemon A would never know about B own task from its own maps; the env root
-	// lock is what has to stop it.
 	if _, ok := daemonA.reserveEnvRootForGC(root); ok {
 		t.Fatal("GC took the env root of a task running in another daemon")
 	}
@@ -85,17 +109,125 @@ func TestGCScope_EnvRootActiveInAnotherDaemon(t *testing.T) {
 	if _, err := os.Stat(artifact); err != nil {
 		t.Fatalf("artifact cleanup removed content from a live env root: %v", err)
 	}
+	if cleaned := daemonA.applyGCAction(root, gcActionClean, stats); cleaned != 0 {
+		t.Fatalf("full cleanup removed a live env root (%d dirs)", cleaned)
+	}
+	if _, err := os.Stat(filepath.Join(root, "workdir", "main.go")); err != nil {
+		t.Fatalf("a live env root was removed: %v", err)
+	}
 
-	// B finishes its task; now A may do the cleanup it was asked for.
+	// B finishes its task; now A may do the cleanup it was asked for, and the
+	// production path does it under the claim it takes internally.
 	claim.Release()
-	release, ok := daemonA.reserveEnvRootForGC(root)
+	releaseScope()
+	if cleaned := daemonA.applyGCAction(root, gcActionClean, stats); cleaned != 1 {
+		t.Fatalf("eligible cleanup did not remove the released env root (%d dirs)", cleaned)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("env root survived an eligible cleanup (err = %v)", err)
+	}
+}
+
+// TestGCScope_DeletionBlocksTaskStart is case B: once a GC owns the deletion for
+// an env-root path, no task may begin using or recreating it until that deletion
+// finishes.
+func TestGCScope_DeletionBlocksTaskStart(t *testing.T) {
+	lockDir := scopeLockDirForTest(t, "key-b2")
+	params, root := envRootTestTask(t)
+	daemonA := newScopeGuardDaemon(t, lockDir, params.WorkspacesRoot)
+	daemonB := newScopeGuardDaemon(t, lockDir, params.WorkspacesRoot)
+	mustWriteFile(t, filepath.Join(root, "workdir", "main.go"), "package main")
+
+	commitA, ok := daemonA.reserveEnvRootForGC(root)
 	if !ok {
-		t.Fatal("GC still refused an env root no process owns")
+		t.Fatal("daemon A could not take the deletion claim for an unowned env root")
 	}
-	release()
-	if _, removed := daemonA.cleanTaskDir(root); !removed {
-		t.Fatal("eligible cleanup did not remove the released env root")
+	if _, err := daemonB.holdEnvRootForTask(root); err == nil {
+		t.Fatal("a task started on an env root another daemon is deleting")
 	}
+	if _, err := os.Stat(filepath.Join(root, "workdir", "main.go")); err != nil {
+		t.Fatalf("the pending deletion already mutated the root: %v", err)
+	}
+
+	commitA()
+	releaseScope, err := daemonB.holdEnvRootForTask(root)
+	if err != nil {
+		t.Fatalf("a task was still refused after the deletion finished: %v", err)
+	}
+	releaseScope()
+}
+
+// TestGCScope_EnvRootRecreationDoesNotBypassExclusion is case C, the inode race
+// this revision exists to close. A deletion claim is held while the env root (and
+// with it .task_lock) is removed; another daemon then recreates the directory and
+// a brand-new .task_lock inode. Because the authoritative claim is keyed on the
+// PATH and lives outside the tree, the new inode buys the second daemon nothing.
+func TestGCScope_EnvRootRecreationDoesNotBypassExclusion(t *testing.T) {
+	lockDir := scopeLockDirForTest(t, "key-c2")
+	params, root := envRootTestTask(t)
+	daemonA := newScopeGuardDaemon(t, lockDir, params.WorkspacesRoot)
+	daemonB := newScopeGuardDaemon(t, lockDir, params.WorkspacesRoot)
+
+	mustWriteFile(t, filepath.Join(root, "workdir", "main.go"), "package main")
+	commitA, ok := daemonA.reserveEnvRootForGC(root)
+	if !ok {
+		t.Fatal("daemon A could not take the deletion claim")
+	}
+	// A removal in flight: the tree, and the old lock inode with it, are gone.
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("simulate removal: %v", err)
+	}
+	// B recreates the root and a fresh .task_lock at the same path.
+	mustWriteFile(t, filepath.Join(root, ".task_lock"), "")
+
+	if _, err := daemonB.holdEnvRootForTask(root); err == nil {
+		t.Fatal("recreating the env root and its lock file bypassed the scope-level deletion claim")
+	}
+
+	// The in-tree lock alone is not what protected the deletion: on the recreated
+	// inode it is taken freely, which is exactly why the scope claim is the
+	// authority.
+	legacyClaim, err := execenv.ClaimEnvRoot(params)
+	if err != nil {
+		t.Fatalf("recreated .task_lock should be claimable: %v", err)
+	}
+	legacyClaim.Release()
+
+	commitA()
+	releaseScope, err := daemonB.holdEnvRootForTask(root)
+	if err != nil {
+		t.Fatalf("a task was still refused after the deletion finished: %v", err)
+	}
+	releaseScope()
+}
+
+// TestGCScope_LegacyTaskWithoutScopeClaimIsProtected is case D: a task started by
+// an older daemon holds only .task_lock. The new GC must still refuse to delete
+// that env root, or a rolling upgrade would delete a running task directory.
+func TestGCScope_LegacyTaskWithoutScopeClaimIsProtected(t *testing.T) {
+	lockDir := scopeLockDirForTest(t, "key-d2")
+	params, root := envRootTestTask(t)
+	daemonA := newScopeGuardDaemon(t, lockDir, params.WorkspacesRoot)
+
+	legacyClaim, err := execenv.ClaimEnvRoot(params)
+	if err != nil {
+		t.Fatalf("legacy env root claim: %v", err)
+	}
+	mustWriteFile(t, filepath.Join(root, "workdir", "main.go"), "package main")
+	if _, ok := daemonA.reserveEnvRootForGC(root); ok {
+		t.Fatal("GC took an env root an old daemon task still holds through .task_lock")
+	}
+	stats := &gcStats{byPattern: map[string]int{}}
+	if cleaned := daemonA.applyGCAction(root, gcActionClean, stats); cleaned != 0 {
+		t.Fatalf("cleanup removed an env root held by an old daemon task (%d dirs)", cleaned)
+	}
+
+	legacyClaim.Release()
+	commit, ok := daemonA.reserveEnvRootForGC(root)
+	if !ok {
+		t.Fatal("GC still refused an env root no execution holds")
+	}
+	commit()
 }
 
 // TestGCScope_CodexStoreActiveInAnotherDaemon is case B.
@@ -286,4 +418,43 @@ func TestScopeLifecycle_ResumeAcrossDaemonsWithConcurrentGC(t *testing.T) {
 	if removed, _ := execenv.PruneCodexSessionStores(profileB.CodexNamespace, 14*24*time.Hour, time.Now(), daemonGC.reserveStoreForDeletion, quietTaskLog()); removed != 1 {
 		t.Fatalf("GC refused the idle store after the resume finished (removed=%d)", removed)
 	}
+}
+
+// TestHoldTaskRepoActivityClaimsEveryTaskRepo covers the task side of the repo
+// boundary: a run claims the scope-level activity for each bare repo it may check
+// out, so heavy maintenance and eviction in any daemon of this work state take the
+// exclusive side and skip.
+func TestHoldTaskRepoActivityClaimsEveryTaskRepo(t *testing.T) {
+	lockDir := scopeLockDirForTest(t, "repo-activity")
+	root := filepath.Join(t.TempDir(), ".repos")
+	locks := execenv.NewScopeLocks(lockDir)
+	d := newScopeGuardDaemon(t, lockDir, t.TempDir())
+	d.repoCache = repocache.NewScoped(root, quietTaskLog(), locks)
+
+	const repoURL = "https://example.com/org/repo.git"
+	task := Task{
+		WorkspaceID: "11111111-1111-1111-1111-111111111111",
+		Repos:       []RepoData{{URL: repoURL}, {URL: repoURL}, {URL: "   "}},
+	}
+	bare := d.repoCache.BarePath(task.WorkspaceID, repoURL)
+	if bare == "" {
+		t.Fatal("BarePath returned an empty path")
+	}
+
+	release := d.holdTaskRepoActivity(task)
+	claim, ok, err := locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bare))
+	if err != nil {
+		t.Fatalf("probe activity claim: %v", err)
+	}
+	if ok {
+		claim.Release()
+		t.Fatal("the task holds no activity claim for the repo it may check out")
+	}
+
+	release()
+	claim, ok, err = locks.TryAcquireTargetDelete(execenv.RepoActivityTarget(bare))
+	if err != nil || !ok {
+		t.Fatalf("activity claim still held after release: ok=%v err=%v", ok, err)
+	}
+	claim.Release()
 }

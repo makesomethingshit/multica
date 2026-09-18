@@ -48,6 +48,11 @@ const scopeLockRetryInterval = 20 * time.Millisecond
 // failure names the store.
 const DefaultScopeLockTimeout = 15 * time.Second
 
+// ErrScopeLockTimeout reports that a claim could not be taken before its bound
+// because another daemon in the same work state holds it. Callers that advertise
+// retryability (the repo cache's ErrRepoBusy path) match on it.
+var ErrScopeLockTimeout = errors.New("scope lock is held by another daemon in this work state")
+
 // ScopeLocks owns the lock files for one work-state scope. The zero value is
 // disabled (no coordination), which is what hand-built daemon configurations in
 // tests get; LoadConfig always sets a directory.
@@ -112,7 +117,7 @@ func (l ScopeLocks) AcquireTargetUse(target string, timeout time.Duration) (*Sco
 		}
 		if !time.Now().Before(deadline) {
 			f.Close()
-			return nil, fmt.Errorf("scope locks: %s is still being reclaimed by another daemon in this work state after %s", target, timeout)
+			return nil, fmt.Errorf("%w: %s is still being reclaimed after %s", ErrScopeLockTimeout, target, timeout)
 		}
 		time.Sleep(scopeLockRetryInterval)
 	}
@@ -139,6 +144,60 @@ func (l ScopeLocks) TryAcquireTargetDelete(target string) (claim *ScopeClaim, ok
 		return nil, false, nil
 	}
 	return &ScopeClaim{file: f, target: target}, true, nil
+}
+
+// AcquireTargetExclusive takes the exclusive claim for target, waiting for a
+// holder in another process up to timeout. Shorter-lived and coarser than
+// AcquireTargetUse: it is what a daemon-level mutation takes when it must not
+// overlap the same mutation in a sibling daemon of this scope, but can afford to
+// wait for the one already running.
+func (l ScopeLocks) AcquireTargetExclusive(target string, timeout time.Duration) (*ScopeClaim, error) {
+	if !l.Enabled() || strings.TrimSpace(target) == "" {
+		return nil, nil
+	}
+	f, err := l.open(target)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := lockFileExclusiveNonBlocking(f)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("scope locks: take exclusive claim on %s: %w", target, err)
+		}
+		if ok {
+			return &ScopeClaim{file: f, target: target}, nil
+		}
+		if !time.Now().Before(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("%w: %s is held after %s", ErrScopeLockTimeout, target, timeout)
+		}
+		time.Sleep(scopeLockRetryInterval)
+	}
+}
+
+// RepoActivityTarget names the scope claim a task holds, shared, for every bare
+// repo its run may touch, and that heavy maintenance and eviction take
+// exclusively (non-blocking) so neither can run while any same-scope daemon has
+// a task that could be reading or writing the repository.
+//
+// The target is the bare path, tagged so it can never collide with the
+// env-root or provider-store claims on that path.
+func RepoActivityTarget(barePath string) string {
+	return "repo-activity:" + filepath.Clean(barePath)
+}
+
+// RepoMutationTarget names the scope claim every daemon-level repository
+// mutation holds exclusively: clone, fetch, ref-layout migration, worktree add,
+// branch and ref updates, worktree prune, heavy maintenance, and eviction.
+// Different repositories are different targets and stay concurrent.
+//
+// The claim is keyed on the bare path but lives OUTSIDE it (ScopeLocks keeps its
+// files beside the scope), which is what lets eviction hold the claim across the
+// RemoveAll that destroys the repo itself.
+func RepoMutationTarget(barePath string) string {
+	return "repo-mutation:" + filepath.Clean(barePath)
 }
 
 // AcquireEnvRootGCClaim takes the env root existing .task_lock exclusively,

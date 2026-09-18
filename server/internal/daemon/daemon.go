@@ -643,9 +643,10 @@ type Daemon struct {
 	// reference count and the fast path, while the OS locks in this scope are the
 	// authoritative boundary between daemons (GH #8280).
 	scopeLocks execenv.ScopeLocks
-	// storeClaimTimeout bounds how long a task waits for a store another daemon
-	// in this scope is deleting. Zero means the default; tests shorten it.
-	storeClaimTimeout time.Duration
+	// scopeClaimTimeout bounds how long a task waits for a scope claim another
+	// daemon in this work state is holding (a store being deleted, or an env root
+	// being reclaimed). Zero means the default; tests shorten it.
+	scopeClaimTimeout time.Duration
 
 	// repoCheckoutTasks binds the localhost /repo/checkout endpoint to the
 	// task-scoped bearer token of a currently running agent. The request body is
@@ -712,7 +713,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	d := &Daemon{
 		cfg:                       cfg,
 		client:                    client,
-		repoCache:                 repocache.New(cacheRoot, logger),
+		repoCache:                 repocache.NewScoped(cacheRoot, logger, execenv.NewScopeLocks(cfg.WorkState.LockDir)),
 		skillCache:                NewSkillBundleCache(skillCacheRoot),
 		logger:                    logger,
 		terminalReports:           newTerminalReportStore(cfg),
@@ -5806,11 +5807,23 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		taskLog.Error("resolve stable task env root", "error", resolveRootErr)
 	}
 	if resolvedEnvRoot != "" {
+		releaseEnvRootScope, scopeErr := d.holdEnvRootForTask(resolvedEnvRoot)
+		if scopeErr != nil {
+			taskLog.Error("claim stable task env root", "root", resolvedEnvRoot, "error", scopeErr)
+		} else {
+			defer releaseEnvRootScope()
+		}
 		d.markActiveEnvRoot(resolvedEnvRoot)
 		defer d.unmarkActiveEnvRoot(resolvedEnvRoot)
 	}
 	if task.PriorWorkDir != "" {
 		if priorRoot := filepath.Dir(task.PriorWorkDir); priorRoot != "" && priorRoot != resolvedEnvRoot {
+			releasePriorScope, scopeErr := d.holdEnvRootForTask(priorRoot)
+			if scopeErr != nil {
+				taskLog.Error("claim prior task env root", "root", priorRoot, "error", scopeErr)
+			} else {
+				defer releasePriorScope()
+			}
 			d.markActiveEnvRoot(priorRoot)
 			defer d.unmarkActiveEnvRoot(priorRoot)
 		}
@@ -7807,11 +7820,35 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("resolve stable task env root: %w", err)
 	}
+	// Stable scope claim for the whole run, and it is taken BEFORE the in-tree
+	// .task_lock below and before any env work: a sibling daemon whose GC owns the
+	// delete claim for this path must not be able to race this task recreating the
+	// directory. Released last (defers run LIFO), so the .task_lock outlives the
+	// scope claim rather than the other way round.
+	releaseRootScope, err := d.holdEnvRootForTask(resolvedRoot)
+	if err != nil {
+		return TaskResult{}, err
+	}
+	defer releaseRootScope()
+
+	// A run that may check out workspace repositories holds the scope-level
+	// activity claim for each bare repo for the whole run. Heavy maintenance and
+	// eviction take the exclusive side of that claim, so reflog expiry, git gc, or
+	// a cache eviction in ANY daemon of this work state cannot run while this task
+	// might be touching the repository (GH #8280).
+	releaseRepoActivity := d.holdTaskRepoActivity(task)
+	defer releaseRepoActivity()
+
 	d.markActiveEnvRoot(resolvedRoot)
 	defer d.unmarkActiveEnvRoot(resolvedRoot)
 	if task.PriorWorkDir != "" {
 		priorRoot := filepath.Dir(task.PriorWorkDir)
 		if priorRoot != resolvedRoot {
+			releasePriorRootScope, err := d.holdEnvRootForTask(priorRoot)
+			if err != nil {
+				return TaskResult{}, err
+			}
+			defer releasePriorRootScope()
 			d.markActiveEnvRoot(priorRoot)
 			defer d.unmarkActiveEnvRoot(priorRoot)
 		}
@@ -8071,6 +8108,18 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	if reusable {
 		defer priorClaim.Release()
+		// The reused directory is the env root this run actually works in, so it
+		// needs the same stable scope claim the fresh path takes. Registered after
+		// the .task_lock release above, so it is released before it - the in-tree
+		// lock still outlives the scope claim, and the GC legacy probe covers the
+		// remaining window.
+		if priorRoot := filepath.Dir(priorWorkDir); priorRoot != "" {
+			releasePriorEnvRootScope, scopeErr := d.holdEnvRootForTask(priorRoot)
+			if scopeErr != nil {
+				return TaskResult{}, scopeErr
+			}
+			defer releasePriorEnvRootScope()
+		}
 		// Deterministic seam for the last-window regression: tests swap the
 		// directory here, after the claim is settled and before Reuse resolves
 		// the path by name.
@@ -8239,6 +8288,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
 	// future changes diverge from ResolveRootDir.
 	if env.RootDir != resolvedRoot && env.RootDir != "" {
+		if releaseRootScope, scopeErr := d.holdEnvRootForTask(env.RootDir); scopeErr != nil {
+			taskLog.Error("claim prepared env root", "root", env.RootDir, "error", scopeErr)
+		} else {
+			defer releaseRootScope()
+		}
 		d.markActiveEnvRoot(env.RootDir)
 		defer d.unmarkActiveEnvRoot(env.RootDir)
 	}
@@ -10070,12 +10124,31 @@ func (d *Daemon) reserveEnvRootForGC(envRoot string) (release func(), ok bool) {
 	if envRoot == "" {
 		return nil, false
 	}
-	claim, owned, err := execenv.AcquireEnvRootGCClaim(envRoot)
+	// 1. The stable scope-level claim. It is keyed on the env root PATH and lives
+	// outside the tree, so it survives the deletion it authorises: an in-tree
+	// lock can be unlinked by the very RemoveAll this claim guards, and the next
+	// process would then lock a fresh inode at the same path while the removal is
+	// still running. This claim cannot be unlinked, so recreate-during-deletion
+	// loses here (GH #8280).
+	scopeClaim, owned, err := d.scopeLocks.TryAcquireTargetDelete(envRoot)
 	if err != nil {
-		d.logger.Warn("gc: could not take the env root execution lock; skipping", "dir", envRoot, "error", err)
+		d.logger.Warn("gc: could not take the env root scope claim; skipping", "dir", envRoot, "error", err)
 		return nil, false
 	}
 	if !owned {
+		return nil, false
+	}
+	// 2. The legacy/in-tree half. A task started by an older daemon holds only
+	// .task_lock and knows nothing about the scope claim, so a rolling upgrade
+	// depends on this probe to leave that task's env root alone.
+	claim, owned, err := execenv.AcquireEnvRootGCClaim(envRoot)
+	if err != nil {
+		d.logger.Warn("gc: could not take the env root execution lock; skipping", "dir", envRoot, "error", err)
+		scopeClaim.Release()
+		return nil, false
+	}
+	if !owned {
+		scopeClaim.Release()
 		return nil, false
 	}
 	d.activeEnvRootsMu.Lock()
@@ -10083,6 +10156,7 @@ func (d *Daemon) reserveEnvRootForGC(envRoot string) (release func(), ok bool) {
 	d.ensureActiveEnvRootStateLocked()
 	if d.activeEnvRoots[envRoot] > 0 || d.deletingEnvRoots[envRoot] {
 		claim.Release()
+		scopeClaim.Release()
 		return nil, false
 	}
 	d.deletingEnvRoots[envRoot] = true
@@ -10092,7 +10166,79 @@ func (d *Daemon) reserveEnvRootForGC(envRoot string) (release func(), ok bool) {
 		d.activeEnvRootsCond.Broadcast()
 		d.activeEnvRootsMu.Unlock()
 		claim.Release()
+		scopeClaim.Release()
 	}, true
+}
+
+// holdEnvRootForTask takes the stable scope-level USE claim for one env root for
+// the lifetime of a task, and returns its release.
+//
+// Ordering, and it is not optional: this must be taken BEFORE the env root own
+// .task_lock (execenv.ClaimEnvRoot / LockEnvRootForReuse), because a GC in a
+// sibling daemon that already owns the delete claim would otherwise let this
+// task recreate the directory and its lock file inside the removal. Taking the
+// scope claim first means the task waits (bounded) until the removal finishes,
+// and only then creates anything.
+//
+// A scope with no lock directory (hand-built configurations) degrades to no
+// cross-process coordination, exactly what such a configuration had before.
+func (d *Daemon) holdEnvRootForTask(envRoot string) (release func(), err error) {
+	if strings.TrimSpace(envRoot) == "" {
+		return func() {}, nil
+	}
+	claim, err := d.scopeLocks.AcquireTargetUse(envRoot, d.scopeLockTimeout())
+	if err != nil {
+		return nil, fmt.Errorf("claim env root %s: %w", envRoot, err)
+	}
+	return func() { claim.Release() }, nil
+}
+
+// scopeLockTimeout is the bound a task waits for a scope claim.
+func (d *Daemon) scopeLockTimeout() time.Duration {
+	if d.scopeClaimTimeout > 0 {
+		return d.scopeClaimTimeout
+	}
+	return execenv.DefaultScopeLockTimeout
+}
+
+// holdTaskRepoActivity takes the shared scope-level activity claim for every
+// bare repo this task may check out, for the lifetime of the run, and returns
+// the release.
+//
+// The claims are best effort on purpose: a task whose repository claim cannot be
+// taken still runs (failing a task over a maintenance race would be worse than
+// running it), but the failure is logged and the cost is bounded - that repo
+// falls back, for this run, to the pre-change behaviour where maintenance could
+// overlap it.
+func (d *Daemon) holdTaskRepoActivity(task Task) func() {
+	if d.repoCache == nil || len(task.Repos) == 0 {
+		return func() {}
+	}
+	releases := make([]func(), 0, len(task.Repos))
+	claimed := make(map[string]bool, len(task.Repos))
+	for _, repo := range task.Repos {
+		url := strings.TrimSpace(repo.URL)
+		if url == "" {
+			continue
+		}
+		barePath := d.repoCache.BarePath(task.WorkspaceID, url)
+		if barePath == "" || claimed[barePath] {
+			continue
+		}
+		claimed[barePath] = true
+		claim, err := d.scopeLocks.AcquireTargetUse(execenv.RepoActivityTarget(barePath), d.scopeLockTimeout())
+		if err != nil {
+			d.logger.Warn("repo activity claim failed; heavy maintenance may overlap this run",
+				"repo", filepath.Base(barePath), "error", err)
+			continue
+		}
+		releases = append(releases, claim.Release)
+	}
+	return func() {
+		for _, release := range releases {
+			release()
+		}
+	}
 }
 
 // holdStoreForTask takes the store for the lifetime of one task: a SHARED claim
@@ -10105,11 +10251,7 @@ func (d *Daemon) reserveEnvRootForGC(envRoot string) (release func(), ok bool) {
 // is what makes THIS daemon's GC wait for this task. A scope with no lock
 // directory (hand-built configurations) degrades to the in-process guard alone.
 func (d *Daemon) holdStoreForTask(store string) (release func(), err error) {
-	timeout := d.storeClaimTimeout
-	if timeout <= 0 {
-		timeout = execenv.DefaultScopeLockTimeout
-	}
-	claim, err := d.scopeLocks.AcquireTargetUse(store, timeout)
+	claim, err := d.scopeLocks.AcquireTargetUse(store, d.scopeLockTimeout())
 	if err != nil {
 		return nil, err
 	}
