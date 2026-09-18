@@ -461,6 +461,11 @@ func stageFakeAgent(t *testing.T) string {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell not available on Windows")
 	}
+	// These tests drive LoadConfig, which now persists the work-state mapping
+	// under HOME. Sharing the runner home would make the first test's explicit
+	// workspaces root the machine's mapping for that backend and fail every later
+	// test that passes a different one (GH #8280).
+	stageTestHome(t, t.TempDir())
 	binDir := t.TempDir()
 	fake := filepath.Join(binDir, "claude")
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -1327,6 +1332,9 @@ func TestLoadConfig_SkipsLoginShellWhenLookPathSucceeds(t *testing.T) {
 
 	t.Setenv("PATH", pathDir)
 	t.Setenv("SHELL", shellPath)
+	// LoadConfig persists the work-state mapping under HOME; keep this test out of
+	// the runner home like its siblings.
+	stageTestHome(t, t.TempDir())
 	// Pin a non-existent agent to a bare name so it would normally trip
 	// the fallback — except `claude` already resolves, and the user hasn't
 	// configured anything else, so the probe loop should be satisfied
