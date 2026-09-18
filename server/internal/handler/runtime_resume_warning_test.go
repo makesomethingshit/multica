@@ -34,15 +34,14 @@ func TestReportRuntimeResumeWarning(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("DaemonRegister: %d: %s", w.Code, w.Body.String())
 	}
-	var registered struct {
-		Runtimes []struct {
-			ID string `json:"id"`
-		} `json:"runtimes"`
+	// Read the row back rather than decoding the register response: the response
+	// shape is the daemon's contract, not this endpoint's, and the runtime id the
+	// route needs is simply the row this daemon registered.
+	var runtimeID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id::text FROM agent_runtime WHERE daemon_id = $1 LIMIT 1`, daemonID).Scan(&runtimeID); err != nil {
+		t.Fatalf("find registered runtime: %v", err)
 	}
-	if err := json.NewDecoder(w.Body).Decode(&registered); err != nil || len(registered.Runtimes) == 0 {
-		t.Fatalf("decode register response: %v", err)
-	}
-	runtimeID := registered.Runtimes[0].ID
 
 	// Seed an unrelated metadata key so the merge can be proven not to clobber it.
 	if _, err := testPool.Exec(ctx,
