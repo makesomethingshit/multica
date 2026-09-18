@@ -8479,6 +8479,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if resumeReachable {
 		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
 	}
+	d.reportResumeWarning(ctx, task, taskLog)
 
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
 	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
@@ -10196,6 +10197,27 @@ func (d *Daemon) holdEnvRootForTask(envRoot string) (release func(), err error) 
 		return nil, fmt.Errorf("claim env root %s: %w", envRoot, err)
 	}
 	return func() { claim.Release() }, nil
+}
+
+// reportResumeWarning records the finalized resume decision on the runtime when
+// a prior session was expected and could not be restored.
+//
+// Placement matters, and so does the condition. It runs once per task, after both
+// resume gates have decided and before the agent process exists, and it keys off
+// the single finalized flag the gates (and the server, for a withheld rollout)
+// set — not off each gate, which would report the same task twice, and not off
+// PriorSessionID, which the gates themselves clear when they reject a session.
+// A cold start and a healthy resume both leave the flag false and report nothing.
+//
+// Best effort, always: this is observability. A failure is logged here and the
+// task continues with the fresh session it was already going to use.
+func (d *Daemon) reportResumeWarning(ctx context.Context, task Task, taskLog *slog.Logger) {
+	if !task.PriorSessionResumeUnavailable {
+		return
+	}
+	if err := d.client.ReportRuntimeResumeWarning(ctx, task.RuntimeID, task.ID); err != nil {
+		taskLog.Warn("failed to report runtime resume warning", "error", err)
+	}
 }
 
 // scopeLockTimeout is the bound a task waits for a scope claim.
