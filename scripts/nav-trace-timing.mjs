@@ -46,3 +46,39 @@ export const invalidForTiming = (entry) => {
   // measured sample.
   return entry.scenario_exit !== 0;
 };
+
+/**
+ * MUL-7095: relative guardrail with an explicit zero-baseline policy.
+ *
+ * The runner promises relative guardrails, never absolute machine-time
+ * thresholds. A zero baseline therefore cannot produce a numeric ratio:
+ * - base 0 / head 0 is a valid clean result and passes;
+ * - base 0 / head > 0 fails explicitly (baseline was zero, the head
+ *   introduced a non-zero value);
+ * - missing/invalid/non-finite data stays unavailable and fail-closed.
+ *
+ * @param baseValue mean of the usable base samples
+ * @param headValue mean of the usable head samples
+ * @param allowance relative allowance (0.25 = fail when ratio > 1.25)
+ * @returns {{ available: boolean, ratio: number|null, failed: boolean, mode: string }}
+ */
+export const relativeRegression = (baseValue, headValue, allowance) => {
+  if (
+    typeof baseValue !== "number" ||
+    typeof headValue !== "number" ||
+    !Number.isFinite(baseValue) ||
+    !Number.isFinite(headValue) ||
+    baseValue < 0 ||
+    headValue < 0
+  ) {
+    return { available: false, ratio: null, failed: false, mode: "unavailable" };
+  }
+  if (baseValue === 0) {
+    if (headValue === 0) {
+      return { available: true, ratio: null, failed: false, mode: "zero-baseline" };
+    }
+    return { available: true, ratio: null, failed: true, mode: "zero-baseline" };
+  }
+  const ratio = headValue / baseValue;
+  return { available: true, ratio, failed: ratio > 1 + allowance, mode: "relative" };
+};

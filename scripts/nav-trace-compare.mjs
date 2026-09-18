@@ -34,7 +34,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { connect, createServer } from "node:net";
-import { invalidForTiming } from "./nav-trace-timing.mjs";
+import { invalidForTiming, relativeRegression } from "./nav-trace-timing.mjs";
 
 const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"]).toString().trim();
 const args = process.argv.slice(2);
@@ -45,15 +45,16 @@ const flag = (name, fallback) => {
 const baseRef = flag("base");
 const headRef = flag("head", "HEAD");
 const spec = flag("spec", "e2e/description-navigation-trace.spec.ts");
-const repeats = Math.max(1, Number(flag("repeats", "1")) || 1);
+const repeats = Math.max(1, Number(flag("repeats", "5")) || 5);
 const project = flag("project", "chromium");
 // Default relative allowance and its measured basis (MUL-7095):
-// `--repeats 5` on the A/B fixture spreads 16.3% base-side and 4.5%
+// Five repeats (the default) on the A/B fixture spread 16.3% base-side and 4.5%
 // head-side for click-to-commit (nav-fix-r6), while a genuine regression
 // measured one-repeat-per-side reached 1.97x on click-to-commit and 1.53x
 // on maxOverlap (nav-final-chromium-r3). 25% clears the spread of the
 // repeated sampling this runner is meant to be run with and still fails the
-// smallest real regression observed. Run the comparison with `--repeats 5`.
+// smallest real regression observed. The default repeat count is five, so the
+// normal documented invocation exercises five repeats without extra flags.
 const maxRelativeRegression = Number(
   flag(
     "max-regression",
@@ -313,20 +314,6 @@ const pick = (traces, key) => {
   return values.reduce((a, b) => a + b, 0) / values.length;
 };
 
-const relativeRegression = (baseValue, headValue, allowance) => {
-  if (
-    typeof baseValue !== "number" ||
-    typeof headValue !== "number" ||
-    !Number.isFinite(baseValue) ||
-    !Number.isFinite(headValue) ||
-    baseValue <= 0
-  ) {
-    return { available: false, ratio: null, failed: false };
-  }
-  const ratio = headValue / baseValue;
-  return { available: true, ratio, failed: ratio > 1 + allowance };
-};
-
 function markdown(base, head, regressions) {
   const usable = base.status === "ok" && head.status === "ok";
   const rows = [
@@ -355,9 +342,15 @@ function markdown(base, head, regressions) {
     "| --- | ---: | ---: | ---: | ---: |",
     ...rows,
     "",
-    ...Object.entries(regressions).map(([key, regression]) =>
-      `- ${key} relative guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%${regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`,
-    ),
+    ...Object.entries(regressions).map(([key, regression]) => {
+      const label = `- ${key} relative guardrail: ${(maxRelativeRegression * 100).toFixed(1)}%`;
+      if (regression.mode === "zero-baseline") {
+        return regression.failed
+          ? `${label} (zero baseline; head introduced a non-zero value — FAILED)`
+          : `${label} (zero baseline; head remained zero — passed)`;
+      }
+      return `${label}${regression.available ? ` (ratio ${regression.ratio.toFixed(3)}; ${regression.failed ? "FAILED" : "passed"})` : " (not evaluated)"}`;
+    }),
     `- base \`${base.ref}\` (${base.sha.slice(0, 9)}) — ${base.status} (${base.usable_repeats}/${base.repeats} usable)${base.spec_failed ? "; scenario failed" : ""}`,
     `- head \`${head.ref}\` (${head.sha.slice(0, 9)}) — ${head.status} (${head.usable_repeats}/${head.repeats} usable)${head.spec_failed ? "; scenario failed" : ""}`,
     `- spec \`${spec}\` from the working tree; raw traces: \`${project}-base-*.json\`, \`${project}-head-*.json\``,

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { invalidForTiming } from "./nav-trace-timing.mjs";
+import { invalidForTiming, relativeRegression } from "./nav-trace-timing.mjs";
 
 // MUL-7095: pin sampler-error and exit-code handling across the
 // collect/accept split (Case 1~5 from the follow-up spec).
@@ -50,4 +50,61 @@ test("Case 5: accept mode with a non-zero exit stays unusable", () => {
     invalidForTiming({ scenario_exit: 1, trace: validTrace() }),
     true,
   );
+});
+
+// MUL-7095: zero-baseline regression policy for the A/B guardrail.
+// The comparison imports this helper from the timing module so the unit pin
+// never executes the runner entrypoint.
+const ALLOWANCE = 0.25;
+
+test("zero baseline 0 -> 0 is an available passing comparison", () => {
+  const result = relativeRegression(0, 0, ALLOWANCE);
+  assert.equal(result.available, true);
+  assert.equal(result.ratio, null);
+  assert.equal(result.failed, false);
+});
+
+test("zero baseline 0 -> >0 is an available failing comparison", () => {
+  const result = relativeRegression(0, 12.5, ALLOWANCE);
+  assert.equal(result.available, true);
+  assert.equal(result.ratio, null);
+  assert.equal(result.failed, true);
+});
+
+test("positive baseline within 25% passes", () => {
+  const result = relativeRegression(100, 110, ALLOWANCE);
+  assert.equal(result.available, true);
+  assert.equal(result.failed, false);
+});
+
+test("positive baseline above 25% fails", () => {
+  const result = relativeRegression(100, 130, ALLOWANCE);
+  assert.equal(result.available, true);
+  assert.equal(result.failed, true);
+});
+
+test("exact 1.25x boundary passes (fail only when strictly greater)", () => {
+  const result = relativeRegression(100, 125, ALLOWANCE);
+  assert.equal(result.available, true);
+  assert.equal(result.failed, false);
+});
+
+test("invalid or missing data stays unavailable and fail-closed", () => {
+  for (const [base, head] of [
+    [null, 0],
+    [0, null],
+    [undefined, undefined],
+    [Number.NaN, 0],
+    [0, Number.NaN],
+    [Number.POSITIVE_INFINITY, 0],
+    [100, Number.POSITIVE_INFINITY],
+  ]) {
+    const result = relativeRegression(base, head, ALLOWANCE);
+    assert.equal(result.available, false);
+  }
+  // The gate treats every unavailable comparison as a failure.
+  const gateFails = (regression) => !regression.available || regression.failed;
+  assert.equal(gateFails(relativeRegression(null, 0, ALLOWANCE)), true);
+  assert.equal(gateFails(relativeRegression(0, 0, ALLOWANCE)), false);
+  assert.equal(gateFails(relativeRegression(0, 5, ALLOWANCE)), true);
 });
