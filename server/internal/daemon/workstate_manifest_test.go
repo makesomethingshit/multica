@@ -257,3 +257,42 @@ func TestReadWorkStateScope_NeverCreatesScopeState(t *testing.T) {
 		t.Fatalf("a read-only caller created scope state: %v", err)
 	}
 }
+
+// TestLoadConfig_RepeatedResolutionUsesThePersistedRoot pins the binding rule at
+// the layer the daemon actually starts through, and documents why the config
+// tests share one scratch root per test rather than calling t.TempDir() per
+// load: reloading a profile follows the persisted mapping, while a load that asks
+// for a different explicit root for the same backend is refused instead of
+// quietly moving the machine onto a second tree.
+func TestLoadConfig_RepeatedResolutionUsesThePersistedRoot(t *testing.T) {
+	stageWorkStateHome(t)
+
+	root := filepath.Join(t.TempDir(), "workspaces")
+	base := Overrides{ServerURL: testBackendA, WorkspacesRoot: root, AllowNoAgents: true}
+
+	first, err := LoadConfig(base)
+	if err != nil {
+		t.Fatalf("first LoadConfig: %v", err)
+	}
+	if first.WorkspacesRoot != root {
+		t.Fatalf("workspaces root = %q, want the explicit %q", first.WorkspacesRoot, root)
+	}
+
+	second, err := LoadConfig(base)
+	if err != nil {
+		t.Fatalf("reloading with the same root: %v", err)
+	}
+	if second.WorkspacesRoot != first.WorkspacesRoot || second.WorkState.CodexNamespace != first.WorkState.CodexNamespace {
+		t.Fatalf("reload changed the mapping: %+v then %+v", first.WorkState, second.WorkState)
+	}
+
+	_, err = LoadConfig(Overrides{
+		ServerURL:      testBackendA,
+		WorkspacesRoot: filepath.Join(t.TempDir(), "somewhere-else"),
+		AllowNoAgents:  true,
+	})
+	var conflict *WorkStateConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("err = %v, want a binding conflict for a different explicit root", err)
+	}
+}
