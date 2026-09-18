@@ -1473,6 +1473,10 @@ func (d *Daemon) pruneWorktreeLocked(ctx context.Context, barePath string) {
 	}
 	completed := true
 	for _, step := range maintenance {
+		// Local fast path only. The authoritative gate is the scope-level activity
+		// claim WithRepoMaintenance already holds: it proves no task in ANY daemon
+		// of this work state may be touching the repository. This check just stops
+		// the next step early when a task started in this process mid-maintenance.
 		if ctx.Err() != nil || d.activeTasks.Load() > 0 {
 			return
 		}
