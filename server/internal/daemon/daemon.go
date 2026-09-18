@@ -647,6 +647,19 @@ type Daemon struct {
 	// daemon in this work state is holding (a store being deleted, or an env root
 	// being reclaimed). Zero means the default; tests shorten it.
 	scopeClaimTimeout time.Duration
+	// runtimeOwners holds the logical-runtime ownership claims this process has
+	// taken (see runtime_owner.go). A runtime may only be registered, claimed,
+	// heartbeated, recovered or deregistered by its owner, because one runtime
+	// row is one machine + backend rather than one process.
+	runtimeOwners *runtimeOwners
+	// runtimeOwnersInit guards the lazy creation of runtimeOwners, so a Daemon
+	// built as a struct literal (tests, embedded callers) cannot panic on the
+	// ownership path. Same pattern as ensureActiveEnvRootStateLocked.
+	runtimeOwnersInit sync.Mutex
+	// machineLocks is the machine-global lock set for resources that are not
+	// scoped to one backend - currently the local_directory real paths. See
+	// local_directory_scope.go.
+	machineLocks execenv.ScopeLocks
 
 	// repoCheckoutTasks binds the localhost /repo/checkout endpoint to the
 	// task-scoped bearer token of a currently running agent. The request body is
@@ -734,6 +747,8 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		activeStores:              make(map[string]int),
 		deletingStores:            make(map[string]bool),
 		scopeLocks:                execenv.NewScopeLocks(cfg.WorkState.LockDir),
+		runtimeOwners:             newRuntimeOwners(),
+		machineLocks:              machineScopeLocks(),
 		localPathLocks:            NewLocalPathLocker(),
 		runtimeGoneInflight:       make(map[string]struct{}),
 		pendingWorkInflight:       make(map[string]struct{}),
@@ -2191,11 +2206,21 @@ func (d *Daemon) RestartBinary() string {
 	return d.restartBinary
 }
 
-// deregisterRuntimes notifies the server that all runtimes are going offline.
+// deregisterRuntimes notifies the server that the runtimes THIS process owns are
+// going offline, then releases those ownership claims.
+//
+// Ordering is the whole point and must not be reversed: deregistering first and
+// releasing second means a sibling can never take the runtime over and bring it
+// back online before this process's late Deregister lands. Releasing first would
+// reopen exactly the race this ownership model exists to close.
+//
+// Only owned runtimes are reported. A process that is merely standing by for a
+// sibling's runtime must not take it offline when it exits (GH #8280).
 func (d *Daemon) deregisterRuntimes() {
-	runtimeIDs := d.allRuntimeIDs()
+	runtimeIDs := d.ownedRuntimeIDs()
 	if len(runtimeIDs) == 0 {
-		d.logger.Debug("deregister: no runtimes to deregister")
+		d.logger.Debug("deregister: no owned runtimes to deregister")
+		d.releaseAllRuntimeOwnership()
 		return
 	}
 
@@ -2208,6 +2233,38 @@ func (d *Daemon) deregisterRuntimes() {
 	} else {
 		d.logger.Info("deregistered runtimes", "count", len(runtimeIDs))
 	}
+	// Only now: the server has been told, so a takeover that happens after this
+	// point is a genuine new owner rather than a sibling racing a stale report.
+	d.releaseAllRuntimeOwnership()
+}
+
+// ownedRuntimeIDs returns the server runtime IDs this process is the active
+// owner of. A runtime tracked locally but owned by a sibling process is
+// deliberately excluded - see deregisterRuntimes.
+func (d *Daemon) ownedRuntimeIDs() []string {
+	d.mu.Lock()
+	type row struct {
+		id          string
+		workspaceID string
+		rt          Runtime
+	}
+	rows := make([]row, 0, len(d.runtimeIndex))
+	for workspaceID, ws := range d.workspaces {
+		for _, rid := range ws.runtimeIDs {
+			if rt, ok := d.runtimeIndex[rid]; ok {
+				rows = append(rows, row{id: rid, workspaceID: workspaceID, rt: rt})
+			}
+		}
+	}
+	d.mu.Unlock()
+
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if d.ownsTarget(runtimeOwnerTargetForRuntime(r.rt, r.workspaceID)) {
+			ids = append(ids, r.id)
+		}
+	}
+	return ids
 }
 
 // resolveAuth loads the auth token from the CLI config for the active profile.
@@ -2961,12 +3018,32 @@ func (d *Daemon) registerRuntimesForWorkspaceBatchLocked(ctx context.Context, wo
 	// previously cached on the workspaceState.
 	profileSig := d.appendProfileRuntimes(ctx, workspaceID, &runtimes, &failedProfiles)
 
+	// Ownership gate: only candidates this process owns may be announced to the
+	// server. A sibling process in the same work-state scope that already serves a
+	// runtime keeps it, and this process stands by for that one (GH #8280).
+	owned, peerOwned, ownErr := d.filterOwnedRuntimeCandidates(ctx, workspaceID, runtimes)
+	if ownErr != nil {
+		return nil, "", ownErr
+	}
+	runtimes = owned
+	if len(peerOwned) > 0 {
+		d.logger.Info("runtime candidates already owned by a sibling daemon process; standing by",
+			"workspace_id", workspaceID, "providers", peerOwned, "owned", len(runtimes))
+	}
+
 	if len(runtimes) == 0 && len(failedProfiles) == 0 {
 		// profileSig is still meaningful even when nothing resolves: the
 		// refresh path uses it to remember "we already converged on the
 		// disabled-everywhere state" so duplicate change notifications are a
 		// no-op instead of a re-empty-register loop. Initial-registration
 		// callers that don't care about the sig discard it via _.
+		//
+		// A standby process reports a DIFFERENT error: it does have runtimes to
+		// host, they are just served elsewhere, and the converge-to-zero path
+		// must not act on that as if this process had nothing (GH #8280).
+		if len(peerOwned) > 0 {
+			return nil, profileSig, errAllRuntimesPeerOwned
+		}
 		return nil, profileSig, ErrNoRuntimesToRegister
 	}
 
@@ -3818,6 +3895,15 @@ func (d *Daemon) refreshWorkspaceRuntimeProfiles(ctx context.Context, workspaceI
 func (d *Daemon) applyProfileDriftRegistration(ctx context.Context, workspaceID string) error {
 	regResp, profileSig, preserve, err := d.registerRuntimesForWorkspaceLocked(ctx, workspaceID)
 	if err != nil {
+		if errors.Is(err, errAllRuntimesPeerOwned) {
+			// Every candidate is served by a sibling process. This is not
+			// convergence to zero - the runtimes exist and are in use - so the
+			// workspace keeps being reconciled and this process keeps standing by
+			// until it can take one over (GH #8280).
+			d.logger.Info("all runtimes for workspace are owned by a sibling daemon process; standing by",
+				"workspace_id", workspaceID)
+			return nil
+		}
 		if errors.Is(err, ErrNoRuntimesToRegister) {
 			// Convergence-to-zero: a custom-only daemon's only enabled
 			// profile was just disabled / deleted, and there are no built-in
@@ -4257,6 +4343,15 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 	}
 	d.mu.Unlock()
 
+	// A live same-machine, same-backend peer from a release that predates the
+	// runtime-owner claim cannot be coordinated with: it would register and serve
+	// the same runtimes this process is about to take. Fail closed and stand by
+	// until it is gone, then retry on the next reconcile (GH #8280).
+	if decision := d.checkRuntimeCoordinationPeers(ctx); decision.Blocked {
+		d.logLegacyPeerStandby(decision)
+		return nil
+	}
+
 	// Built-in agent CLIs are installed per machine, so one probe round serves
 	// every workspace this sync has to register (MUL-5225). Probing is lazy —
 	// a sync that finds nothing new to register never shells out at all, which
@@ -4311,6 +4406,14 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 			var err error
 			resp, profileSig, err = d.registerRuntimesForWorkspaceBatchLocked(ctx, id, payload)
 			if err != nil {
+				if errors.Is(err, errAllRuntimesPeerOwned) {
+					// Standby: a sibling process serves every runtime this
+					// workspace would have hosted. Register nothing, converge
+					// nothing, and let the periodic reconcile retry (GH #8280).
+					d.logger.Info("workspace runtimes are owned by a sibling daemon process; standing by",
+						"workspace_id", id)
+					return nil
+				}
 				return err
 			}
 			// First registration is the third path a response reaches local state
@@ -4379,10 +4482,16 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 		// running on these runtimes. Without this, an issue can stay stuck
 		// at in_progress until the slow heartbeat sweeper or the in-flight
 		// task timeout (2.5h) kicks in.
-		for _, rid := range runtimeIDs {
-			if err := d.client.RecoverOrphans(ctx, rid); err != nil {
-				d.logger.Warn("recover-orphans failed", "runtime_id", rid, "error", err)
+		//
+		// Gated on ownership: recovery hard-fails every running task on the
+		// runtime, so it may only run for a runtime THIS process just took over
+		// from a dead owner - never for one a sibling process is still serving,
+		// and never twice for one ownership (GH #8280).
+		for _, rt := range resp.Runtimes {
+			if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
+				continue
 			}
+			d.recoverOrphansOncePerOwnership(ctx, id, rt)
 		}
 
 		d.logger.Info("watching workspace", "workspace_id", id, "name", name, "runtimes", len(runtimeIDs), "repos", len(resp.Repos))
@@ -6242,6 +6351,40 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 			taskLog.Error("fail task after local_directory lock cancel", "error", failErr)
 		}
 		return nil, true
+	}
+	// The machine-wide half of the same claim. Ordering is local-then-machine
+	// everywhere (see local_directory_scope.go): the local locker owns fairness
+	// and the holder hint, and the OS claim is what actually spans processes.
+	machineRelease, machineErr := d.holdLocalDirectoryPath(waitCtx, assignment.RealPath, task.ID, onWait)
+	if machineErr != nil {
+		release()
+		if cancelledByPoll != nil {
+			select {
+			case <-cancelledByPoll:
+				taskLog.Info("local_directory: wait aborted by server-side terminal state")
+				return nil, true
+			default:
+			}
+		}
+		if waitCtx.Err() != nil {
+			taskLog.Info("local_directory: machine-wide wait cancelled")
+			return nil, true
+		}
+		taskLog.Error("local_directory: machine-wide lock acquire failed", "error", machineErr)
+		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+			kind:          terminalTaskReportFail,
+			taskID:        task.ID,
+			errorMessage:  fmt.Sprintf("local_directory wait failed: %s", machineErr.Error()),
+			failureReason: "local_directory_error",
+		}); failErr != nil {
+			taskLog.Error("fail task after local_directory machine-wide lock error", "error", failErr)
+		}
+		return nil, true
+	}
+	localRelease := release
+	release = func() {
+		machineRelease()
+		localRelease()
 	}
 	taskLog.Info("local_directory: lock acquired")
 	return release, false
@@ -8274,7 +8417,18 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 				return TaskResult{}, fmt.Errorf("local_directory worktree: wait for a consistent snapshot of %s: %w",
 					localAssignment.AbsPath, lockErr)
 			}
+			// The machine-wide half, held for the snapshot alone exactly like the
+			// local half: another PROCESS may be running an in_place task in this
+			// same checkout, and snapshotting underneath it would capture a
+			// half-written tree (GH #8280).
+			machineRelease, machineErr := d.holdLocalDirectoryPath(waitCtx, localAssignment.RealPath, task.ID, nil)
+			if machineErr != nil {
+				release()
+				return TaskResult{}, fmt.Errorf("local_directory worktree: machine-wide wait for a consistent snapshot of %s: %w",
+					localAssignment.AbsPath, machineErr)
+			}
 			env, err = d.prepareExecutionEnvironment(prepareCtx, prepParams)
+			machineRelease()
 			release()
 			if err != nil {
 				return TaskResult{}, asEnvironmentSetupFailure(fmt.Errorf("prepare execution environment: %w", err))
@@ -10215,7 +10369,13 @@ func (d *Daemon) reportResumeWarning(ctx context.Context, task Task, taskLog *sl
 	if !task.PriorSessionResumeUnavailable {
 		return
 	}
-	if err := d.client.ReportRuntimeResumeWarning(ctx, task.RuntimeID, task.ID); err != nil {
+	// Bounded and off the launch critical path: this is a diagnostic, and the
+	// normal client timeout is far longer than a provider launch should ever
+	// wait on one. A failure - including a 404 from a server that predates the
+	// endpoint - is logged and the run continues.
+	reportCtx, cancel := context.WithTimeout(ctx, resumeWarningReportTimeout)
+	defer cancel()
+	if err := d.client.ReportRuntimeResumeWarning(reportCtx, task.RuntimeID, task.ID); err != nil {
 		taskLog.Warn("failed to report runtime resume warning", "error", err)
 	}
 }
@@ -10838,3 +10998,9 @@ func defaultArgsForProvider(cfg Config, provider string) []string {
 	}
 	return append([]string(nil), args...)
 }
+
+// resumeWarningReportTimeout bounds the best-effort runtime resume-warning
+// report. It is deliberately short: the report is observability, and it sits
+// before the provider launch, so a slow or unreachable server must not delay a
+// task. The client timeout is tuned for task traffic, not for this.
+const resumeWarningReportTimeout = 3 * time.Second

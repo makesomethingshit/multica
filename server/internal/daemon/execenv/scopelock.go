@@ -1,6 +1,7 @@
 package execenv
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -287,4 +288,78 @@ func (c *ScopeClaim) Release() {
 	_ = unlockFile(c.file)
 	_ = c.file.Close()
 	c.file = nil
+}
+
+// AcquireTargetUseContext takes shared ownership of target, waiting until the
+// claim is free or ctx ends. It is the cancellable form of AcquireTargetUse and
+// exists for holders that legitimately stay locked for hours: a local_directory
+// task can wait for a sibling writer for as long as the task itself is allowed
+// to run, so the wait must end on task cancellation or daemon shutdown rather
+// than on a fixed short timeout (GH #8280).
+func (l ScopeLocks) AcquireTargetUseContext(ctx context.Context, target string) (*ScopeClaim, error) {
+	if !l.Enabled() || strings.TrimSpace(target) == "" {
+		return nil, nil
+	}
+	f, err := l.open(target)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		ok, err := lockFileSharedNonBlocking(f)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("scope locks: take use claim on %s: %w", target, err)
+		}
+		if ok {
+			return &ScopeClaim{file: f, target: target}, nil
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, context.Cause(ctx)
+		case <-time.After(scopeLockRetryInterval):
+		}
+	}
+}
+
+// AcquireTargetExclusiveContext takes the exclusive claim for target, waiting
+// until it is free or ctx ends. The cancellable counterpart to
+// AcquireTargetExclusive, for the same reason as AcquireTargetUseContext.
+func (l ScopeLocks) AcquireTargetExclusiveContext(ctx context.Context, target string) (*ScopeClaim, error) {
+	if !l.Enabled() || strings.TrimSpace(target) == "" {
+		return nil, nil
+	}
+	f, err := l.open(target)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		ok, err := lockFileExclusiveNonBlocking(f)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("scope locks: take exclusive claim on %s: %w", target, err)
+		}
+		if ok {
+			return &ScopeClaim{file: f, target: target}, nil
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, context.Cause(ctx)
+		case <-time.After(scopeLockRetryInterval):
+		}
+	}
+}
+
+// LocalDirectoryTarget names the machine-wide claim for one local_directory
+// real path.
+//
+// Deliberately NOT scoped to a backend: a local directory is a filesystem
+// resource, not a runtime one, so two daemons on one machine that talk to
+// different backends can still be told to work in the same checkout. The lock
+// file therefore lives in the machine-global lock root, and the target is the
+// canonical real path the assignment already resolved (symlinks and alternate
+// spellings of one directory must land on one claim).
+func LocalDirectoryTarget(canonicalRealPath string) string {
+	return "local-directory:" + filepath.Clean(canonicalRealPath)
 }
