@@ -56,12 +56,24 @@ type persistedTerminalTaskReport struct {
 	FailureReason         string    `json:"failure_reason,omitempty"`
 	SessionRolloutMissing bool      `json:"session_rollout_missing,omitempty"`
 	RetiredSessionID      string    `json:"retired_session_id,omitempty"`
+	// ClaimDispatchedAt is the claim generation this result belongs to: the
+	// server-issued dispatched_at of the claim that produced it. Absent means
+	// unknown ownership — a record written before the daemon learned to fence
+	// terminal reports — and such a record is never replayed, because sending it
+	// now could settle a task a later claim owns (see
+	// replayPendingTerminalReports).
+	ClaimDispatchedAt *time.Time `json:"claim_dispatched_at,omitempty"`
 
 	PermanentRejectionCount   int        `json:"permanent_rejection_count,omitempty"`
 	FirstPermanentRejectionAt *time.Time `json:"first_permanent_rejection_at,omitempty"`
 	LastPermanentRejectionAt  *time.Time `json:"last_permanent_rejection_at,omitempty"`
 	LastPermanentStatus       int        `json:"last_permanent_status,omitempty"`
 	QuarantinedAt             *time.Time `json:"quarantined_at,omitempty"`
+	// SupersededAt marks a report the generation fence refused because a newer
+	// claim owns the task. Distinct from QuarantinedAt: a superseded report was
+	// not refused as malformed, and it must never be turned into a failure
+	// compensation against the reclaim that owns the task now.
+	SupersededAt *time.Time `json:"superseded_at,omitempty"`
 }
 
 type pendingTerminalTaskReport struct {
@@ -132,7 +144,7 @@ func persistedTerminalReport(report terminalTaskReport, createdAt time.Time) (pe
 	if err != nil {
 		return persistedTerminalTaskReport{}, err
 	}
-	return persistedTerminalTaskReport{
+	record := persistedTerminalTaskReport{
 		Version:               terminalReportRecordVersion,
 		CreatedAt:             createdAt.UTC(),
 		Kind:                  kind,
@@ -146,7 +158,15 @@ func persistedTerminalReport(report terminalTaskReport, createdAt time.Time) (pe
 		FailureReason:         report.failureReason,
 		SessionRolloutMissing: report.sessionRolloutMissing,
 		RetiredSessionID:      report.retiredSessionID,
-	}, nil
+	}
+	// UTC on the way in as well as on the way out: struct equality is how
+	// enqueue detects a conflicting payload for the same task, and time.Time
+	// compares location pointers, not just the instant.
+	if !report.claimDispatchedAt.IsZero() {
+		generation := report.claimDispatchedAt.UTC()
+		record.ClaimDispatchedAt = &generation
+	}
+	return record, nil
 }
 
 func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, error) {
@@ -165,7 +185,7 @@ func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, 
 	default:
 		return terminalTaskReport{}, fmt.Errorf("unsupported terminal report kind %q", record.Kind)
 	}
-	return terminalTaskReport{
+	report := terminalTaskReport{
 		kind:                  kind,
 		taskID:                record.TaskID,
 		output:                record.Output,
@@ -177,7 +197,11 @@ func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, 
 		failureReason:         record.FailureReason,
 		sessionRolloutMissing: record.SessionRolloutMissing,
 		retiredSessionID:      record.RetiredSessionID,
-	}, nil
+	}
+	if record.ClaimDispatchedAt != nil {
+		report.claimDispatchedAt = record.ClaimDispatchedAt.UTC()
+	}
+	return report, nil
 }
 
 func (s *terminalReportStore) ensureDir() error {
@@ -497,39 +521,104 @@ func (s *terminalReportStore) recordPermanentRejection(item pendingTerminalTaskR
 	if !quarantine {
 		return false, nil
 	}
+	return true, s.movePendingToFailedQueue(path, item, report)
+}
+
+// movePendingToFailedQueue publishes the pending record in failed/ and drops
+// the pending file. Callers hold the store mutex and have already validated
+// that the pending file still matches item. The rename/removal has completed by
+// the time it returns: sync failures are reported to operators, but the caller
+// must still treat the report as retired, because there is no pending file left
+// for a later pass to rediscover.
+func (s *terminalReportStore) movePendingToFailedQueue(path string, item pendingTerminalTaskReport, report terminalTaskReport) error {
 	if err := ensureTerminalReportDir(s.failedDir()); err != nil {
-		return false, fmt.Errorf("create failed terminal report queue: %w", err)
+		return fmt.Errorf("create failed terminal report queue: %w", err)
 	}
 	failedPath := filepath.Join(s.failedDir(), item.fileName)
 	if existingBody, readErr := os.ReadFile(failedPath); readErr == nil {
 		existing, decodeErr := decodePersistedTerminalReport(existingBody)
 		if decodeErr != nil {
-			return false, fmt.Errorf("existing failed terminal report is unreadable: %w", decodeErr)
+			return fmt.Errorf("existing failed terminal report is unreadable: %w", decodeErr)
 		}
 		existingReport, decodeErr := existing.terminalReport()
 		if decodeErr != nil || existingReport != report {
-			return false, errors.New("failed terminal report conflicts with queued payload")
+			return errors.New("failed terminal report conflicts with queued payload")
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return false, fmt.Errorf("remove duplicate quarantined terminal report: %w", err)
+			return fmt.Errorf("remove duplicate quarantined terminal report: %w", err)
 		}
 	} else if errors.Is(readErr, os.ErrNotExist) {
 		if err := os.Rename(path, failedPath); err != nil {
-			return false, fmt.Errorf("quarantine terminal report: %w", err)
+			return fmt.Errorf("quarantine terminal report: %w", err)
 		}
 	} else {
-		return false, fmt.Errorf("inspect failed terminal report: %w", readErr)
+		return fmt.Errorf("inspect failed terminal report: %w", readErr)
 	}
-	// The rename/removal has completed at this point. Report sync failures to
-	// operators, but also return quarantined=true so the caller performs the
-	// one-time server compensation. Returning false would leave no pending file
-	// for a later pass to rediscover and could strand the server row in running.
 	failedSyncErr := syncTerminalReportDir(s.failedDir())
 	pendingSyncErr := syncTerminalReportDir(s.dir)
-	return true, errors.Join(
+	return errors.Join(
 		wrapTerminalReportSyncError("sync failed terminal report queue", failedSyncErr),
 		wrapTerminalReportSyncError("sync pending terminal report queue after quarantine", pendingSyncErr),
 	)
+}
+
+// recordSupersededReport retires a report the server's generation fence proved
+// stale: a newer claim owns the task row, so replaying it can only add load,
+// never settle anything. Unlike recordPermanentRejection there is no count/age
+// gate — the fence is authoritative on the first response — and the payload is
+// retained in failed/ so the result the daemon produced is still inspectable.
+func (s *terminalReportStore) recordSupersededReport(item pendingTerminalTaskReport, status int, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureDir(); err != nil {
+		return err
+	}
+	path := filepath.Join(s.dir, item.fileName)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read superseded terminal report: %w", err)
+	}
+	record, err := decodePersistedTerminalReport(body)
+	if err != nil {
+		return fmt.Errorf("decode superseded terminal report: %w", err)
+	}
+	report, err := record.terminalReport()
+	if err != nil {
+		return fmt.Errorf("validate superseded terminal report: %w", err)
+	}
+	if item.fileName != terminalReportFileName(report.taskID) || report != item.report {
+		return errors.New("superseded terminal report no longer matches queued payload")
+	}
+	supersededAt := now.UTC()
+	record.SupersededAt = &supersededAt
+	record.LastPermanentStatus = status
+	if err := writeTerminalReportRecord(s.dir, item.fileName, record); err != nil {
+		return fmt.Errorf("persist superseded terminal report: %w", err)
+	}
+	return s.movePendingToFailedQueue(path, item, report)
+}
+
+// quarantineSupersededTerminalReport is the daemon-side arm of
+// recordSupersededReport. It never runs the complete→fail compensation: the
+// reclaim that owns the task row now must keep its own outcome.
+func (d *Daemon) quarantineSupersededTerminalReport(item pendingTerminalTaskReport, deliveryErr error) bool {
+	if d.terminalReports == nil {
+		return false
+	}
+	if err := d.terminalReports.recordSupersededReport(item, http.StatusConflict, d.terminalReportClock()); err != nil {
+		d.logger.Error("retire superseded terminal report",
+			"task", item.report.taskID,
+			"kind", item.report.kind,
+			"error", err,
+		)
+		return false
+	}
+	d.logger.Warn("terminal report rejected as a stale claim generation; retained in the failed terminal-report queue",
+		"task", item.report.taskID,
+		"kind", item.report.kind,
+		"error", deliveryErr,
+	)
+	return true
 }
 
 func wrapTerminalReportSyncError(message string, err error) error {
@@ -639,6 +728,15 @@ func (d *Daemon) signalTerminalReportReplay() {
 // remain pending; a post-rename sync error is logged while compensation still
 // runs because there is no pending path left for a later pass to discover.
 func (d *Daemon) handleTerminalReportDeliveryError(ctx context.Context, item pendingTerminalTaskReport, deliveryErr error) bool {
+	// The server's generation fence is authoritative: it proved inside the
+	// terminal UPDATE that a later claim owns this task row, so this result can
+	// never settle it. Retire the report instead of replaying it forever, and
+	// skip the complete→fail compensation below — failing the row would mutate
+	// the reclaim that legitimately owns it, which is the exact outcome the
+	// fence exists to prevent.
+	if isStaleClaimGenerationError(deliveryErr) {
+		return d.quarantineSupersededTerminalReport(item, deliveryErr)
+	}
 	status, permanent := terminalReportPermanentRejection(deliveryErr)
 	if !permanent || d.terminalReports == nil {
 		return false
@@ -668,9 +766,13 @@ func (d *Daemon) handleTerminalReportDeliveryError(ctx context.Context, item pen
 	// overwrite or delete the user's original successful result. A semantic
 	// task-not-found response needs no compensation because no row remains.
 	if item.report.kind == terminalTaskReportComplete && !isTaskNotFoundError(deliveryErr) {
+		// The compensation must not invent a generation: it reports on behalf of
+		// the same claim, so it carries the same one — and stays unfenced exactly
+		// when its parent report had none.
 		fallback := terminalTaskReport{
 			kind:                  terminalTaskReportFail,
 			taskID:                item.report.taskID,
+			claimDispatchedAt:     item.report.claimDispatchedAt,
 			errorMessage:          fmt.Sprintf("successful terminal result was rejected by the server with HTTP %d; the original completion is preserved in the daemon failed terminal-report queue", status),
 			branchName:            item.report.branchName,
 			sessionID:             item.report.sessionID,
@@ -700,6 +802,10 @@ func (d *Daemon) handleTerminalReportDeliveryError(ctx context.Context, item pen
 // The caller owns the outer backoff; each pending item gets exactly one HTTP
 // attempt. The one-time fail compensation after quarantine uses the normal
 // bounded terminal schedule because there will be no later replay for it.
+//
+// Reports with no claim generation are counted as pending but never sent: they
+// cannot be fenced to the claim that produced them, and after a restart the
+// daemon cannot tell whether the task id still belongs to that claim.
 func (d *Daemon) replayPendingTerminalReports(ctx context.Context) (pending, delivered int) {
 	if d.terminalReports == nil {
 		return 0, 0
@@ -765,6 +871,22 @@ func (d *Daemon) replayPendingTerminalReports(ctx context.Context) (pending, del
 		}()
 	}
 	for _, item := range items {
+		if item.report.claimDispatchedAt.IsZero() {
+			// A record written before the daemon fenced terminal reports carries
+			// no claim generation, so ownership of the task id cannot be proven.
+			// Sending it could settle a task a later claim now owns; deleting it
+			// would discard the only copy of the result. Retain it and keep
+			// reporting it as pending, so an operator sees the record on every
+			// pass instead of it silently disappearing. Legacy records were
+			// already given their one unfenced delivery by the daemon that wrote
+			// them (see reportTerminalTask), so nothing legitimate is lost here.
+			d.logger.Warn("terminal report has no claim generation; retained without delivery",
+				"task", item.report.taskID,
+				"kind", item.report.kind,
+				"file", item.fileName,
+			)
+			continue
+		}
 		select {
 		case jobs <- item:
 		case <-ctx.Done():

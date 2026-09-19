@@ -167,6 +167,9 @@ func TestTerminalReportReplaysAfterClientRetryWindow(t *testing.T) {
 		sessionID:      "session-1",
 		workDir:        "/tmp/work",
 		durableWorkDir: "/tmp/project",
+		// Replay needs the claim generation the result belongs to: a record
+		// without one is retained instead of delivered.
+		claimDispatchedAt: testClaimGeneration(),
 	}
 	if err := d.reportTerminalTask(context.Background(), report); err == nil {
 		t.Fatal("terminal report unexpectedly succeeded while server was offline")
@@ -209,6 +212,9 @@ func TestTerminalReportReplaysAfterDaemonRestart(t *testing.T) {
 		errorMessage:  "provider failed after doing useful work",
 		branchName:    "agent/partial-work",
 		failureReason: "agent_error.process_failure",
+		// Only a generation lets the daemon prove, after a restart, which claim
+		// this report may still settle.
+		claimDispatchedAt: testClaimGeneration(),
 	}
 
 	beforeRestart := New(cfg, logger)
@@ -284,6 +290,7 @@ func TestTerminalReportPermanentRejectionQuarantinesOriginalAndStopsReplay(t *te
 	report := terminalTaskReport{
 		kind: terminalTaskReportComplete, taskID: "task-rejected", output: "original successful answer",
 		branchName: "agent/original", sessionID: "session-original",
+		claimDispatchedAt: testClaimGeneration(),
 	}
 	var completeCalls, fallbackCalls atomic.Int32
 	d.terminalReportSend = func(_ context.Context, got terminalTaskReport, _ []time.Duration) error {
@@ -383,7 +390,10 @@ func TestTerminalReportForegroundAndReplayDoNotSendConcurrently(t *testing.T) {
 		WorkspacesRoot: t.TempDir(),
 		DaemonID:       "daemon-in-flight",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	report := terminalTaskReport{kind: terminalTaskReportComplete, taskID: "task-race", output: "once"}
+	report := terminalTaskReport{
+		kind: terminalTaskReportComplete, taskID: "task-race", output: "once",
+		claimDispatchedAt: testClaimGeneration(),
+	}
 	if err := d.terminalReports.enqueue(report); err != nil {
 		t.Fatalf("seed pending report: %v", err)
 	}

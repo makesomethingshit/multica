@@ -533,11 +533,11 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 	}, nil)
 }
 
-func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, defaultTerminalRetrySchedule)
+func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, claimDispatchedAt time.Time) error {
+	return c.completeTaskWithRetrySchedule(ctx, taskID, output, branchName, sessionID, workDir, sessionRolloutMissing, retiredSessionID, durableWorkDir, claimDispatchedAt, defaultTerminalRetrySchedule)
 }
 
-func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, schedule []time.Duration) error {
+func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, output, branchName, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, claimDispatchedAt time.Time, schedule []time.Duration) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -557,6 +557,7 @@ func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, outp
 	if retiredSessionID != "" {
 		body["retired_session_id"] = retiredSessionID
 	}
+	addClaimGeneration(body, claimDispatchedAt)
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, schedule)
 }
 
@@ -569,11 +570,11 @@ func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []Tas
 	}, nil)
 }
 
-func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) error {
-	return c.failTaskWithRetrySchedule(ctx, taskID, errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, defaultTerminalRetrySchedule)
+func (c *Client) FailTask(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, claimDispatchedAt time.Time) error {
+	return c.failTaskWithRetrySchedule(ctx, taskID, errMsg, sessionID, workDir, branchName, failureReason, sessionRolloutMissing, retiredSessionID, durableWorkDir, claimDispatchedAt, defaultTerminalRetrySchedule)
 }
 
-func (c *Client) failTaskWithRetrySchedule(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, schedule []time.Duration) error {
+func (c *Client) failTaskWithRetrySchedule(ctx context.Context, taskID, errMsg, sessionID, workDir, branchName, failureReason string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string, claimDispatchedAt time.Time, schedule []time.Duration) error {
 	body := map[string]any{"error": errMsg}
 	if sessionID != "" {
 		body["session_id"] = sessionID
@@ -599,7 +600,41 @@ func (c *Client) failTaskWithRetrySchedule(ctx context.Context, taskID, errMsg, 
 	if retiredSessionID != "" {
 		body["retired_session_id"] = retiredSessionID
 	}
+	addClaimGeneration(body, claimDispatchedAt)
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), body, nil, schedule)
+}
+
+// addClaimGeneration stamps a terminal callback with the claim generation it
+// belongs to: the exact dispatched_at the server issued on the claim that
+// produced this result. The server compares it inside the terminal UPDATE, so
+// a report from an older claim can never settle a later reclaim of the same
+// task id. The value is echoed, never re-derived — a report with no claim
+// generation (a server that predates the field, or a report with no claim at
+// all) omits it and keeps the legacy unfenced contract.
+func addClaimGeneration(body map[string]any, claimDispatchedAt time.Time) {
+	if claimDispatchedAt.IsZero() {
+		return
+	}
+	body["expected_dispatched_at"] = claimDispatchedAt.UTC().Format(time.RFC3339Nano)
+}
+
+// isStaleClaimGenerationError reports whether err is the server's atomic
+// generation fence refusing this report: a later claim owns the task row now,
+// so this result can never settle it. The server answers with a stable code,
+// which distinguishes it from every ordinary conflict and from an outage — a
+// transient failure stays retryable, this one must not be retried at all.
+func isStaleClaimGenerationError(err error) bool {
+	var reqErr *requestError
+	if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusConflict {
+		return false
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(reqErr.Body), &body) != nil {
+		return false
+	}
+	return body.Code == protocol.DaemonTaskClaimGenerationMismatchCode
 }
 
 // PinTaskSession persists the agent's session_id and work_dir on the task

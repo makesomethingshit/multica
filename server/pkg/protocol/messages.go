@@ -72,6 +72,14 @@ const (
 	AppCapabilityChatDraftRestoreV1 = "chat-draft-restore-v1"
 )
 
+// DaemonTaskClaimGenerationMismatchCode is the machine-readable code a daemon
+// terminal callback receives (HTTP 409) when the atomic terminal UPDATE
+// refused it because a later claim generation owns the task row. The report
+// belongs to an older claim and can never settle that row, so the daemon
+// stops replaying it: it must NOT be treated as a transient outage. The code
+// is the contract; the human sentence next to it may change freely.
+const DaemonTaskClaimGenerationMismatchCode = "task_claim_generation_mismatch"
+
 // ChatQuickAction is a server-validated follow-up attached to one assistant
 // reply. Label is the concise chip text; Prompt is the full next user turn.
 type ChatQuickAction struct {
