@@ -133,7 +133,11 @@ func (h *Handler) requireDaemonTaskAccessWithWorkspace(w http.ResponseWriter, r 
 		// uses this 404 to interrupt the running agent, so a transient DB
 		// error must not be reported as a deletion.
 		if isNotFound(err) {
-			writeError(w, http.StatusNotFound, "task not found")
+			// The stable code is what lets a generation-aware report tell a real
+			// absence apart from a server whose versioned terminal route does not
+			// exist (an ordinary, unstructured 404). The sentence stays for every
+			// installed daemon that matches on it.
+			writeErrorCode(w, http.StatusNotFound, protocol.DaemonTaskNotFoundCode, "task not found")
 			return db.AgentTaskQueue{}, "", false
 		}
 		slog.Warn("get agent task failed", "task_id", taskID, "error", err)
@@ -154,7 +158,7 @@ func (h *Handler) requireDaemonTaskAccessWithWorkspace(w http.ResponseWriter, r 
 		return db.AgentTaskQueue{}, "", false
 	}
 	if wsID == "" {
-		writeError(w, http.StatusNotFound, "task not found")
+		writeErrorCode(w, http.StatusNotFound, protocol.DaemonTaskNotFoundCode, "task not found")
 		return db.AgentTaskQueue{}, "", false
 	}
 
@@ -4276,7 +4280,23 @@ func writeClaimGenerationConflict(w http.ResponseWriter) {
 		"task claim generation is no longer current")
 }
 
+// CompleteTask is the legacy terminal surface: the claim generation is optional,
+// so an installed daemon that predates the fence keeps working. A
+// generation-aware daemon uses CompleteTaskV2 instead.
 func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
+	h.completeTask(w, r, false)
+}
+
+// CompleteTaskV2 is the versioned terminal surface. Unlike the legacy route its
+// semantics REQUIRE the claim generation, so a report that was produced under a
+// fence cannot be accepted here as an unfenced legacy callback: during a rolling
+// deployment an old replica has no such route and answers 404, which the daemon
+// treats as "retry later", never as "settle it anyway".
+func (h *Handler) CompleteTaskV2(w http.ResponseWriter, r *http.Request) {
+	h.completeTask(w, r, true)
+}
+
+func (h *Handler) completeTask(w http.ResponseWriter, r *http.Request, requireGeneration bool) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
@@ -4302,6 +4322,12 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	expectedDispatchedAt, err := parseExpectedDispatchedAt(req.ExpectedDispatchedAt)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid expected_dispatched_at")
+		return
+	}
+	if requireGeneration && expectedDispatchedAt.IsZero() {
+		// The versioned route has no unfenced mode: an empty or missing value is
+		// a caller bug, not a legacy callback.
+		writeError(w, http.StatusBadRequest, "expected_dispatched_at is required")
 		return
 	}
 
@@ -4334,7 +4360,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 			SessionRolloutMissing: req.SessionRolloutMissing,
 			RetiredSessionID:      req.RetiredSessionID,
 			ExpectedDispatchedAt:  req.ExpectedDispatchedAt,
-		})
+		}, requireGeneration)
 		return
 	}
 
@@ -5026,6 +5052,8 @@ type TaskFailRequest struct {
 	ExpectedDispatchedAt string `json:"expected_dispatched_at,omitempty"`
 }
 
+// FailTask is the legacy terminal surface; see CompleteTask for why its fence
+// field stays optional.
 func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
@@ -5040,12 +5068,27 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	// TaskService.FailTask normalizes req.Error itself, but every other field
-	// here lands in a TEXT column too and a NUL in any one of them fails the
-	// same transaction (GH #7098).
-	sanitizeTaskFailRequest(&req)
+	h.failTask(w, r, taskID, workspaceID, req, false)
+}
 
-	h.failTask(w, r, taskID, workspaceID, req)
+// FailTaskV2 is the versioned failure surface: the claim generation is
+// mandatory, and a server too old to have the route answers 404 rather than
+// accepting the report unfenced.
+func (h *Handler) FailTaskV2(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "taskId")
+
+	// Verify the caller owns this task's workspace.
+	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	if !ok {
+		return
+	}
+
+	var req TaskFailRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	h.failTask(w, r, taskID, workspaceID, req, true)
 }
 
 // failTask records a terminal failure and writes the response. Shared by the
@@ -5053,10 +5096,23 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 // run re-classified at the /complete boundary lands through exactly the same
 // transaction, token revocation and runtime wake-up as one the daemon reported
 // as failed itself.
-func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, workspaceID string, req TaskFailRequest) {
+//
+// The request is sanitized here rather than in each caller (GH #7098), and
+// requireGeneration is set by the versioned route, which has no unfenced mode;
+// the context-exhaustion re-route carries the same generation across, so a
+// fenced completion that is normalized into a failure stays fenced.
+func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, workspaceID string, req TaskFailRequest, requireGeneration bool) {
+	// TaskService.FailTask normalizes req.Error itself, but every other field
+	// here lands in a TEXT column too and a NUL in any one of them fails the
+	// same transaction (GH #7098).
+	sanitizeTaskFailRequest(&req)
 	expectedDispatchedAt, err := parseExpectedDispatchedAt(req.ExpectedDispatchedAt)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid expected_dispatched_at")
+		return
+	}
+	if requireGeneration && expectedDispatchedAt.IsZero() {
+		writeError(w, http.StatusBadRequest, "expected_dispatched_at is required")
 		return
 	}
 	// MUL-5305: SessionRolloutMissing is applied inside FailTask's terminal

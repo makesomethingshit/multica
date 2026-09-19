@@ -55,19 +55,46 @@ func fencedTerminalTask(t *testing.T, status string, extra testutil.Cols) (strin
 
 // postTerminalCallback drives the real handler for one terminal callback.
 func postTerminalCallback(t *testing.T, taskID, endpoint string, body map[string]any) *httptest.ResponseRecorder {
+	return postTerminalCallbackTo(t, "/api/daemon/tasks/"+taskID+"/"+endpoint, endpoint, body)
+}
+
+// postFencedTerminalCallback drives the versioned terminal route, which requires
+// the claim generation and has no unfenced mode.
+func postFencedTerminalCallback(t *testing.T, taskID, endpoint string, body map[string]any) *httptest.ResponseRecorder {
+	return postTerminalCallbackTo(t, "/api/daemon/v2/tasks/"+taskID+"/"+endpoint, endpoint, body)
+}
+
+func postTerminalCallbackTo(t *testing.T, path, endpoint string, body map[string]any) *httptest.ResponseRecorder {
 	t.Helper()
 	w := httptest.NewRecorder()
-	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+taskID+"/"+endpoint, body,
+	req := newDaemonTokenRequest(http.MethodPost, path, body,
 		testWorkspaceID, terminalFenceDaemonID)
 	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("taskId", taskID)
+	rctx.URLParams.Add("taskId", pathTaskID(path))
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	if endpoint == "complete" {
-		testHandler.CompleteTask(w, req)
+		if strings.Contains(path, "/v2/") {
+			testHandler.CompleteTaskV2(w, req)
+		} else {
+			testHandler.CompleteTask(w, req)
+		}
 	} else {
-		testHandler.FailTask(w, req)
+		if strings.Contains(path, "/v2/") {
+			testHandler.FailTaskV2(w, req)
+		} else {
+			testHandler.FailTask(w, req)
+		}
 	}
 	return w
+}
+
+// pathTaskID pulls the task id out of a terminal callback path.
+func pathTaskID(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2]
 }
 
 // reclaimTask moves the row to a fresh claim generation, the way the stale
@@ -374,6 +401,104 @@ func TestTerminalCallbackFenceIsTheUpdateAndNotAPriorLookup(t *testing.T) {
 	}); w.Code != http.StatusOK {
 		t.Fatalf("new claim could not settle its own row: got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+// TestClaimPayloadRoundTripsClaimGeneration pins the other half of the fence:
+// TestFencedTerminalEndpointContract pins the versioned terminal route, which is
+// the per-request safety boundary during a rolling deployment: it has no
+// unfenced mode, so a report produced under a fence is either settled by a
+// server that enforces the fence or refused — never applied as a legacy
+// callback by a replica that ignores the field.
+func TestFencedTerminalEndpointContract(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	for _, endpoint := range []string{"complete", "fail"} {
+		t.Run(endpoint+" requires the generation", func(t *testing.T) {
+			taskID, _ := fencedTerminalTask(t, "running", nil)
+			body := map[string]any{"output": "done", "error": "failed"}
+			for name, value := range map[string]any{
+				"missing":   nil,
+				"empty":     "",
+				"malformed": "yesterday",
+			} {
+				payload := map[string]any{}
+				for key, item := range body {
+					payload[key] = item
+				}
+				if value != nil {
+					payload["expected_dispatched_at"] = value
+				}
+				w := postFencedTerminalCallback(t, taskID, endpoint, payload)
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("%s generation (%s): got %d: %s, want 400", endpoint, name, w.Code, w.Body.String())
+				}
+			}
+			if status, _, _, _ := taskRowState(t, taskID); status != "running" {
+				t.Fatalf("status = %q, want running (untouched by an invalid fenced request)", status)
+			}
+		})
+	}
+
+	t.Run("matching generation settles and replays idempotently", func(t *testing.T) {
+		taskID, generation := fencedTerminalTask(t, "running", nil)
+		body := map[string]any{
+			"output":                 "done",
+			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+		}
+		if w := postFencedTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
+			t.Fatalf("fenced complete: got %d: %s", w.Code, w.Body.String())
+		}
+		// The response was lost; the daemon replays the same fenced report.
+		if w := postFencedTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
+			t.Fatalf("fenced replay: got %d: %s, want idempotent 200", w.Code, w.Body.String())
+		}
+		if status, _, _, _ := taskRowState(t, taskID); status != "completed" {
+			t.Fatalf("status = %q, want completed", status)
+		}
+	})
+
+	t.Run("stale generation conflicts on the fenced route", func(t *testing.T) {
+		taskID, generation := fencedTerminalTask(t, "running", nil)
+		reclaimTask(t, taskID)
+		w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
+			"output":                 "old claim result",
+			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+		})
+		if w.Code != http.StatusConflict {
+			t.Fatalf("fenced stale complete: got %d: %s, want 409", w.Code, w.Body.String())
+		}
+		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
+			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
+		}
+		if status, _, _, _ := taskRowState(t, taskID); status != "running" {
+			t.Fatalf("status = %q, want running (untouched)", status)
+		}
+	})
+
+	// The daemon must be able to tell a real absence from a replica that has no
+	// fenced route, so a missing task answers with the stable code instead of an
+	// ordinary unstructured 404.
+	t.Run("missing task carries the structured code", func(t *testing.T) {
+		missingTaskID := "00000000-0000-0000-0000-0000000000ff"
+		w := postFencedTerminalCallback(t, missingTaskID, "complete", map[string]any{
+			"output":                 "done",
+			"expected_dispatched_at": time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("fenced callback for a missing task: got %d: %s, want 404", w.Code, w.Body.String())
+		}
+		if code := responseCode(t, w); code != protocol.DaemonTaskNotFoundCode {
+			t.Fatalf("missing-task code = %q, want %q", code, protocol.DaemonTaskNotFoundCode)
+		}
+		// The legacy route answers with the same code on a current server, so a
+		// daemon can classify both surfaces the same way.
+		legacy := postTerminalCallback(t, missingTaskID, "complete", map[string]any{"output": "done"})
+		if legacy.Code != http.StatusNotFound || responseCode(t, legacy) != protocol.DaemonTaskNotFoundCode {
+			t.Fatalf("legacy missing task = %d %s, want 404 with the stable code", legacy.Code, legacy.Body.String())
+		}
+	})
 }
 
 // TestClaimPayloadRoundTripsClaimGeneration pins the other half of the fence:

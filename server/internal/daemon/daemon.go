@@ -6493,12 +6493,16 @@ func (d *Daemon) terminalReportClock() time.Time {
 	return time.Now()
 }
 
-// observeServerCapabilities records the capability set the connected server
-// advertised on its most recent heartbeat ack. It is the authoritative answer to
-// "may this daemon use generation-aware terminal reporting right now": a server
-// that does not list the fence capability — an older deployment, or a rollback —
-// leaves the daemon unable to prove the fence is enforced, so a stored report is
-// retained rather than replayed unfenced.
+// observeServerCapabilities records the capability set the deployment advertised
+// on the most recent heartbeat ack. It is a PREFLIGHT signal only: heartbeat and
+// terminal callbacks are independent requests, and behind a load balancer they
+// can land on different replicas, so a capability proved by one heartbeat is not
+// proof that the replica handling the next terminal POST enforces the fence.
+//
+// The per-request safety boundary is the versioned terminal route itself, which
+// has no unfenced mode (see terminalTaskPath). This signal only avoids pointless
+// requests: without it the daemon holds replay rather than sending a report a
+// deployment has never claimed to support.
 func (d *Daemon) observeServerCapabilities(capabilities []string) {
 	supported := false
 	for _, capability := range capabilities {
@@ -6511,10 +6515,11 @@ func (d *Daemon) observeServerCapabilities(capabilities []string) {
 	d.serverFenceObserved.Store(true)
 }
 
-// serverSupportsTerminalReportFence reports whether the connected server has
-// proven the generation fence contract. Unobserved is treated as unsupported:
-// silence is not evidence, and the cost of guessing wrong is an unfenced
-// terminal mutation.
+// serverSupportsTerminalReportFence reports whether the deployment has
+// ADVERTISED the generation fence, which gates whether replay is worth
+// attempting. Unobserved is treated as unsupported: silence is not evidence.
+// This never substitutes for the versioned endpoint — it decides whether to
+// spend a request, not whether a mutation is fenced.
 func (d *Daemon) serverSupportsTerminalReportFence() bool {
 	return d.serverFenceObserved.Load() && d.serverFenceSupported.Load()
 }

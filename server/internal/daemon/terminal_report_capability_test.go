@@ -30,11 +30,12 @@ func serverAdvertisesFence(d *Daemon) {
 }
 
 // fenceCapableServer is an httptest server that records every terminal callback
-// body it receives and answers 200.
-func fenceCapableServer(t *testing.T) (*httptest.Server, func() []map[string]any) {
+// path and body it receives and answers 200.
+func fenceCapableServer(t *testing.T) (*httptest.Server, func() []map[string]any, func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var bodies []map[string]any
+	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
@@ -42,15 +43,20 @@ func fenceCapableServer(t *testing.T) (*httptest.Server, func() []map[string]any
 		}
 		mu.Lock()
 		bodies = append(bodies, body)
+		paths = append(paths, req.URL.Path)
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
 	return srv, func() []map[string]any {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]map[string]any(nil), bodies...)
-	}
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]map[string]any(nil), bodies...)
+		}, func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string(nil), paths...)
+		}
 }
 
 // TestOldServerClaimWithDispatchedAtStaysLegacy is the version-skew regression.
@@ -73,7 +79,7 @@ func TestOldServerClaimWithDispatchedAtStaysLegacy(t *testing.T) {
 				t.Fatalf("old-server claim produced generation %s (unreadable=%v), want legacy/absent", got, got.unreadable)
 			}
 
-			srv, sentBodies := fenceCapableServer(t)
+			srv, sentBodies, sentPaths := fenceCapableServer(t)
 			d := New(Config{
 				ServerBaseURL:  srv.URL,
 				WorkspacesRoot: t.TempDir(),
@@ -93,6 +99,9 @@ func TestOldServerClaimWithDispatchedAtStaysLegacy(t *testing.T) {
 			}
 			if value, present := bodies[0]["expected_dispatched_at"]; present {
 				t.Fatalf("legacy callback carried a fence (%v); an old server ignores it", value)
+			}
+			if got := sentPaths(); len(got) != 1 || got[0] != "/api/daemon/tasks/task-old-server/complete" {
+				t.Fatalf("legacy callback paths = %v, want the legacy terminal route", got)
 			}
 			if items, err := d.terminalReports.list(); err != nil || len(items) != 0 {
 				t.Fatalf("durable queue = %d records (%v), want none for an old-server claim", len(items), err)

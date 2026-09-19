@@ -834,6 +834,18 @@ func (d *Daemon) signalTerminalReportReplay() {
 // remain pending; a post-rename sync error is logged while compensation still
 // runs because there is no pending path left for a later pass to discover.
 func (d *Daemon) handleTerminalReportDeliveryError(ctx context.Context, item pendingTerminalTaskReport, deliveryErr error) bool {
+	// A replica that has no versioned terminal route could not settle this
+	// report, but it did not reject it either: keep it pending so a later attempt
+	// can reach a fence-capable replica. It must not reach the permanent
+	// rejection path below, which would strand a valid result in failed/ because
+	// one old replica happened to answer a rolling deployment's request.
+	if isFencedTerminalEndpointUnsupported(deliveryErr) {
+		d.logger.Warn("terminal report held: this server replica has no fenced terminal endpoint",
+			"task", item.report.taskID,
+			"kind", item.report.kind,
+		)
+		return false
+	}
 	// The server's generation fence is authoritative: it proved inside the
 	// terminal UPDATE that a later claim owns this task row, so this result can
 	// never settle it. Retire the report instead of replaying it forever, and

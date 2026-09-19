@@ -56,7 +56,42 @@ func isTaskNotFoundError(err error) bool {
 	if reqErr.StatusCode != http.StatusNotFound {
 		return false
 	}
+	// Prefer the stable code a current server sends. The sentence stays as the
+	// fallback for servers that predate the code, which every installed daemon
+	// already matched on.
+	if hasErrorCode(reqErr.Body, protocol.DaemonTaskNotFoundCode) {
+		return true
+	}
 	return strings.Contains(strings.ToLower(reqErr.Body), "task not found")
+}
+
+// hasErrorCode reports whether a response body is the JSON error envelope the
+// daemon endpoints write, carrying the given stable code.
+func hasErrorCode(body, code string) bool {
+	var envelope struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(body), &envelope) != nil {
+		return false
+	}
+	return envelope.Code == code
+}
+
+// isFencedTerminalEndpointUnsupported reports that a generation-aware report
+// reached a server with no versioned terminal route: a mixed deployment, or a
+// rollback to a build that predates the fence. The report was not rejected — the
+// replica simply cannot settle it — so it stays pending and is retried, and it
+// must never be acknowledged, quarantined as a semantic task-not-found, or
+// turned into a failure compensation.
+func isFencedTerminalEndpointUnsupported(err error) bool {
+	var reqErr *requestError
+	if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusNotFound {
+		return false
+	}
+	if !strings.Contains(reqErr.Path, "/api/daemon/v2/") {
+		return false
+	}
+	return !isTaskNotFoundError(err)
 }
 
 // isUnauthorizedError returns true if the error is a 401 from the server.
@@ -558,7 +593,7 @@ func (c *Client) completeTaskWithRetrySchedule(ctx context.Context, taskID, outp
 		body["retired_session_id"] = retiredSessionID
 	}
 	addClaimGeneration(body, claimDispatchedAt)
-	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, schedule)
+	return c.postJSONWithRetry(ctx, terminalTaskPath(taskID, "complete", !claimDispatchedAt.IsZero()), body, nil, schedule)
 }
 
 func (c *Client) ReportTaskUsage(ctx context.Context, taskID string, usage []TaskUsageEntry) error {
@@ -601,7 +636,24 @@ func (c *Client) failTaskWithRetrySchedule(ctx context.Context, taskID, errMsg, 
 		body["retired_session_id"] = retiredSessionID
 	}
 	addClaimGeneration(body, claimDispatchedAt)
-	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/fail", taskID), body, nil, schedule)
+	return c.postJSONWithRetry(ctx, terminalTaskPath(taskID, "fail", !claimDispatchedAt.IsZero()), body, nil, schedule)
+}
+
+// terminalTaskPath selects the terminal surface for one report. The choice is
+// structural — a report either carries the claim generation that makes it
+// generation-aware, or it does not — and it is never derived from the last
+// heartbeat: replicas behind a load balancer are independent, so a capability a
+// heartbeat proved says nothing about the replica that would handle this request.
+//
+// The versioned route is the per-request safety boundary. It has no unfenced
+// mode, so a report produced under a fence is either settled by a server that
+// enforces the fence or refused; there is deliberately no fallback from it to
+// the legacy route, which would recreate the unfenced mutation.
+func terminalTaskPath(taskID, action string, generationAware bool) string {
+	if generationAware {
+		return fmt.Sprintf("/api/daemon/v2/tasks/%s/%s", taskID, action)
+	}
+	return fmt.Sprintf("/api/daemon/tasks/%s/%s", taskID, action)
 }
 
 // addClaimGeneration stamps a terminal callback with the claim generation it

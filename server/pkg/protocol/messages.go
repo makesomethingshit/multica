@@ -80,6 +80,14 @@ const (
 // is the contract; the human sentence next to it may change freely.
 const DaemonTaskClaimGenerationMismatchCode = "task_claim_generation_mismatch"
 
+// DaemonTaskNotFoundCode is the machine-readable twin of the daemon endpoints'
+// "task not found" message. It exists so a generation-aware terminal report can
+// tell a server that genuinely has no such task row from a server whose
+// versioned terminal route does not exist at all (which answers an ordinary
+// unstructured 404): the first is a semantic absence the daemon settles, the
+// second is a mixed deployment the daemon must retry.
+const DaemonTaskNotFoundCode = "task_not_found"
+
 // TerminalReportGenerationFenceV1 names the complete terminal-report generation
 // fence contract: a claim that advertises it round-trips dispatched_at exactly,
 // and /complete and /fail compare that generation inside the terminal UPDATE.
