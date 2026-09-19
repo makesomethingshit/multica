@@ -109,6 +109,12 @@ func TestRuntimeCoordination_PeerOnAnotherBackendIsIgnored(t *testing.T) {
 
 // TestRuntimeCoordination_LegacyPeerGoneAllowsActivation is spec case 12: once the
 // legacy peer stops answering, this daemon may take ownership normally.
+//
+// "Stopped" is the second half of the rule and needs both signals: the health
+// probe is unanswered AND nothing holds the profile's health port. A profile
+// directory outliving its daemon is stale; a peer whose port is still held is
+// alive and only prevented from answering, which must keep this process in
+// standby (see TestRuntimeCoordination_UnresponsivePeerBlocksActivation).
 func TestRuntimeCoordination_LegacyPeerGoneAllowsActivation(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -120,13 +126,17 @@ func TestRuntimeCoordination_LegacyPeerGoneAllowsActivation(t *testing.T) {
 		cfg:    Config{ServerBaseURL: backend, Profile: ""},
 		logger: quietTaskLog(),
 	}
-	original := peerProbeFunc
-	t.Cleanup(func() { peerProbeFunc = original })
-	// Not alive: a stopped legacy daemon is indistinguishable from one that
-	// never served health, and the safe reading is "nothing is serving it".
+	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
+	t.Cleanup(func() {
+		peerProbeFunc = originalProbe
+		peerHealthPortOwnedFunc = originalPort
+	})
+	// Not alive, and the port is free: no process is running under that profile,
+	// so the profile directory is stale and activation may proceed.
 	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
 		return peerCoordinationStatus{}
 	}
+	peerHealthPortOwnedFunc = func(int) bool { return false }
 	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
 		t.Fatalf("a stopped peer blocked activation: %v", decision.Peers)
 	}

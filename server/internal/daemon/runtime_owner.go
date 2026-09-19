@@ -55,6 +55,21 @@ func runtimeOwnerTarget(workspaceID, provider, profileID string) string {
 	return "runtime-owner:builtin:" + workspaceID + ":" + provider
 }
 
+// runtimeOwnerTargetWorkspace decodes the workspace a target names, so standby
+// bookkeeping can be scoped to one workspace (the reconcile retry below needs to
+// ask "does THIS workspace have a sibling-owned runtime?").
+//
+// Both halves of the identity are colon-free — workspace IDs, provider names and
+// profile IDs are UUIDs and slugs — so the third field is unambiguously the
+// workspace.
+func runtimeOwnerTargetWorkspace(target string) string {
+	parts := strings.SplitN(target, ":", 4)
+	if len(parts) < 4 || parts[0] != "runtime-owner" {
+		return ""
+	}
+	return parts[2]
+}
+
 // runtimeOwnerClaim is one held ownership: the OS claim plus the generation it
 // belongs to.
 //
@@ -144,15 +159,39 @@ func (d *Daemon) clearRuntimeStandby(target string) {
 	delete(d.ownerState().standbyTargets, target)
 }
 
-// runtimeStandbyTargets returns the targets currently owned by a sibling.
-func (d *Daemon) runtimeStandbyTargets() map[string]string {
+// pruneRuntimeStandby removes this workspace's standby entries that are no
+// longer candidates, so the set reflects the current candidate list instead of
+// accumulating historical targets (a disabled profile, an uninstalled provider,
+// a profile that changed provider identity). Without it a workspace would be
+// reconciled forever for a runtime nobody hosts.
+//
+// candidates is the target set of the round that just ran; entries for other
+// workspaces are left alone.
+func (d *Daemon) pruneRuntimeStandby(workspaceID string, candidates map[string]bool) {
 	d.ownerState().mu.Lock()
 	defer d.ownerState().mu.Unlock()
-	out := make(map[string]string, len(d.ownerState().standbyTargets))
-	for target, label := range d.ownerState().standbyTargets {
-		out[target] = label
+	for target := range d.ownerState().standbyTargets {
+		if runtimeOwnerTargetWorkspace(target) != workspaceID {
+			continue
+		}
+		if !candidates[target] {
+			delete(d.ownerState().standbyTargets, target)
+		}
 	}
-	return out
+}
+
+// workspaceHasStandbyRuntime reports whether any runtime target recorded as
+// sibling-owned belongs to workspaceID — i.e. this process is still standing by
+// for a runtime in that workspace and must keep retrying it.
+func (d *Daemon) workspaceHasStandbyRuntime(workspaceID string) bool {
+	d.ownerState().mu.Lock()
+	defer d.ownerState().mu.Unlock()
+	for target := range d.ownerState().standbyTargets {
+		if runtimeOwnerTargetWorkspace(target) == workspaceID {
+			return true
+		}
+	}
+	return false
 }
 
 // ownsTarget reports whether this process currently holds target.
@@ -269,6 +308,7 @@ func (d *Daemon) filterOwnedRuntimeCandidates(ctx context.Context, workspaceID s
 		d.clearRuntimeStandby(target)
 		owned = append(owned, entry)
 	}
+	d.pruneRuntimeStandby(workspaceID, seen)
 	return owned, peerOwned, nil
 }
 

@@ -656,6 +656,12 @@ type Daemon struct {
 	// built as a struct literal (tests, embedded callers) cannot panic on the
 	// ownership path. Same pattern as ensureActiveEnvRootStateLocked.
 	runtimeOwnersInit sync.Mutex
+	// legacyPeerStandby is set while a live same-machine, same-backend peer from
+	// a release that predates the runtime-owner claim is serving this machine.
+	// This process has given its runtimes up to that peer, so it must not start
+	// new work: the flag is the second condition tryEnterClaim refuses on (GH
+	// #8280 - see runtime_coordination.go).
+	legacyPeerStandby atomic.Bool
 	// machineLocks is the machine-global lock set for resources that are not
 	// scoped to one backend - currently the local_directory real paths. See
 	// local_directory_scope.go.
@@ -1441,14 +1447,79 @@ func (d *Daemon) removeStaleRuntime(runtimeID string) (string, bool) {
 		d.mu.Unlock()
 		return "", false
 	}
+	// Capture the ownership target before the row goes: the claim is held by
+	// logical target, and once the runtime ID is gone nothing local can name it.
+	// The row itself was deleted server-side, so there is nothing to deregister —
+	// but this process is no longer serving a live runtime under that claim, and
+	// releasing it here is what gives the re-registration below a fresh ownership
+	// generation (and therefore exactly one orphan recovery for the new row).
+	// Holding it would keep the claim but skip that recovery forever (GH #8280).
+	var target string
+	if rt, tracked := d.runtimeIndex[runtimeID]; tracked {
+		target = runtimeOwnerTargetForRuntime(rt, workspaceID)
+	}
 	delete(d.runtimeIndex, runtimeID)
 	d.mu.Unlock()
+	d.releaseRuntimeOwnership(target)
 
 	d.wsHBMu.Lock()
 	delete(d.wsHBLastAck, runtimeID)
 	d.wsHBMu.Unlock()
 
 	return workspaceID, true
+}
+
+// dropTrackedRuntimeRows stops tracking every runtime row of one workspace and
+// returns them paired with their ownership targets, so the caller can take them
+// offline and then release the claims. The workspace itself stays tracked; use
+// forgetWorkspace to stop tracking it as well.
+//
+// The target has to be captured here, under the same lock that removes the row:
+// after this call there is no runtime metadata left to derive it from, and
+// releasing "by runtime ID" is not the same thing — IDs rotate when the server
+// deletes and recreates a runtime.
+func (d *Daemon) dropTrackedRuntimeRows(workspaceID string) []droppedRuntime {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ws, exists := d.workspaces[workspaceID]
+	if !exists {
+		return nil
+	}
+	if len(ws.runtimeIDs) == 0 {
+		return nil
+	}
+	dropped := make([]droppedRuntime, 0, len(ws.runtimeIDs))
+	for _, rid := range ws.runtimeIDs {
+		entry := droppedRuntime{ID: rid}
+		if rt, tracked := d.runtimeIndex[rid]; tracked {
+			entry.Target = runtimeOwnerTargetForRuntime(rt, workspaceID)
+			delete(d.runtimeIndex, rid)
+		}
+		dropped = append(dropped, entry)
+	}
+	// A fresh array rather than reuse, matching removeStaleRuntime: the health
+	// handler copies the slice header under d.mu and serializes it after
+	// releasing the lock.
+	ws.runtimeIDs = ws.runtimeIDs[:0:0]
+	return dropped
+}
+
+// forgetWorkspace drops one workspace's local tracking — its runtime rows and
+// the workspaceState itself — and reports the rows it was serving, so the caller
+// can take them offline and then release the claims. It reports false when the
+// workspace was not tracked.
+func (d *Daemon) forgetWorkspace(workspaceID string) ([]droppedRuntime, bool) {
+	d.mu.Lock()
+	_, exists := d.workspaces[workspaceID]
+	d.mu.Unlock()
+	if !exists {
+		return nil, false
+	}
+	dropped := d.dropTrackedRuntimeRows(workspaceID)
+	d.mu.Lock()
+	delete(d.workspaces, workspaceID)
+	d.mu.Unlock()
+	return dropped, true
 }
 
 // workspaceNeedsRuntimeRecovery reports whether a tracked workspace currently
@@ -1464,6 +1535,20 @@ func (d *Daemon) workspaceNeedsRuntimeRecovery(workspaceID string) bool {
 		return false
 	}
 	return len(ws.runtimeIDs) == 0
+}
+
+// workspaceNeedsRuntimeReconcile reports whether the periodic reconcile should
+// retry registration for a tracked workspace: it has no runtimes at all, or one
+// of its runtime targets is currently recorded as sibling-owned.
+//
+// The second half is what keeps partial ownership from going stale. A sibling
+// that dies releases nothing but its OS claim, and when the workspace's profile
+// signature has not changed there is no drift reason to re-register either — so
+// without a standby-aware predicate this process would happily keep serving the
+// runtimes it owns and never retry the freed sibling runtime it is standing by
+// for (GH #8280).
+func (d *Daemon) workspaceNeedsRuntimeReconcile(workspaceID string) bool {
+	return d.workspaceNeedsRuntimeRecovery(workspaceID) || d.workspaceHasStandbyRuntime(workspaceID)
 }
 
 // reregisterWorkspaceAfterRuntimeGone calls registerRuntimesForWorkspace and
@@ -1489,14 +1574,18 @@ func (d *Daemon) workspaceNeedsRuntimeRecovery(workspaceID string) bool {
 //   - newIDs:     the runtime IDs the server returned in this response, in
 //     the order they were returned. These are the daemon's authoritative
 //     current runtime set after the call.
-//   - droppedIDs: runtime IDs that were tracked before this call but did
-//     NOT survive the response. Callers Deregister these so the server marks
-//     them offline immediately instead of waiting on the 150 s
-//     stale-heartbeat sweep. On the runtime_gone path the triggering row was
+//   - dropped: runtime rows that were tracked before this call but did NOT
+//     survive the response, each paired with the ownership target it belongs
+//     to. Callers Deregister these so the server marks them offline immediately
+//     instead of waiting on the 150 s stale-heartbeat sweep, and release the
+//     target's claim afterwards — this process has stopped serving that logical
+//     runtime, so keeping the claim would lock a sibling out until the process
+//     exits (GH #8280). On the runtime_gone path the triggering row was
 //     already deleted server-side (and pruned locally before the register),
 //     but a SIBLING dropped here — e.g. a provider removed from the daemon's
 //     config, or a disabled profile — still has a live server row that must be
-//     deregistered.
+//     deregistered. The target is read here, under the same lock that drops the
+//     row: afterwards nothing local can name it, and runtime IDs rotate.
 //   - ok:         false when the workspace was forgotten between the
 //     register call and this apply (e.g. the user left the workspace and
 //     syncWorkspacesFromAPI removed it). The caller must abort silently in
@@ -1518,7 +1607,7 @@ func (d *Daemon) workspaceNeedsRuntimeRecovery(workspaceID string) bool {
 // rejected below: that verdict was reached by demoteBelowMinimumRuntimes, which
 // removed the rows under the claim barrier, and this response merely predates
 // it.
-func (d *Daemon) applyRegisterResponseInPlace(workspaceID string, resp *RegisterResponse, profileSig string, preserveProviders map[string]string) (newIDs, droppedIDs []string, ok bool) {
+func (d *Daemon) applyRegisterResponseInPlace(workspaceID string, resp *RegisterResponse, profileSig string, preserveProviders map[string]string) (newIDs []string, dropped []droppedRuntime, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	ws, exists := d.workspaces[workspaceID]
@@ -1539,7 +1628,7 @@ func (d *Daemon) applyRegisterResponseInPlace(workspaceID string, resp *Register
 	for _, rt := range resp.Runtimes {
 		if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
 			rejected[rt.ID] = struct{}{}
-			droppedIDs = append(droppedIDs, rt.ID)
+			dropped = append(dropped, droppedRuntime{ID: rt.ID, Target: runtimeOwnerTargetForRuntime(rt, workspaceID)})
 			continue
 		}
 		newIDs = append(newIDs, rt.ID)
@@ -1567,8 +1656,12 @@ func (d *Daemon) applyRegisterResponseInPlace(workspaceID string, resp *Register
 				continue
 			}
 		}
+		target := ""
+		if rt, tracked := d.runtimeIndex[oldID]; tracked {
+			target = runtimeOwnerTargetForRuntime(rt, workspaceID)
+		}
 		delete(d.runtimeIndex, oldID)
-		droppedIDs = append(droppedIDs, oldID)
+		dropped = append(dropped, droppedRuntime{ID: oldID, Target: target})
 	}
 	for _, rt := range resp.Runtimes {
 		if _, skip := rejected[rt.ID]; skip {
@@ -1595,7 +1688,7 @@ func (d *Daemon) applyRegisterResponseInPlace(workspaceID string, resp *Register
 	if profileSig != "" {
 		ws.profileSetSig = profileSig
 	}
-	return newIDs, droppedIDs, true
+	return newIDs, dropped, true
 }
 
 // mergeBuiltinRegisterResponse applies a builtins-only register response
@@ -1656,7 +1749,7 @@ func (d *Daemon) mergeBuiltinRegisterResponse(workspaceID string, resp *Register
 		// guard in applyRegisterResponseInPlace. The caller deregisters the row
 		// the server upserted back.
 		if d.providerDemotedLocked(rt.Provider) {
-			revived.add(d, rt.ID, rt.Provider)
+			revived.add(d, workspaceID, rt)
 			continue
 		}
 		d.runtimeIndex[rt.ID] = rt
@@ -1718,6 +1811,22 @@ func (d *Daemon) demotedOfflineReasonLocked(provider string) *RuntimeOfflineReas
 type revivedRuntimes struct {
 	ids     []string
 	reasons map[string]RuntimeOfflineReason
+	// targets is the ownership claim each of those rows belongs to. The row is
+	// refused locally, so this process must not keep claiming the logical
+	// runtime it just declined to serve (GH #8280).
+	targets map[string]string
+}
+
+// droppedRuntime is one runtime row this daemon is giving up: the server row to
+// take offline, and the ownership claim to release once that attempt is done.
+//
+// The two travel together because they cannot be derived from each other after
+// the fact: the claim is keyed on the logical target (workspace + provider, or
+// workspace + profile), and the local metadata that names it is deleted in the
+// same step that decides the row is going away.
+type droppedRuntime struct {
+	ID     string
+	Target string
 }
 
 // reasonsFor narrows the causes to the rows actually being deregistered. The
@@ -1743,16 +1852,22 @@ func (r revivedRuntimes) reasonsFor(runtimeIDs []string) map[string]RuntimeOffli
 // add records one revived row. Callers must hold d.mu (it reads the demotion
 // record), and it is a no-op for a provider with no structured cause — those
 // rows still need deregistering, they just have nothing to re-attach.
-func (r *revivedRuntimes) add(d *Daemon, runtimeID, provider string) {
-	r.ids = append(r.ids, runtimeID)
-	reason := d.demotedOfflineReasonLocked(provider)
+func (r *revivedRuntimes) add(d *Daemon, workspaceID string, rt Runtime) {
+	r.ids = append(r.ids, rt.ID)
+	if target := runtimeOwnerTargetForRuntime(rt, workspaceID); target != "" {
+		if r.targets == nil {
+			r.targets = make(map[string]string, 1)
+		}
+		r.targets[rt.ID] = target
+	}
+	reason := d.demotedOfflineReasonLocked(rt.Provider)
 	if reason == nil {
 		return
 	}
 	if r.reasons == nil {
 		r.reasons = make(map[string]RuntimeOfflineReason, 1)
 	}
-	r.reasons[runtimeID] = *reason
+	r.reasons[rt.ID] = *reason
 }
 
 // demotionRecord is a confirmed verdict about the binary on disk: the evidence
@@ -1947,18 +2062,32 @@ func (d *Daemon) untrackedRuntimeIDs(ids []string) []string {
 
 func (d *Daemon) reregisterWorkspaceAfterRuntimeGone(ctx context.Context, workspaceID string) error {
 	var newIDs []string
+	// The response rows are captured for the ownership-gated recovery below,
+	// which runs after the register lock is released.
+	var registered []Runtime
 	// Send, apply and clean up as one ordered step — see workspaceRegisterLock.
 	err := d.withWorkspaceRegisterLock(workspaceID, func() error {
 		resp, profileSig, preserve, err := d.registerRuntimesForWorkspaceLocked(ctx, workspaceID)
 		if err != nil {
+			if errors.Is(err, errAllRuntimesPeerOwned) {
+				// Every candidate is served by a sibling right now. That is a
+				// standby outcome rather than a failed reconcile: registering
+				// nothing is correct, the standby entries keep the workspace
+				// reconciled, and the caller must not be told it failed (GH
+				// #8280).
+				d.logger.Info("all runtime candidates are owned by a sibling daemon process; standing by",
+					"workspace_id", workspaceID)
+				return nil
+			}
 			return fmt.Errorf("register runtimes: %w", err)
 		}
 
-		ids, droppedIDs, ok := d.applyRegisterResponseInPlace(workspaceID, resp, profileSig, preserve)
+		ids, dropped, ok := d.applyRegisterResponseInPlace(workspaceID, resp, profileSig, preserve)
 		if !ok {
 			return fmt.Errorf("workspace %s no longer tracked", workspaceID)
 		}
 		newIDs = ids
+		registered = resp.Runtimes
 
 		for _, rid := range newIDs {
 			d.logger.Info("re-registered runtime after server-side deletion",
@@ -1970,7 +2099,7 @@ func (d *Daemon) reregisterWorkspaceAfterRuntimeGone(ctx context.Context, worksp
 		// runtime_gone trigger only deleted its own. Eagerly mark those offline,
 		// matching the drift path, instead of leaving them claimable until the
 		// stale-heartbeat sweep.
-		d.deregisterDroppedRuntimes(ctx, workspaceID, droppedIDs, "runtime_gone recovery", nil)
+		d.deregisterDroppedRuntimes(ctx, workspaceID, dropped, "runtime_gone recovery", nil)
 		return nil
 	})
 	if err != nil {
@@ -1978,20 +2107,28 @@ func (d *Daemon) reregisterWorkspaceAfterRuntimeGone(ctx context.Context, worksp
 	}
 	d.notifyRuntimeSetChanged()
 
-	// Tell the server about any tasks the previous (now-deleted) runtime
-	// was working on, mirroring the registration path's recover-orphans call.
-	// This is intentionally scoped to the runtime_gone recovery: the
-	// runtimes were truly gone server-side, so anything still in
-	// dispatched/running/waiting_local_directory on those rows is an orphan
-	// that needs to be failed-and-retried. The drift-refresh path (which
-	// also feeds applyRegisterResponseInPlace) deliberately skips this step
-	// because its surviving runtime IDs may still be actively executing
-	// tasks for the user (MUL-3332).
-	for _, rid := range newIDs {
-		if err := d.client.RecoverOrphans(ctx, rid); err != nil {
-			d.logger.Warn("recover-orphans after re-register failed",
-				"runtime_id", rid, "error", err)
+	// Tell the server about any tasks the previous (now-deleted) runtime was
+	// working on, mirroring the registration path. The recovery is gated on
+	// ownership generation rather than on the returned rows: this register
+	// returns every configured provider, so the runtime that lost its row comes
+	// back TOGETHER with the workspace's surviving runtimes, and recovery
+	// hard-fails every dispatched/running/waiting_local_directory task on
+	// whichever runtime it is aimed at. Recovering per returned row would fail
+	// the tasks this process is still executing on a sibling runtime of the one
+	// that was actually deleted (GH #8280).
+	//
+	// The row that lost its server-side identity got a fresh ownership
+	// generation in removeStaleRuntime, so it is recovered exactly once here; a
+	// surviving runtime keeps its generation and markOwnershipRecovered skips
+	// it. The drift-refresh path (which also feeds applyRegisterResponseInPlace)
+	// still deliberately skips recovery entirely (MUL-3332).
+	for _, rt := range registered {
+		if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
+			// Refused locally and already on its way offline; recovering it
+			// would fail tasks for a runtime this process will never serve.
+			continue
 		}
+		d.recoverOrphansOncePerOwnership(ctx, workspaceID, rt)
 	}
 	return nil
 }
@@ -3981,7 +4118,7 @@ func (d *Daemon) convergeWorkspaceRuntimesToZero(ctx context.Context, workspaceI
 	// slice header under d.mu and serializes it after releasing the lock
 	// (removeStaleRuntime keeps the same rule).
 	kept := ws.runtimeIDs[:0:0]
-	var dropped []string
+	var dropped []droppedRuntime
 	for _, rid := range ws.runtimeIDs {
 		if rt, tracked := d.runtimeIndex[rid]; tracked && rt.ProfileID == "" {
 			if _, preserve := preserveProviders[rt.Provider]; preserve {
@@ -3992,8 +4129,15 @@ func (d *Daemon) convergeWorkspaceRuntimesToZero(ctx context.Context, workspaceI
 			// round; drop its version record too, mirroring the demote path.
 			delete(ws.builtinVersions, rt.Provider)
 		}
+		// The ownership target is read before the row goes: converging to zero
+		// means this process stops serving that logical runtime, so the claim
+		// must be released with it (GH #8280).
+		entry := droppedRuntime{ID: rid}
+		if rt, tracked := d.runtimeIndex[rid]; tracked {
+			entry.Target = runtimeOwnerTargetForRuntime(rt, workspaceID)
+		}
 		delete(d.runtimeIndex, rid)
-		dropped = append(dropped, rid)
+		dropped = append(dropped, entry)
 	}
 	ws.runtimeIDs = kept
 	if profileSig != "" {
@@ -4004,7 +4148,7 @@ func (d *Daemon) convergeWorkspaceRuntimesToZero(ctx context.Context, workspaceI
 	d.mu.Unlock()
 
 	d.logger.Info("custom runtime profile drift converged to zero; clearing local tracking",
-		"workspace_id", workspaceID, "deregistered_runtime_ids", dropped,
+		"workspace_id", workspaceID, "deregistered_runtimes", len(dropped),
 		"preserved_providers", preserveProviders)
 
 	d.deregisterDroppedRuntimes(ctx, workspaceID, dropped, "zero-runtime convergence", nil)
@@ -4347,10 +4491,19 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 	// runtime-owner claim cannot be coordinated with: it would register and serve
 	// the same runtimes this process is about to take. Fail closed and stand by
 	// until it is gone, then retry on the next reconcile (GH #8280).
+	//
+	// checkRuntimeCoordinationPeers is the whole mixed-version rule: a peer that
+	// answered without the capability blocks, a peer that did not answer blocks
+	// while its health port is still held, and a peer whose port is free is a
+	// stale profile directory. If this process already owns runtimes when the
+	// conflict appears, "standing by" has to be an active transition rather than
+	// an early return - see yieldRuntimesToLegacyPeer.
 	if decision := d.checkRuntimeCoordinationPeers(ctx); decision.Blocked {
 		d.logLegacyPeerStandby(decision)
+		d.yieldRuntimesToLegacyPeer(ctx, decision)
 		return nil
 	}
+	d.resumeAfterLegacyPeer()
 
 	// Built-in agent CLIs are installed per machine, so one probe round serves
 	// every workspace this sync has to register (MUL-5225). Probing is lazy —
@@ -4371,6 +4524,10 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 
 	var registered int
 	var removed int
+	// standbyCount counts the workspaces this round deliberately left entirely
+	// to a sibling process. A daemon whose every workspace is in that state is
+	// healthy, not empty: the runtimes exist and are being served (GH #8280).
+	var standbyCount int
 	for id, name := range apiIDs {
 		if currentIDs[id] {
 			if reconcileProfiles {
@@ -4380,13 +4537,16 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 			}
 			// Only intervene further if the workspace lost all of its
 			// runtimes (most commonly because handleRuntimeGone pruned them
-			// and its inline re-register failed). The pointer is not replaced
-			// here either — ensureRepoReady holds repoRefreshMu from the
-			// original pointer.
-			if !d.workspaceNeedsRuntimeRecovery(id) {
+			// and its inline re-register failed), or because a sibling owns one
+			// of its runtime targets and this process is still standing by for
+			// that one — a healthy locally-owned runtime must not suppress the
+			// retry, since the sibling can die at any time (GH #8280). The
+			// pointer is not replaced here either — ensureRepoReady holds
+			// repoRefreshMu from the original pointer.
+			if !d.workspaceNeedsRuntimeReconcile(id) {
 				continue
 			}
-			d.logger.Info("workspace has no runtimes; retrying registration", "workspace_id", id, "name", name)
+			d.logger.Info("workspace runtimes need reconcile; retrying registration", "workspace_id", id, "name", name)
 			if err := d.reregisterWorkspaceAfterRuntimeGone(ctx, id); err != nil {
 				d.logger.Warn("retry register failed", "workspace_id", id, "error", err)
 				continue
@@ -4398,6 +4558,12 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 		var (
 			resp       *RegisterResponse
 			runtimeIDs []string
+			// standby marks an attempt that deliberately registered nothing
+			// because a sibling process serves every runtime this workspace
+			// would have hosted. It is neither an error nor a success: there is
+			// no response to fold in, and the steps after the callback must be
+			// skipped rather than run against a nil resp (GH #8280).
+			standby bool
 		)
 		// Send, publish and clean up as one ordered step — see
 		// workspaceRegisterLock.
@@ -4412,6 +4578,7 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 					// nothing, and let the periodic reconcile retry (GH #8280).
 					d.logger.Info("workspace runtimes are owned by a sibling daemon process; standing by",
 						"workspace_id", id)
+					standby = true
 					return nil
 				}
 				return err
@@ -4427,7 +4594,7 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 			var revived revivedRuntimes
 			for _, rt := range resp.Runtimes {
 				if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
-					revived.add(d, rt.ID, rt.Provider)
+					revived.add(d, id, rt)
 					continue
 				}
 				runtimeIDs = append(runtimeIDs, rt.ID)
@@ -4473,6 +4640,13 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 			d.logger.Error("failed to register runtimes", "workspace_id", id, "name", name, "error", err)
 			continue
 		}
+		if standby {
+			// A standby attempt owns no runtime it could publish: no repo sync,
+			// no orphan recovery (that would hard-fail the sibling's tasks), no
+			// registration count. Only the remaining workspaces matter.
+			standbyCount++
+			continue
+		}
 
 		if d.repoCache != nil && len(resp.Repos) > 0 {
 			go d.syncWorkspaceRepos(id, resp.Repos)
@@ -4501,14 +4675,17 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 	// Remove workspaces the user no longer belongs to.
 	for id := range currentIDs {
 		if _, ok := apiIDs[id]; !ok {
-			d.mu.Lock()
-			if ws, exists := d.workspaces[id]; exists {
-				for _, rid := range ws.runtimeIDs {
-					delete(d.runtimeIndex, rid)
-				}
+			// Drop the local metadata first, then tell the server, then release
+			// the ownership claims — the same order shutdown uses, and for the
+			// same reason: releasing first would let a sibling take the target
+			// over and bring the runtime back online before this process's late
+			// Deregister lands (GH #8280). The target can only be named while
+			// the runtime row is still here, so it is captured inside.
+			dropped, existed := d.forgetWorkspace(id)
+			if !existed {
+				continue
 			}
-			delete(d.workspaces, id)
-			d.mu.Unlock()
+			d.deregisterDroppedRuntimes(ctx, id, dropped, "workspace removed", nil)
 			d.logger.Info("stopped watching workspace", "workspace_id", id)
 			removed++
 		}
@@ -4525,7 +4702,13 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 	// just upgraded, and a state file removed by repo cache GC.
 	d.publishTrackedCoAuthoredByState()
 
-	if len(d.allRuntimeIDs()) == 0 && registered == 0 && len(workspaces) > 0 {
+	// Startup may continue with nothing to serve only when every workspace was
+	// explicitly left to a sibling: the runtimes exist, this process just does
+	// not own them, and the periodic sync takes them over once they are free.
+	// Every other way of registering nothing (unreachable server, rejected
+	// token, a machine with no runtimes) still fails startup.
+	allWorkspacesStandby := standbyCount > 0 && standbyCount == len(apiIDs)
+	if len(d.allRuntimeIDs()) == 0 && registered == 0 && !allWorkspacesStandby && len(workspaces) > 0 {
 		return fmt.Errorf("%w for any of the %d workspace(s)", errNoWorkspaceRuntimesRegistered, len(workspaces))
 	}
 	if registered > 0 || removed > 0 {
@@ -5317,7 +5500,11 @@ func (d *Daemon) reportUpdateResultWithRetry(ctx context.Context, runtimeID, upd
 func (d *Daemon) tryEnterClaim() bool {
 	d.claimMu.Lock()
 	defer d.claimMu.Unlock()
-	if d.pauseClaims {
+	// legacyPeerStandby is checked here rather than by pausing claims through
+	// the auto-update barrier: the barrier is owned by the update path and is
+	// released on its failure paths, so a standby set through it could be
+	// cleared by an unrelated update that never happened (GH #8280).
+	if d.pauseClaims || d.legacyPeerStandby.Load() {
 		return false
 	}
 	d.claimsInFlight++
