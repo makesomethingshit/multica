@@ -556,6 +556,10 @@ func TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes(t *testing.T) {
 		return peerCoordinationStatus{Alive: true}
 	}
 	peerHealthPortOwnedFunc = func(int) bool { return true }
+	// Subscribed after the registration above, so the only notification this
+	// channel can carry is the yield's.
+	runtimeSetCh, unsub := d.runtimeSet.Subscribe()
+	defer unsub()
 
 	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
 		t.Fatalf("sync with a late legacy peer: %v", err)
@@ -582,6 +586,13 @@ func TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes(t *testing.T) {
 	}
 	if !fx.runtimeOnline(runtimeID) {
 		t.Error("the shared runtime was taken offline during the handoff")
+	}
+	// Heartbeating stops through the runtime-set notification: the heartbeat
+	// loop cancels the goroutine of every ID that left allRuntimeIDs().
+	select {
+	case <-runtimeSetCh:
+	case <-time.After(2 * time.Second):
+		t.Error("the runtime-set watchers were not notified, so the heartbeat goroutine would keep running")
 	}
 
 	// The peer is upgraded or stopped: the next tick resumes and this process

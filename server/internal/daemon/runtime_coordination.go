@@ -323,6 +323,12 @@ func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
 // as runtime_offline and retried by the server, exactly as for every other path
 // that drops a runtime mid-claim. Waiting for those goroutines would mean
 // waiting for task execution, which this transition deliberately does not do.
+//
+// A task that is already executing is unaffected by the drop: its terminal and
+// cleanup paths read no runtimeIndex entry, and the only two lookups that do are
+// handleTask's entry check and runTask's custom-profile command lookup, both of
+// which predate this transition and behave the same for every other path that
+// stops serving a runtime.
 func (d *Daemon) yieldRuntimesToLegacyPeer(ctx context.Context, decision legacyPeerDecision) {
 	if !d.enterLegacyPeerStandby(ctx) {
 		// The daemon is shutting down: the claim gate stays closed, which is the
