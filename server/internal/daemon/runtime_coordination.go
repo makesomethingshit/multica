@@ -278,11 +278,6 @@ func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
 		"peers", decision.Peers)
 }
 
-// legacyPeerYieldTimeout bounds the deregistration burst a standby transition
-// makes. The claims are released whether or not it succeeds, with the server's
-// stale-heartbeat sweep as the backstop.
-const legacyPeerYieldTimeout = 10 * time.Second
-
 // yieldRuntimesToLegacyPeer is the transition for a live uncoordinated peer that
 // appears AFTER this process already started serving runtimes.
 //
@@ -292,21 +287,48 @@ const legacyPeerYieldTimeout = 10 * time.Second
 // the two-owners failure the whole revision exists to prevent (GH #8280). So the
 // transition is explicit, and ordered:
 //
-//  1. close the claim gate first, so no NEW task can start while both processes
-//     are known live;
-//  2. take this process's runtimes offline on the server;
-//  3. release their ownership claims, so a peer that does coordinate can take
-//     them over immediately;
+//  1. close the claim gate and let the claims that already entered finish their
+//     ClaimTask -> dispatch step (enterLegacyPeerStandby), so no claim is left
+//     in flight under an ownership drop;
+//  2. for every workspace, under its registration lock: stop tracking this
+//     process's runtimes and release their logical ownership claims
+//     (yieldTrackedRuntimes). The registration lock is what keeps a register
+//     response that is already in flight from publishing a runtime back into
+//     the set this step just emptied;
+//  3. nudge the runtime-set watchers so the heartbeat and poll supervisors
+//     re-derive an empty set immediately;
 //  4. stay in standby until the peer is gone or upgraded - resumeAfterLegacyPeer
 //     clears the gate, and the normal reconcile re-registers what this process
 //     owns from the now-empty tracked set.
+//
+// It deliberately does NOT Deregister these runtimes, and that is the one
+// exception to the deregister-before-release ordering every other removal path
+// follows. Both processes share the machine-scoped daemon identity, so the row
+// this process would be taking offline is the row the legacy peer continues to
+// serve: there is no second server runtime to hand ownership over to. Marking it
+// offline would recreate the sibling-shutdown failure (#8280) through the
+// mixed-version path. The local serving authority goes away; the server runtime
+// identity stays exactly as it is. The shared row goes stale on its own once
+// nobody heartbeats it, and the reconcile below re-registers it when the peer is
+// gone.
 //
 // Tasks already running are NOT cancelled: the server has routed them and this
 // process is the only one that can finish them, so the boundary this revision
 // fixes is "no new work starts", not "drain in flight". That boundary is
 // deliberate and covered by TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes.
+//
+// The drain covers the claim transition - ClaimTask through the dispatch
+// accounting that exitClaim releases. A task whose handleTask goroutine has not
+// resolved its runtime yet keeps the behaviour documented there: it is reported
+// as runtime_offline and retried by the server, exactly as for every other path
+// that drops a runtime mid-claim. Waiting for those goroutines would mean
+// waiting for task execution, which this transition deliberately does not do.
 func (d *Daemon) yieldRuntimesToLegacyPeer(ctx context.Context, decision legacyPeerDecision) {
-	d.legacyPeerStandby.Store(true)
+	if !d.enterLegacyPeerStandby(ctx) {
+		// The daemon is shutting down: the claim gate stays closed, which is the
+		// safe direction, and there is no point moving ownership around.
+		return
+	}
 
 	d.mu.Lock()
 	workspaceIDs := make([]string, 0, len(d.workspaces))
@@ -316,30 +338,39 @@ func (d *Daemon) yieldRuntimesToLegacyPeer(ctx context.Context, decision legacyP
 	d.mu.Unlock()
 	sort.Strings(workspaceIDs)
 
-	yieldCtx, cancel := context.WithTimeout(ctx, legacyPeerYieldTimeout)
-	defer cancel()
-
-	// One workspace at a time, each under its own register lock, like every
-	// other cleanup: the rows are dropped locally, the server is told, and only
-	// then are the claims released (deregisterDroppedRuntimes).
+	// One workspace at a time, each under its own register lock: a registration
+	// for that workspace either completed before this section or runs after it,
+	// so it cannot republish a runtime this transition has just given up.
 	yielded := 0
 	for _, workspaceID := range workspaceIDs {
-		dropped := d.dropTrackedRuntimeRows(workspaceID)
-		if len(dropped) == 0 {
-			continue
-		}
 		_ = d.withWorkspaceRegisterLock(workspaceID, func() error {
-			d.deregisterDroppedRuntimes(yieldCtx, workspaceID, dropped, "uncoordinated peer", nil)
+			yielded += len(d.yieldTrackedRuntimes(workspaceID))
 			return nil
 		})
-		yielded += len(dropped)
 	}
 	if yielded == 0 {
 		return
 	}
 	d.notifyRuntimeSetChanged()
-	d.logger.Warn("gave up owned runtimes to a daemon that cannot coordinate; standing by until it is gone or upgraded",
+	d.logger.Warn("gave up local runtime ownership to a daemon that cannot coordinate; "+
+		"the shared server runtimes stay online for that peer, which is still serving them",
 		"peers", decision.Peers, "runtimes", yielded)
+}
+
+// yieldTrackedRuntimes gives up this process's local serving authority for one
+// workspace: the runtime rows leave local tracking, and the logical ownership
+// claims are released so a coordinating peer can take them over. The server is
+// not told anything.
+//
+// The caller must hold the workspace's register lock (workspaceRegisterLock) —
+// the drop and the release are one ordered step against every registration and
+// profile-drift apply for that workspace.
+func (d *Daemon) yieldTrackedRuntimes(workspaceID string) []droppedRuntime {
+	dropped := d.dropTrackedRuntimeRows(workspaceID)
+	for _, rt := range dropped {
+		d.releaseRuntimeOwnership(rt.Target)
+	}
+	return dropped
 }
 
 // resumeAfterLegacyPeer clears the standby gate once no uncoordinated peer is

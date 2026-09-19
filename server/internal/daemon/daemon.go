@@ -627,6 +627,12 @@ type Daemon struct {
 	claimMu        sync.Mutex
 	pauseClaims    bool // when true, the batch poller skips claiming
 	claimsInFlight int  // pollers that have decided to claim but haven't yet handed the task off to handleTask
+	// claimsDrained is signalled when claimsInFlight reaches zero, so the
+	// legacy-peer standby transition can wait for the claims that already
+	// entered to finish their ClaimTask -> dispatch step instead of polling.
+	// Created by LoadConfig and, for struct-literal Daemons, by the drain helper
+	// under claimMu.
+	claimsDrained *sync.Cond
 
 	activeEnvRootsMu   sync.Mutex
 	activeEnvRootsCond *sync.Cond      // signalled when an in-flight env-root GC mutation finishes
@@ -772,6 +778,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	}
 	d.activeEnvRootsCond = sync.NewCond(&d.activeEnvRootsMu)
 	d.activeStoresCond = sync.NewCond(&d.activeStoresMu)
+	d.claimsDrained = sync.NewCond(&d.claimMu)
 	// Seed the copy-on-write availability set from the startup probe. Callers
 	// must go through d.agents() from here on; cfg.Agents is the initial value
 	// only and does not track later refreshes.
@@ -1470,9 +1477,13 @@ func (d *Daemon) removeStaleRuntime(runtimeID string) (string, bool) {
 }
 
 // dropTrackedRuntimeRows stops tracking every runtime row of one workspace and
-// returns them paired with their ownership targets, so the caller can take them
-// offline and then release the claims. The workspace itself stays tracked; use
-// forgetWorkspace to stop tracking it as well.
+// returns them paired with their ownership targets. The workspace itself stays
+// tracked; use forgetWorkspace to stop tracking it as well.
+//
+// What happens to a returned row belongs to the caller: every removal path
+// deregisters it and then releases the target (deregisterDroppedRuntimes), except
+// the legacy-peer handoff, which releases the target and leaves the shared server
+// row online for the peer that is still serving it (yieldTrackedRuntimes).
 //
 // The target has to be captured here, under the same lock that removes the row:
 // after this call there is no runtime metadata left to derive it from, and
@@ -5516,6 +5527,55 @@ func (d *Daemon) exitClaim() {
 	d.claimMu.Lock()
 	defer d.claimMu.Unlock()
 	d.claimsInFlight--
+	// Wake the legacy-peer standby transition, which may be waiting for this
+	// transition to finish. Nil for a daemon that never drained a claim.
+	if d.claimsInFlight == 0 && d.claimsDrained != nil {
+		d.claimsDrained.Broadcast()
+	}
+}
+
+// enterLegacyPeerStandby closes the claim gate and waits for the claims that
+// already passed it to finish their ClaimTask -> dispatch transition. It reports
+// whether that drain completed; false means ctx ended first, and the gate stays
+// closed either way, which is the safe direction.
+//
+// The transition boundary this defines is: no new claim may START once standby
+// is entered, and a claim that entered before is allowed to finish. Existing
+// agent tasks are deliberately NOT waited for — they are supposed to keep
+// running — so this never looks at activeTasks.
+//
+// The wait is woken by exitClaim's broadcast rather than by polling. A condvar
+// cannot observe a context by itself, so one watcher goroutine wakes it when ctx
+// ends; it exits with the call, and the claim transition it waits for is a
+// single ClaimTask round trip.
+func (d *Daemon) enterLegacyPeerStandby(ctx context.Context) bool {
+	d.claimMu.Lock()
+	defer d.claimMu.Unlock()
+	// Close the gate first: everything that already entered is counted by
+	// claimsInFlight, and nothing new can enter from here on.
+	d.legacyPeerStandby.Store(true)
+	if d.claimsInFlight == 0 {
+		return ctx.Err() == nil
+	}
+	if d.claimsDrained == nil {
+		d.claimsDrained = sync.NewCond(&d.claimMu)
+	}
+	cond := d.claimsDrained
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-ctx.Done():
+			d.claimMu.Lock()
+			cond.Broadcast()
+			d.claimMu.Unlock()
+		case <-stopped:
+		}
+	}()
+	for d.claimsInFlight > 0 && ctx.Err() == nil {
+		cond.Wait()
+	}
+	return ctx.Err() == nil
 }
 
 // trySetClaimBarrier atomically pauses new ClaimTask calls if the daemon is

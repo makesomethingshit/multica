@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
@@ -63,6 +65,20 @@ func containsString(got []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// waitUntil polls condition until it holds or the deadline passes. It is used
+// only to observe a flag the goroutine under test sets before it blocks, never
+// to sample state that is still moving.
+func waitUntil(deadline time.Duration, condition func() bool) bool {
+	expires := time.Now().Add(deadline)
+	for time.Now().Before(expires) {
+		if condition() {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return condition()
 }
 
 func countString(got []string, want string) int {
@@ -545,20 +561,27 @@ func TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes(t *testing.T) {
 		t.Fatalf("sync with a late legacy peer: %v", err)
 	}
 
+	if !d.legacyPeerStandby.Load() {
+		t.Error("legacy standby was not entered")
+	}
 	if d.ownsTarget(codexTarget) {
 		t.Error("this process kept the runtime claim while an uncoordinated peer serves the machine")
 	}
 	if got := d.allRuntimeIDs(); len(got) != 0 {
 		t.Errorf("still tracking runtimes %v after yielding to the peer", got)
 	}
-	if !containsString(fx.deregisteredIDs(), runtimeID) {
-		t.Errorf("deregistered %v, want the yielded runtime %s", fx.deregisteredIDs(), runtimeID)
-	}
-	if fx.runtimeOnline(runtimeID) {
-		t.Error("the runtime was left online for a peer that cannot coordinate with this process")
-	}
 	if d.tryEnterClaim() {
 		t.Error("a new task could still be claimed while both processes are known live")
+	}
+	// The shared server row is NOT taken offline: both processes use the
+	// machine-scoped daemon identity, so that row is the one the legacy peer is
+	// still serving. Deregistering here would reproduce the sibling-shutdown
+	// failure (#8280) through the mixed-version path.
+	if got := fx.deregisteredIDs(); len(got) != 0 {
+		t.Errorf("the legacy-peer yield deregistered %v; the peer is still serving that shared row", got)
+	}
+	if !fx.runtimeOnline(runtimeID) {
+		t.Error("the shared runtime was taken offline during the handoff")
 	}
 
 	// The peer is upgraded or stopped: the next tick resumes and this process
@@ -576,8 +599,254 @@ func TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes(t *testing.T) {
 	if got := d.allRuntimeIDs(); len(got) != 1 {
 		t.Fatalf("tracked runtimes after resuming = %v, want the runtime back", got)
 	}
+	// No fake offline -> online transition in between: the row never left the
+	// online state the legacy peer kept it in.
 	if !fx.runtimeOnline(d.allRuntimeIDs()[0]) {
-		t.Error("the recovered runtime was not brought back online")
+		t.Error("the shared runtime is not online after ownership was retaken")
+	}
+	if !d.tryEnterClaim() {
+		t.Error("claiming was not resumed after the peer went away")
+	}
+}
+
+// TestRuntimeCoordination_YieldIsSerializedAgainstRegistration is item 6: the
+// local drop has to happen inside the workspace's registration lock, or a
+// register response that is already in flight publishes the runtime back into
+// the set the yield just emptied - leaving standby set, the runtime tracked
+// again, and its heartbeat and claim running.
+//
+// The register gate holds the response of a reconcile register while the yield
+// runs. With the drop inside the lock, the response lands first and the yield
+// removes the row afterwards; with the drop before the lock, the response
+// republishes the row and it is tracked again at the end.
+func TestRuntimeCoordination_YieldIsSerializedAgainstRegistration(t *testing.T) {
+	isolatedProfileHome(t)
+	fx := newBatchFixture(t)
+	fx.enableStableRuntimeIDs()
+	lockDir := scopeLockDirForTest(t, "yield-vs-register")
+	fx.shareRuntimeOwnership(lockDir)
+	d := fx.daemon
+	d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
+	d.cfg.ServerBaseURL = fx.server.URL
+	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
+
+	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
+	t.Cleanup(func() {
+		peerProbeFunc = originalProbe
+		peerHealthPortOwnedFunc = originalPort
+	})
+
+	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	codexTarget := runtimeOwnerTarget("ws-1", "codex", "")
+	runtimeID := fx.runtimeIDFor("ws-1", "codex")
+	if runtimeID == "" || !d.ownsTarget(codexTarget) {
+		t.Fatal("precondition: the runtime was not taken and registered")
+	}
+
+	// Hold one register for ws-1 in flight while the legacy peer appears.
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	fx.setRegisterGate(func(workspaceID string) {
+		if workspaceID != "ws-1" {
+			return
+		}
+		once.Do(func() { close(arrived) })
+		<-release
+	})
+
+	registering := make(chan struct{})
+	go func() {
+		defer close(registering)
+		if err := d.reregisterWorkspaceAfterRuntimeGone(context.Background(), "ws-1"); err != nil {
+			t.Errorf("registration in flight: %v", err)
+		}
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the register request never reached the server")
+	}
+
+	withStagedPeerConfig(t, "legacy-host", fx.server.URL)
+	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
+		return peerCoordinationStatus{Alive: true}
+	}
+	peerHealthPortOwnedFunc = func(int) bool { return true }
+
+	yielding := make(chan struct{})
+	go func() {
+		defer close(yielding)
+		if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
+			t.Errorf("sync with a live legacy peer: %v", err)
+		}
+	}()
+
+	// Wait for the yield to have closed the claim gate. From here the register
+	// response is still held, so a drop that is not serialized by the register
+	// lock would already be visible as an empty local runtime set.
+	if !waitUntil(5*time.Second, func() bool { return d.legacyPeerStandby.Load() }) {
+		t.Fatal("legacy standby was never entered")
+	}
+	if got := d.allRuntimeIDs(); len(got) == 0 {
+		t.Error("the yield dropped local tracking while a register response was still in flight")
+	}
+
+	close(release)
+	<-registering
+	select {
+	case <-yielding:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the yield never completed")
+	}
+
+	// The register response must not have republished the runtime after the
+	// yield finished.
+	if got := d.allRuntimeIDs(); len(got) != 0 {
+		t.Errorf("a runtime is tracked again after the yield: %v", got)
+	}
+	if d.ownsTarget(codexTarget) {
+		t.Error("this process still owns the runtime's logical target after the yield")
+	}
+	if !d.legacyPeerStandby.Load() {
+		t.Error("legacy standby was cleared")
+	}
+	if got := fx.deregisteredIDs(); len(got) != 0 {
+		t.Errorf("the yield deregistered %v", got)
+	}
+	if !fx.runtimeOnline(runtimeID) {
+		t.Error("the shared runtime was taken offline during the handoff")
+	}
+}
+
+// TestRuntimeCoordination_YieldWaitsForClaimsInFlight is item 7: a claim that
+// entered before the standby barrier is allowed to finish its
+// ClaimTask -> dispatch step, and only then is ownership dropped. The claim
+// accounting (claimMu / claimsInFlight / tryEnterClaim / exitClaim) is the
+// transition boundary the daemon already tracks.
+func TestRuntimeCoordination_YieldWaitsForClaimsInFlight(t *testing.T) {
+	isolatedProfileHome(t)
+	fx := newBatchFixture(t)
+	fx.enableStableRuntimeIDs()
+	lockDir := scopeLockDirForTest(t, "yield-vs-claim")
+	fx.shareRuntimeOwnership(lockDir)
+	d := fx.daemon
+	d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
+	d.cfg.ServerBaseURL = fx.server.URL
+	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
+
+	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	codexTarget := runtimeOwnerTarget("ws-1", "codex", "")
+	runtimeID := fx.runtimeIDFor("ws-1", "codex")
+	if runtimeID == "" || !d.ownsTarget(codexTarget) {
+		t.Fatal("precondition: the runtime was not taken and registered")
+	}
+
+	// A claim enters the transition and its response is still in flight.
+	if !d.tryEnterClaim() {
+		t.Fatal("precondition: the claim must enter")
+	}
+
+	yielded := make(chan struct{})
+	go func() {
+		defer close(yielded)
+		d.yieldRuntimesToLegacyPeer(context.Background(), legacyPeerDecision{
+			Blocked: true,
+			Peers:   []string{"legacy-host (http://127.0.0.1:19514/health) is alive"},
+		})
+	}()
+
+	if !waitUntil(5*time.Second, func() bool { return d.legacyPeerStandby.Load() }) {
+		t.Fatal("legacy standby was never entered")
+	}
+	// No new claim may start once the barrier is up.
+	if d.tryEnterClaim() {
+		t.Error("a new claim entered after the standby barrier")
+	}
+	// ...and the ownership of the claimed runtime is still intact underneath the
+	// in-flight claim.
+	select {
+	case <-yielded:
+		t.Fatal("runtime ownership was yielded while a claim was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := d.allRuntimeIDs(); len(got) != 1 || got[0] != runtimeID {
+		t.Errorf("runtime tracking was dropped under an in-flight claim: %v", got)
+	}
+	if !d.ownsTarget(codexTarget) {
+		t.Error("the ownership claim was released under an in-flight claim")
+	}
+
+	// The response arrives and its dispatch transition completes.
+	d.exitClaim()
+	select {
+	case <-yielded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the yield did not complete after the claim drained")
+	}
+
+	if got := d.allRuntimeIDs(); len(got) != 0 {
+		t.Errorf("runtime tracking after the yield = %v, want none", got)
+	}
+	if d.ownsTarget(codexTarget) {
+		t.Error("the ownership claim survived the yield")
+	}
+	if d.tryEnterClaim() {
+		t.Error("a new claim entered while legacy standby is set")
+	}
+	if got := fx.deregisteredIDs(); len(got) != 0 {
+		t.Errorf("the yield deregistered %v", got)
+	}
+	if !fx.runtimeOnline(runtimeID) {
+		t.Error("the shared runtime was taken offline during the handoff")
+	}
+}
+
+// TestRuntimeCoordination_YieldDoesNotWaitForRunningTasks is item 4: the
+// transition drains the claim step only. A task that is already executing keeps
+// running and is not waited for - the acceptance requirement is "no new work
+// starts", not "drain in flight".
+func TestRuntimeCoordination_YieldDoesNotWaitForRunningTasks(t *testing.T) {
+	isolatedProfileHome(t)
+	fx := newBatchFixture(t)
+	fx.enableStableRuntimeIDs()
+	lockDir := scopeLockDirForTest(t, "yield-vs-running-task")
+	fx.shareRuntimeOwnership(lockDir)
+	d := fx.daemon
+	d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
+	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
+	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	runtimeID := fx.runtimeIDFor("ws-1", "codex")
+
+	// A task is executing locally while the peer conflict appears.
+	d.activeTasks.Add(1)
+	defer d.activeTasks.Add(-1)
+
+	yielded := make(chan struct{})
+	go func() {
+		defer close(yielded)
+		d.yieldRuntimesToLegacyPeer(context.Background(), legacyPeerDecision{Blocked: true, Peers: []string{"legacy-host"}})
+	}()
+	select {
+	case <-yielded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the yield waited for the running task instead of the claim transition")
+	}
+
+	if got := d.activeTasks.Load(); got != 1 {
+		t.Errorf("active tasks = %d after the yield, want the running task untouched", got)
+	}
+	if got := d.allRuntimeIDs(); len(got) != 0 {
+		t.Errorf("runtime tracking after the yield = %v, want none", got)
+	}
+	if !fx.runtimeOnline(runtimeID) {
+		t.Error("the shared runtime was taken offline during the handoff")
 	}
 }
 
