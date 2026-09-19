@@ -1375,7 +1375,7 @@ func (h *Handler) processHeartbeat(ctx context.Context, runtimeID string, suppor
 	ack := &protocol.DaemonHeartbeatAckPayload{
 		RuntimeID:          runtimeID,
 		Status:             "ok",
-		ServerCapabilities: []string{protocol.DaemonCapabilityRPCV1},
+		ServerCapabilities: []string{protocol.DaemonCapabilityRPCV1, protocol.TerminalReportGenerationFenceV1},
 	}
 
 	probeUpdateCtx, cancelProbeUpdate := context.WithTimeout(ctx, heartbeatHasPendingTimeout)
@@ -2364,6 +2364,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	// fenced callback miss its own claim whenever the reclaim happened inside
 	// the same second.
 	resp.DispatchedAt = timestampToNanoPtr(task.DispatchedAt)
+	// Claim-only capability, set here so it is present on EVERY claim path (the
+	// batch claim and the per-runtime claim both build through this function).
+	// The pair is the contract: the flag says this server enforces the fence, and
+	// the nano dispatched_at above is what the daemon must echo back exactly.
+	resp.TerminalReportGenerationFenceV1 = true
 	var issueNumber int32
 	// Claim-only capability: this server resolves the squad-leader role on the
 	// wire (is_leader_task / squad_id), so the daemon must not re-derive it

@@ -32,6 +32,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
 	"github.com/multica-ai/multica/server/internal/selfexec"
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 	"github.com/multica-ai/multica/server/pkg/redact"
 	"github.com/multica-ai/multica/server/pkg/skillbundle"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
@@ -281,17 +282,23 @@ func (g claimGeneration) String() string {
 	}
 }
 
-// claimGenerationForTask reads this claim's fencing value. A claim payload that
-// ships the field but not in a form we can parse yields an unreadable
-// generation, which refuses terminal reporting entirely rather than degrading
-// into an unfenced callback.
+// claimGenerationForTask reads this claim's fencing value. The claim-only
+// capability decides first: without it the server never promised to compare the
+// generation, so the claim is legacy no matter what its dispatched_at says —
+// older servers send that timestamp and still ignore expected_dispatched_at.
+// A claim that DOES advertise the capability must carry a readable generation;
+// anything else is a protocol violation that refuses terminal reporting
+// entirely rather than degrading into an unfenced callback.
 func claimGenerationForTask(task Task) claimGeneration {
-	if task.DispatchedAt == nil {
+	if !task.TerminalReportGenerationFenceV1 {
 		return claimGeneration{}
+	}
+	if task.DispatchedAt == nil {
+		return claimGeneration{unreadable: true}
 	}
 	raw := strings.TrimSpace(*task.DispatchedAt)
 	if raw == "" {
-		return claimGeneration{}
+		return claimGeneration{unreadable: true}
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, raw)
 	if err != nil || parsed.IsZero() {
@@ -453,6 +460,13 @@ type Daemon struct {
 	// (task id + claim generation), so two claim generations of one task never
 	// block each other while a duplicate of the same one still does.
 	terminalReportFlight map[string]struct{}
+	// serverFenceObserved/Supported record the terminal-report generation fence
+	// capability the connected server last advertised on a heartbeat ack. A
+	// persisted report is only replayed once the connected server has PROVEN the
+	// capability: after a restart, or after a server rollback, an unproven server
+	// could ignore expected_dispatched_at and apply the report unfenced.
+	serverFenceObserved  atomic.Bool
+	serverFenceSupported atomic.Bool
 
 	mu           sync.Mutex
 	workspaces   map[string]*workspaceState
@@ -4613,6 +4627,9 @@ func (d *Daemon) handleHeartbeatActions(ctx context.Context, runtimeID string, r
 	if resp == nil {
 		return
 	}
+	// Both transports converge here, so this is the one place the daemon records
+	// what the connected server says it supports.
+	d.observeServerCapabilities(resp.ServerCapabilities)
 	if resp.PendingUpdate != nil || resp.PendingModelList != nil || resp.PendingLocalSkills != nil || resp.PendingLocalSkillImport != nil {
 		d.logger.Debug("heartbeat: pending actions",
 			"runtime_id", runtimeID,
@@ -6396,10 +6413,11 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	if d.terminalReports != nil {
 		if err := d.terminalReports.enqueue(report); err != nil {
 			if errors.Is(err, errTerminalReportNotPersistable) {
-				// An older server gave this claim no generation. There is nothing
-				// that could be replayed safely later, so the report is delivered
-				// now and deliberately not stored.
-				d.logger.Info("terminal report has no claim generation; delivered without a durable copy",
+				// The claim did not advertise the generation fence — an older
+				// server, so its dispatched_at carries no fence semantics. There is
+				// nothing that could be replayed safely later, so the report is
+				// delivered now and deliberately not stored.
+				d.logger.Info("claim did not advertise the terminal-report generation fence; delivering without a durable copy",
 					"task", report.taskID,
 					"kind", report.kind,
 				)
@@ -6473,6 +6491,32 @@ func (d *Daemon) terminalReportClock() time.Time {
 		return d.terminalReportNow()
 	}
 	return time.Now()
+}
+
+// observeServerCapabilities records the capability set the connected server
+// advertised on its most recent heartbeat ack. It is the authoritative answer to
+// "may this daemon use generation-aware terminal reporting right now": a server
+// that does not list the fence capability — an older deployment, or a rollback —
+// leaves the daemon unable to prove the fence is enforced, so a stored report is
+// retained rather than replayed unfenced.
+func (d *Daemon) observeServerCapabilities(capabilities []string) {
+	supported := false
+	for _, capability := range capabilities {
+		if capability == protocol.TerminalReportGenerationFenceV1 {
+			supported = true
+			break
+		}
+	}
+	d.serverFenceSupported.Store(supported)
+	d.serverFenceObserved.Store(true)
+}
+
+// serverSupportsTerminalReportFence reports whether the connected server has
+// proven the generation fence contract. Unobserved is treated as unsupported:
+// silence is not evidence, and the cost of guessing wrong is an unfenced
+// terminal mutation.
+func (d *Daemon) serverSupportsTerminalReportFence() bool {
+	return d.serverFenceObserved.Load() && d.serverFenceSupported.Load()
 }
 
 func (d *Daemon) sendTerminalTaskReport(ctx context.Context, report terminalTaskReport, schedule []time.Duration) error {

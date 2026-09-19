@@ -80,6 +80,18 @@ const (
 // is the contract; the human sentence next to it may change freely.
 const DaemonTaskClaimGenerationMismatchCode = "task_claim_generation_mismatch"
 
+// TerminalReportGenerationFenceV1 names the complete terminal-report generation
+// fence contract: a claim that advertises it round-trips dispatched_at exactly,
+// and /complete and /fail compare that generation inside the terminal UPDATE.
+//
+// The name travels two ways on purpose. The claim payload carries it as
+// terminal_report_generation_fence_v1, which is what makes a claim
+// generation-aware, and the heartbeat ack lists it in ServerCapabilities, which
+// is what lets a daemon holding a persisted report — after a restart, or after
+// the server was rolled back — prove the CONNECTED server enforces the fence
+// before it sends that report.
+const TerminalReportGenerationFenceV1 = "terminal_report_generation_fence_v1"
+
 // ChatQuickAction is a server-validated follow-up attached to one assistant
 // reply. Label is the concise chip text; Prompt is the full next user turn.
 type ChatQuickAction struct {

@@ -186,6 +186,7 @@ func TestTerminalReportReplaysAfterClientRetryWindow(t *testing.T) {
 	}
 
 	online.Store(true)
+	serverAdvertisesFence(d)
 	pending, delivered := d.replayPendingTerminalReports(context.Background())
 	if pending != 0 || delivered != 1 {
 		t.Fatalf("replay result pending=%d delivered=%d, want 0/1", pending, delivered)
@@ -230,6 +231,7 @@ func TestTerminalReportReplaysAfterDaemonRestart(t *testing.T) {
 	}
 
 	afterRestart := New(cfg, logger)
+	serverAdvertisesFence(afterRestart)
 	var replayed terminalTaskReport
 	afterRestart.terminalReportSend = func(_ context.Context, got terminalTaskReport, schedule []time.Duration) error {
 		if schedule != nil {
@@ -292,6 +294,7 @@ func TestTerminalReportPermanentRejectionQuarantinesOriginalAndStopsReplay(t *te
 	base := time.Date(2026, time.September, 18, 0, 0, 0, 0, time.UTC)
 	now := base
 	d.terminalReportNow = func() time.Time { return now }
+	serverAdvertisesFence(d)
 	report := terminalTaskReport{
 		kind: terminalTaskReportComplete, taskID: "task-rejected", output: "original successful answer",
 		branchName: "agent/original", sessionID: "session-original",
@@ -402,6 +405,7 @@ func TestTerminalReportForegroundAndReplayDoNotSendConcurrently(t *testing.T) {
 	if err := d.terminalReports.enqueue(report); err != nil {
 		t.Fatalf("seed pending report: %v", err)
 	}
+	serverAdvertisesFence(d)
 
 	started := make(chan struct{})
 	releaseSend := make(chan struct{})
@@ -545,12 +549,13 @@ func TestRunBatchPollerReleasesSlotAfterTerminalRetryExhaustion(t *testing.T) {
 		case strings.HasSuffix(req.URL.Path, "/api/daemon/tasks/claim"):
 			switch {
 			case completeAttempts.Load() == 0:
-				// Claims carry the generation the server issued; without it a report
-				// is delivered but deliberately not stored, and this test is about
-				// the durable copy surviving an exhausted retry window.
-				_, _ = w.Write([]byte(`{"tasks":[{"id":"t1","runtime_id":"rt-1","issue_id":"i1","dispatched_at":"2026-09-19T04:43:58.123456Z"}]}`))
+				// A fence-capable claim carries the capability and the generation the
+				// server issued. Without both, the report is delivered but
+				// deliberately not stored, and this test is about the durable copy
+				// surviving an exhausted retry window.
+				_, _ = w.Write([]byte(`{"tasks":[{"id":"t1","runtime_id":"rt-1","issue_id":"i1","terminal_report_generation_fence_v1":true,"dispatched_at":"2026-09-19T04:43:58.123456Z"}]}`))
 			case secondServed.CompareAndSwap(false, true):
-				_, _ = w.Write([]byte(`{"tasks":[{"id":"t2","runtime_id":"rt-1","issue_id":"i2","dispatched_at":"2026-09-19T04:44:58.654321Z"}]}`))
+				_, _ = w.Write([]byte(`{"tasks":[{"id":"t2","runtime_id":"rt-1","issue_id":"i2","terminal_report_generation_fence_v1":true,"dispatched_at":"2026-09-19T04:44:58.654321Z"}]}`))
 			default:
 				_, _ = w.Write([]byte(`{"tasks":[]}`))
 			}

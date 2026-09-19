@@ -124,6 +124,7 @@ func TestTerminalReportGenerationsSurviveRestartTogether(t *testing.T) {
 	}
 
 	afterRestart := New(cfg, logger)
+	serverAdvertisesFence(afterRestart)
 	var replayed []terminalTaskReport
 	var mu sync.Mutex
 	afterRestart.terminalReportSend = func(_ context.Context, report terminalTaskReport, schedule []time.Duration) error {
@@ -297,6 +298,7 @@ func TestTerminalReportSupersedeIsPerClaimGeneration(t *testing.T) {
 
 	// Generation B is the current claim, so it settles the row; generation A is
 	// refused as stale and retired instead of being counted as delivered.
+	serverAdvertisesFence(d)
 	if pending, delivered := d.replayPendingTerminalReports(context.Background()); pending != 0 || delivered != 1 {
 		t.Fatalf("replay pending=%d delivered=%d, want 0/1", pending, delivered)
 	}

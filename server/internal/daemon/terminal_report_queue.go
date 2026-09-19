@@ -51,10 +51,11 @@ const (
 // ACL boundary, so protection comes from the current user's profile/workspace
 // ACL; the queue never carries an auth token on either platform.
 //
-// Version stays at 1 because the rejection fields are additive and older
-// daemons ignore unknown JSON fields. A future incompatible version is left
-// untouched and reported on every replay pass; downgrading must never delete a
-// payload merely because the older binary cannot decode it.
+// Generation-aware records are version 2 and always carry claim_dispatched_at;
+// version 1 is the pre-fence layout, keyed by task id alone, whose ownership is
+// unknowable and which is therefore never replayed. A record of any other
+// version is left untouched and reported on every replay pass: downgrading must
+// never delete a payload merely because the older binary cannot decode it.
 type persistedTerminalTaskReport struct {
 	Version               int       `json:"version"`
 	CreatedAt             time.Time `json:"created_at"`
@@ -106,9 +107,11 @@ type terminalReportNamespaceStats struct {
 	stats terminalReportStoreStats
 }
 
-// terminalReportStore is a file-backed outbox. One file per task keeps each
-// acknowledgement independent, and hashing task IDs prevents a malformed or
-// tampered task ID from becoming a path traversal primitive.
+// terminalReportStore is a file-backed outbox. One file per terminal-report
+// identity — one task id plus one claim generation — keeps each
+// acknowledgement, rejection and supersede independent of every other
+// generation of the same task, and hashing that identity prevents a malformed
+// or tampered task id from becoming a path traversal primitive.
 type terminalReportStore struct {
 	root      string
 	namespace string
@@ -987,6 +990,20 @@ func (d *Daemon) replayPendingTerminalReports(ctx context.Context) (pending, del
 				"task", item.report.taskID,
 				"kind", item.report.kind,
 				"file", item.fileName,
+			)
+			continue
+		}
+		if !d.serverSupportsTerminalReportFence() {
+			// The generation-aware record was produced under a server contract
+			// that promised the fence, and it keeps that generation. But the
+			// server actually connected to has not proven it enforces the fence —
+			// a restart before the first heartbeat, or a rollback to a build that
+			// ignores expected_dispatched_at — so sending it could settle a task
+			// unfenced. Retain the record and say so, on every pass, instead.
+			d.logger.Warn("terminal report held: connected server has not advertised the generation fence capability",
+				"task", item.report.taskID,
+				"kind", item.report.kind,
+				"claim_dispatched_at", item.report.claimGeneration,
 			)
 			continue
 		}

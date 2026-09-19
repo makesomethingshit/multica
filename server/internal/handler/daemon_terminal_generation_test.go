@@ -388,43 +388,82 @@ func TestClaimPayloadRoundTripsClaimGeneration(t *testing.T) {
 
 	runtimeID := dbfx.Runtime(t, "claim generation runtime", nil)
 	agentID := dbfx.Agent(t, "claim generation agent", runtimeID)
-	issueID := dbfx.Issue(t, "claim generation issue")
-	taskID := dbfx.Task(t, agentID, testutil.Cols{
-		"runtime_id": runtimeID,
-		"issue_id":   issueID,
-		"status":     "queued",
+
+	seedQueuedTask := func(t *testing.T, label string) string {
+		t.Helper()
+		return dbfx.Task(t, agentID, testutil.Cols{
+			"runtime_id": runtimeID,
+			"issue_id":   dbfx.Issue(t, "claim generation "+label),
+			"status":     "queued",
+		})
+	}
+	// Both claim paths must advertise the fence capability AND round-trip the
+	// generation exactly: the daemon can only echo what it actually received, and
+	// a claim that advertises fencing without a usable timestamp would be a
+	// contract violation.
+	assertClaim := func(t *testing.T, taskID, dispatchedAt string, fence bool) {
+		t.Helper()
+		if !fence {
+			t.Fatal("claim did not advertise terminal_report_generation_fence_v1")
+		}
+		var stored time.Time
+		if err := testPool.QueryRow(ctx, `SELECT dispatched_at FROM agent_task_queue WHERE id = $1`, taskID).Scan(&stored); err != nil {
+			t.Fatalf("read claimed generation: %v", err)
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, dispatchedAt)
+		if err != nil {
+			t.Fatalf("claim dispatched_at %q is not RFC3339Nano: %v", dispatchedAt, err)
+		}
+		if !parsed.Equal(stored) {
+			t.Fatalf("claim dispatched_at = %s, stored = %s: the daemon cannot echo what it never received",
+				parsed.UTC(), stored.UTC())
+		}
+		if truncated := stored.Truncate(time.Second); !truncated.Equal(stored) && parsed.Equal(truncated) {
+			t.Fatalf("claim dispatched_at = %s lost the sub-second precision of %s", parsed.UTC(), stored.UTC())
+		}
+	}
+
+	t.Run("batch claim", func(t *testing.T) {
+		taskID := seedQueuedTask(t, "batch")
+		w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 1)
+		if w.Code != http.StatusOK {
+			t.Fatalf("batch claim: got %d: %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Tasks []struct {
+				ID              string `json:"id"`
+				DispatchedAt    string `json:"dispatched_at"`
+				GenerationFence bool   `json:"terminal_report_generation_fence_v1"`
+			} `json:"tasks"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode claim response: %v", err)
+		}
+		if len(resp.Tasks) != 1 || resp.Tasks[0].ID != taskID {
+			t.Fatalf("claim returned %+v, want task %s", resp.Tasks, taskID)
+		}
+		assertClaim(t, taskID, resp.Tasks[0].DispatchedAt, resp.Tasks[0].GenerationFence)
 	})
 
-	w := postBatchClaim(t, testWorkspaceID, []string{runtimeID}, 1)
-	if w.Code != http.StatusOK {
-		t.Fatalf("batch claim: got %d: %s", w.Code, w.Body.String())
-	}
-	var resp struct {
-		Tasks []struct {
-			ID           string `json:"id"`
-			DispatchedAt string `json:"dispatched_at"`
-		} `json:"tasks"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode claim response: %v", err)
-	}
-	if len(resp.Tasks) != 1 || resp.Tasks[0].ID != taskID {
-		t.Fatalf("claim returned %+v, want task %s", resp.Tasks, taskID)
-	}
-
-	var stored time.Time
-	if err := testPool.QueryRow(ctx, `SELECT dispatched_at FROM agent_task_queue WHERE id = $1`, taskID).Scan(&stored); err != nil {
-		t.Fatalf("read claimed generation: %v", err)
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, resp.Tasks[0].DispatchedAt)
-	if err != nil {
-		t.Fatalf("claim dispatched_at %q is not RFC3339Nano: %v", resp.Tasks[0].DispatchedAt, err)
-	}
-	if !parsed.Equal(stored) {
-		t.Fatalf("claim dispatched_at = %s, stored = %s: the daemon cannot echo what it never received",
-			parsed.UTC(), stored.UTC())
-	}
-	if truncated := stored.Truncate(time.Second); !truncated.Equal(stored) && parsed.Equal(truncated) {
-		t.Fatalf("claim dispatched_at = %s lost the sub-second precision of %s", parsed.UTC(), stored.UTC())
-	}
+	t.Run("single runtime claim", func(t *testing.T) {
+		taskID := seedQueuedTask(t, "single")
+		req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
+			testWorkspaceID, terminalFenceDaemonID)
+		req = withURLParam(req, "runtimeId", runtimeID)
+		w := testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK)
+		var resp struct {
+			Task *struct {
+				ID              string `json:"id"`
+				DispatchedAt    string `json:"dispatched_at"`
+				GenerationFence bool   `json:"terminal_report_generation_fence_v1"`
+			} `json:"task"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode claim response: %v", err)
+		}
+		if resp.Task == nil || resp.Task.ID != taskID {
+			t.Fatalf("claim returned %+v, want task %s", resp.Task, taskID)
+		}
+		assertClaim(t, taskID, resp.Task.DispatchedAt, resp.Task.GenerationFence)
+	})
 }

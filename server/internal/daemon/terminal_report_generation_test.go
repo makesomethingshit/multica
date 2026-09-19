@@ -243,6 +243,7 @@ func TestTerminalReportOrdinaryConflictStaysPending(t *testing.T) {
 	if err := d.terminalReports.enqueue(claimGenerationReport("task-ordinary-conflict")); err != nil {
 		t.Fatalf("enqueue report: %v", err)
 	}
+	serverAdvertisesFence(d)
 	pending, delivered := d.replayPendingTerminalReports(context.Background())
 	if pending != 1 || delivered != 0 {
 		t.Fatalf("ordinary conflict pending=%d delivered=%d, want 1/0", pending, delivered)
@@ -286,6 +287,7 @@ func TestTerminalReportReplayUsesThePersistedClaimGeneration(t *testing.T) {
 	}
 
 	afterRestart := New(cfg, logger)
+	serverAdvertisesFence(afterRestart)
 	pending, delivered := afterRestart.replayPendingTerminalReports(context.Background())
 	if pending != 0 || delivered != 1 {
 		t.Fatalf("restart replay pending=%d delivered=%d, want 0/1", pending, delivered)
@@ -309,24 +311,29 @@ func TestClaimGenerationComesOnlyFromTheClaimPayload(t *testing.T) {
 
 	tests := []struct {
 		name           string
+		fenced         bool
 		raw            *string
 		want           time.Time
 		wantUnreadable bool
 	}{
-		{name: "nano precision", raw: &formatted, want: generation},
-		{name: "second precision", raw: &secondPrecision, want: generation.Truncate(time.Second)},
-		// Absence is a property of the SERVER (it never fenced its claims) and
-		// keeps the legacy unfenced callback working.
-		{name: "absent", raw: nil},
-		{name: "empty", raw: new(string)},
-		// A field that is present but unreadable is a protocol error, not an old
-		// server: it must never be reported as an absent generation.
-		{name: "unparseable", raw: ptrTo("not a timestamp"), wantUnreadable: true},
-		{name: "zero instant", raw: ptrTo("0001-01-01T00:00:00Z"), wantUnreadable: true},
+		{name: "advertised nano precision", fenced: true, raw: &formatted, want: generation},
+		{name: "advertised second precision", fenced: true, raw: &secondPrecision, want: generation.Truncate(time.Second)},
+		// No capability is a property of the SERVER (it never promised to compare
+		// the generation), and it keeps the legacy unfenced callback working —
+		// whatever the timestamp looks like.
+		{name: "not advertised, valid timestamp", raw: &formatted},
+		{name: "not advertised, absent", raw: nil},
+		{name: "not advertised, malformed", raw: ptrTo("not a timestamp")},
+		// An advertised contract with no readable generation is a protocol error,
+		// never an old server: it must not be reported as an absent generation.
+		{name: "advertised but missing", fenced: true, wantUnreadable: true},
+		{name: "advertised but empty", fenced: true, raw: new(string), wantUnreadable: true},
+		{name: "advertised but unparseable", fenced: true, raw: ptrTo("not a timestamp"), wantUnreadable: true},
+		{name: "advertised but zero instant", fenced: true, raw: ptrTo("0001-01-01T00:00:00Z"), wantUnreadable: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := claimGenerationForTask(Task{DispatchedAt: tt.raw})
+			got := claimGenerationForTask(Task{DispatchedAt: tt.raw, TerminalReportGenerationFenceV1: tt.fenced})
 			if got.unreadable != tt.wantUnreadable {
 				t.Fatalf("claimGenerationForTask() unreadable = %v, want %v", got.unreadable, tt.wantUnreadable)
 			}
@@ -360,7 +367,7 @@ func TestTerminalReportRefusesAnUnreadableClaimGeneration(t *testing.T) {
 		kind:            terminalTaskReportComplete,
 		taskID:          "task-unreadable",
 		output:          "must never be delivered unfenced",
-		claimGeneration: claimGenerationForTask(Task{DispatchedAt: ptrTo("yesterday")}),
+		claimGeneration: claimGenerationForTask(Task{DispatchedAt: ptrTo("yesterday"), TerminalReportGenerationFenceV1: true}),
 	}
 	if err := d.reportTerminalTask(context.Background(), report); err == nil {
 		t.Fatal("unreadable claim generation was reported as delivered")
@@ -410,10 +417,11 @@ func TestTerminalReportWithoutGenerationIsDeliveredButNotStored(t *testing.T) {
 
 func TestTaskDispatchedAtMirrorsTheClaimPayload(t *testing.T) {
 	// internal/daemon.Task is a hand-kept mirror of the server's claim response.
-	// A missing or renamed JSON tag here would silently drop the generation, and
-	// every callback of that claim would go back to the unfenced path.
+	// A missing or renamed JSON tag here would silently drop the capability or
+	// the generation, and every callback of that claim would go back to the
+	// unfenced path.
 	var task Task
-	if err := json.Unmarshal([]byte("{\"id\":\"task-1\",\"dispatched_at\":\"2026-09-19T04:43:58.123456Z\"}"), &task); err != nil {
+	if err := json.Unmarshal([]byte("{\"id\":\"task-1\",\"terminal_report_generation_fence_v1\":true,\"dispatched_at\":\"2026-09-19T04:43:58.123456Z\"}"), &task); err != nil {
 		t.Fatalf("decode claim payload: %v", err)
 	}
 	want := time.Date(2026, time.September, 19, 4, 43, 58, 123456000, time.UTC)
@@ -421,14 +429,17 @@ func TestTaskDispatchedAtMirrorsTheClaimPayload(t *testing.T) {
 		t.Fatalf("claim generation from the claim payload = %s (%v), want %s", got, got.unreadable, want)
 	}
 
-	// A server that predates the field must leave the generation unknown rather
-	// than inventing one locally.
+	// A server that predates the capability must leave the generation unknown
+	// rather than inferring one from the timestamp it happens to send.
 	var legacy Task
-	if err := json.Unmarshal([]byte("{\"id\":\"task-2\"}"), &legacy); err != nil {
+	if err := json.Unmarshal([]byte("{\"id\":\"task-2\",\"dispatched_at\":\"2026-09-19T04:43:58Z\"}"), &legacy); err != nil {
 		t.Fatalf("decode legacy claim payload: %v", err)
 	}
 	if got := claimGenerationForTask(legacy); !got.dispatchedAt.IsZero() || got.unreadable {
 		t.Fatalf("legacy claim payload produced a generation: %s", got)
+	}
+	if legacy.TerminalReportGenerationFenceV1 {
+		t.Fatal("capability decoded as true from a payload that never advertised it")
 	}
 }
 
