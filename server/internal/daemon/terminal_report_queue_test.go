@@ -28,6 +28,7 @@ func TestTerminalReportStoreRoundTripAndPermissions(t *testing.T) {
 	report := terminalTaskReport{
 		kind:                  terminalTaskReportComplete,
 		taskID:                "task-private",
+		claimGeneration:       claimGeneration{dispatchedAt: testClaimGeneration()},
 		output:                "private final answer",
 		branchName:            "agent/private",
 		sessionID:             "session-private",
@@ -84,7 +85,10 @@ func TestTerminalReportStoreRecoversFlushedTempFileAfterCrash(t *testing.T) {
 	if err := store.ensureDir(); err != nil {
 		t.Fatalf("prepare store: %v", err)
 	}
-	report := terminalTaskReport{kind: terminalTaskReportComplete, taskID: "task-crash", output: "durable answer"}
+	report := terminalTaskReport{
+		kind: terminalTaskReportComplete, taskID: "task-crash", output: "durable answer",
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
+	}
 	record, err := persistedTerminalReport(report, time.Now())
 	if err != nil {
 		t.Fatalf("build persisted report: %v", err)
@@ -93,7 +97,7 @@ func TestTerminalReportStoreRecoversFlushedTempFileAfterCrash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal report: %v", err)
 	}
-	targetName := terminalReportFileName(report.taskID)
+	targetName := reportFileName(report)
 	temp, err := os.CreateTemp(store.dir, "."+strings.TrimSuffix(targetName, ".json")+"-*.tmp")
 	if err != nil {
 		t.Fatalf("create interrupted temp: %v", err)
@@ -169,7 +173,7 @@ func TestTerminalReportReplaysAfterClientRetryWindow(t *testing.T) {
 		durableWorkDir: "/tmp/project",
 		// Replay needs the claim generation the result belongs to: a record
 		// without one is retained instead of delivered.
-		claimDispatchedAt: testClaimGeneration(),
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
 	}
 	if err := d.reportTerminalTask(context.Background(), report); err == nil {
 		t.Fatal("terminal report unexpectedly succeeded while server was offline")
@@ -214,7 +218,7 @@ func TestTerminalReportReplaysAfterDaemonRestart(t *testing.T) {
 		failureReason: "agent_error.process_failure",
 		// Only a generation lets the daemon prove, after a restart, which claim
 		// this report may still settle.
-		claimDispatchedAt: testClaimGeneration(),
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
 	}
 
 	beforeRestart := New(cfg, logger)
@@ -269,6 +273,7 @@ func TestTerminalReportEnqueueFailureStillAttemptsHTTP(t *testing.T) {
 	}
 	if err := d.reportTerminalTask(context.Background(), terminalTaskReport{
 		kind: terminalTaskReportComplete, taskID: "task-online", output: "deliver me",
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
 	}); err != nil {
 		t.Fatalf("online delivery failed because enqueue failed: %v", err)
 	}
@@ -290,7 +295,7 @@ func TestTerminalReportPermanentRejectionQuarantinesOriginalAndStopsReplay(t *te
 	report := terminalTaskReport{
 		kind: terminalTaskReportComplete, taskID: "task-rejected", output: "original successful answer",
 		branchName: "agent/original", sessionID: "session-original",
-		claimDispatchedAt: testClaimGeneration(),
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
 	}
 	var completeCalls, fallbackCalls atomic.Int32
 	d.terminalReportSend = func(_ context.Context, got terminalTaskReport, _ []time.Duration) error {
@@ -332,7 +337,7 @@ func TestTerminalReportPermanentRejectionQuarantinesOriginalAndStopsReplay(t *te
 	if stats.PendingCount != 0 || stats.FailedCount != 1 || stats.FailedBytes == 0 {
 		t.Fatalf("queue stats = %+v, want one non-empty failed record", stats)
 	}
-	body, err := os.ReadFile(filepath.Join(d.terminalReports.failedDir(), terminalReportFileName(report.taskID)))
+	body, err := os.ReadFile(filepath.Join(d.terminalReports.failedDir(), reportFileName(report)))
 	if err != nil {
 		t.Fatalf("read failed terminal report: %v", err)
 	}
@@ -392,7 +397,7 @@ func TestTerminalReportForegroundAndReplayDoNotSendConcurrently(t *testing.T) {
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	report := terminalTaskReport{
 		kind: terminalTaskReportComplete, taskID: "task-race", output: "once",
-		claimDispatchedAt: testClaimGeneration(),
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
 	}
 	if err := d.terminalReports.enqueue(report); err != nil {
 		t.Fatalf("seed pending report: %v", err)
@@ -464,7 +469,10 @@ func TestTerminalReportFutureVersionIsRetainedAcrossDowngrade(t *testing.T) {
 	if err := store.ensureDir(); err != nil {
 		t.Fatalf("prepare terminal report queue: %v", err)
 	}
-	report := terminalTaskReport{kind: terminalTaskReportComplete, taskID: "future-task", output: "future payload"}
+	report := terminalTaskReport{
+		kind: terminalTaskReportComplete, taskID: "future-task", output: "future payload",
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
+	}
 	record, err := persistedTerminalReport(report, time.Now())
 	if err != nil {
 		t.Fatalf("build terminal report: %v", err)
@@ -474,7 +482,7 @@ func TestTerminalReportFutureVersionIsRetainedAcrossDowngrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal future report: %v", err)
 	}
-	path := filepath.Join(store.dir, terminalReportFileName(report.taskID))
+	path := filepath.Join(store.dir, reportFileName(report))
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("write future report: %v", err)
 	}
@@ -537,9 +545,12 @@ func TestRunBatchPollerReleasesSlotAfterTerminalRetryExhaustion(t *testing.T) {
 		case strings.HasSuffix(req.URL.Path, "/api/daemon/tasks/claim"):
 			switch {
 			case completeAttempts.Load() == 0:
-				_, _ = w.Write([]byte(`{"tasks":[{"id":"t1","runtime_id":"rt-1","issue_id":"i1"}]}`))
+				// Claims carry the generation the server issued; without it a report
+				// is delivered but deliberately not stored, and this test is about
+				// the durable copy surviving an exhausted retry window.
+				_, _ = w.Write([]byte(`{"tasks":[{"id":"t1","runtime_id":"rt-1","issue_id":"i1","dispatched_at":"2026-09-19T04:43:58.123456Z"}]}`))
 			case secondServed.CompareAndSwap(false, true):
-				_, _ = w.Write([]byte(`{"tasks":[{"id":"t2","runtime_id":"rt-1","issue_id":"i2"}]}`))
+				_, _ = w.Write([]byte(`{"tasks":[{"id":"t2","runtime_id":"rt-1","issue_id":"i2","dispatched_at":"2026-09-19T04:44:58.654321Z"}]}`))
 			default:
 				_, _ = w.Write([]byte(`{"tasks":[]}`))
 			}

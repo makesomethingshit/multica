@@ -32,14 +32,14 @@ func testClaimGeneration() time.Time {
 // claimGenerationReport is one terminal report fenced to a known generation.
 func claimGenerationReport(taskID string) terminalTaskReport {
 	return terminalTaskReport{
-		kind:              terminalTaskReportComplete,
-		taskID:            taskID,
-		claimDispatchedAt: testClaimGeneration(),
-		output:            "the original answer",
-		branchName:        "agent/fenced",
-		sessionID:         "session-fenced",
-		workDir:           "/tmp/fenced",
-		durableWorkDir:    "/tmp/project",
+		kind:            terminalTaskReportComplete,
+		taskID:          taskID,
+		claimGeneration: claimGeneration{dispatchedAt: testClaimGeneration()},
+		output:          "the original answer",
+		branchName:      "agent/fenced",
+		sessionID:       "session-fenced",
+		workDir:         "/tmp/fenced",
+		durableWorkDir:  "/tmp/project",
 	}
 }
 
@@ -64,8 +64,8 @@ func TestTerminalReportQueuePersistsClaimGeneration(t *testing.T) {
 	if items[0].report != report {
 		t.Fatalf("round-tripped report = %+v, want %+v", items[0].report, report)
 	}
-	if !items[0].report.claimDispatchedAt.Equal(report.claimDispatchedAt) {
-		t.Fatalf("round-tripped generation = %s, want %s", items[0].report.claimDispatchedAt, report.claimDispatchedAt)
+	if !items[0].report.claimGeneration.dispatchedAt.Equal(report.claimGeneration.dispatchedAt) {
+		t.Fatalf("round-tripped generation = %s, want %s", items[0].report.claimGeneration.dispatchedAt, report.claimGeneration.dispatchedAt)
 	}
 
 	// The generation has to be on disk, not just in memory: replay after a
@@ -83,16 +83,21 @@ func TestTerminalReportQueuePersistsClaimGeneration(t *testing.T) {
 		t.Fatalf("queued record has no claim_dispatched_at: %s", body)
 	}
 	stored, err := time.Parse(time.RFC3339Nano, raw)
-	if err != nil || !stored.Equal(report.claimDispatchedAt) {
-		t.Fatalf("persisted claim_dispatched_at = %q, want %s", raw, report.claimDispatchedAt)
+	if err != nil || !stored.Equal(report.claimGeneration.dispatchedAt) {
+		t.Fatalf("persisted claim_dispatched_at = %q, want %s", raw, report.claimGeneration.dispatchedAt)
 	}
 
-	// A report for the same task that differs only in generation is a different
-	// claim's result, so it must not overwrite the queued one.
-	conflict := report
-	conflict.claimDispatchedAt = report.claimDispatchedAt.Add(time.Second)
-	if err := store.enqueue(conflict); err == nil || !strings.Contains(err.Error(), "conflicts with the original") {
-		t.Fatalf("conflicting enqueue error = %v, want original-payload conflict", err)
+	// A different generation of the same task is a different identity, so it
+	// gets its own record instead of touching this one; the payload-conflict
+	// rules for one identity are pinned in the identity tests.
+	other := report
+	other.claimGeneration = claimGeneration{dispatchedAt: report.claimGeneration.dispatchedAt.Add(time.Second)}
+	other.output = "result of a later claim"
+	if err := store.enqueue(other); err != nil {
+		t.Fatalf("enqueue of a later claim generation: %v", err)
+	}
+	if items, err := store.list(); err != nil || len(items) != 2 {
+		t.Fatalf("queue holds %d records (%v), want the original and the later claim", len(items), err)
 	}
 }
 
@@ -105,13 +110,22 @@ func TestTerminalReportLegacyRecordWithoutGenerationIsNeverReplayed(t *testing.T
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	d := New(cfg, logger)
 
-	// A record written by a daemon that predates the fence: same on-disk shape,
-	// no claim generation.
-	legacy := terminalTaskReport{kind: terminalTaskReportComplete, taskID: "task-legacy", output: "legacy answer"}
-	if err := d.terminalReports.enqueue(legacy); err != nil {
-		t.Fatalf("enqueue legacy report: %v", err)
+	// A version-1 record written by a daemon that predates the fence: keyed by
+	// task id alone, no claim generation, and therefore no provable owner.
+	legacy := persistedTerminalTaskReport{
+		Version:   legacyTerminalReportRecordVersion,
+		CreatedAt: time.Now().UTC(),
+		Kind:      "complete",
+		TaskID:    "task-legacy",
+		Output:    "legacy answer",
 	}
-	name := terminalReportFileName(legacy.taskID)
+	name := legacyTerminalReportFileName(legacy.TaskID)
+	if err := d.terminalReports.ensureDir(); err != nil {
+		t.Fatalf("prepare queue: %v", err)
+	}
+	if err := writeTerminalReportRecord(d.terminalReports.dir, name, legacy); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
 	path := filepath.Join(d.terminalReports.dir, name)
 	before, err := os.ReadFile(path)
 	if err != nil {
@@ -233,7 +247,7 @@ func TestTerminalReportOrdinaryConflictStaysPending(t *testing.T) {
 	if pending != 1 || delivered != 0 {
 		t.Fatalf("ordinary conflict pending=%d delivered=%d, want 1/0", pending, delivered)
 	}
-	if _, err := os.Stat(filepath.Join(d.terminalReports.failedDir(), terminalReportFileName("task-ordinary-conflict"))); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(d.terminalReports.failedDir(), legacyTerminalReportFileName("task-ordinary-conflict"))); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ordinary conflict moved the report to failed/: %v", err)
 	}
 }
@@ -280,7 +294,7 @@ func TestTerminalReportReplayUsesThePersistedClaimGeneration(t *testing.T) {
 		t.Fatalf("replay bodies = %d, want 1", len(bodies))
 	}
 	got, _ := bodies[0]["expected_dispatched_at"].(string)
-	if want := report.claimDispatchedAt.Format(time.RFC3339Nano); got != want {
+	if want := report.claimGeneration.dispatchedAt.Format(time.RFC3339Nano); got != want {
 		t.Fatalf("replayed expected_dispatched_at = %q, want the persisted %q", got, want)
 	}
 	if got := bodies[0]["output"]; got != report.output {
@@ -294,27 +308,105 @@ func TestClaimGenerationComesOnlyFromTheClaimPayload(t *testing.T) {
 	secondPrecision := generation.Truncate(time.Second).Format(time.RFC3339)
 
 	tests := []struct {
-		name string
-		raw  *string
-		want time.Time
+		name           string
+		raw            *string
+		want           time.Time
+		wantUnreadable bool
 	}{
 		{name: "nano precision", raw: &formatted, want: generation},
 		{name: "second precision", raw: &secondPrecision, want: generation.Truncate(time.Second)},
+		// Absence is a property of the SERVER (it never fenced its claims) and
+		// keeps the legacy unfenced callback working.
 		{name: "absent", raw: nil},
 		{name: "empty", raw: new(string)},
-		{name: "unparseable", raw: ptrTo("not a timestamp")},
+		// A field that is present but unreadable is a protocol error, not an old
+		// server: it must never be reported as an absent generation.
+		{name: "unparseable", raw: ptrTo("not a timestamp"), wantUnreadable: true},
+		{name: "zero instant", raw: ptrTo("0001-01-01T00:00:00Z"), wantUnreadable: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := claimGeneration(Task{DispatchedAt: tt.raw})
-			if !got.Equal(tt.want) {
-				t.Fatalf("claimGeneration() = %s, want %s", got, tt.want)
+			got := claimGenerationForTask(Task{DispatchedAt: tt.raw})
+			if got.unreadable != tt.wantUnreadable {
+				t.Fatalf("claimGenerationForTask() unreadable = %v, want %v", got.unreadable, tt.wantUnreadable)
+			}
+			if !got.dispatchedAt.Equal(tt.want) {
+				t.Fatalf("claimGenerationForTask() = %s, want %s", got.dispatchedAt, tt.want)
 			}
 		})
 	}
 }
 
 func ptrTo(value string) *string { return &value }
+
+// TestTerminalReportRefusesAnUnreadableClaimGeneration pins the third case of
+// the parser: a claim that ships a dispatched_at we cannot read is a protocol
+// error, so no terminal callback may leave the daemon and no replayable record
+// may be written. Degrading into an unfenced callback is the one outcome that
+// would let a stale report settle a reclaim.
+func TestTerminalReportRefusesAnUnreadableClaimGeneration(t *testing.T) {
+	d := New(Config{
+		ServerBaseURL:  "https://api.example.test",
+		WorkspacesRoot: t.TempDir(),
+		DaemonID:       "daemon-unreadable-generation",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	var sent atomic.Int32
+	d.terminalReportSend = func(context.Context, terminalTaskReport, []time.Duration) error {
+		sent.Add(1)
+		return nil
+	}
+	report := terminalTaskReport{
+		kind:            terminalTaskReportComplete,
+		taskID:          "task-unreadable",
+		output:          "must never be delivered unfenced",
+		claimGeneration: claimGenerationForTask(Task{DispatchedAt: ptrTo("yesterday")}),
+	}
+	if err := d.reportTerminalTask(context.Background(), report); err == nil {
+		t.Fatal("unreadable claim generation was reported as delivered")
+	}
+	if got := sent.Load(); got != 0 {
+		t.Fatalf("terminal sends = %d, want 0", got)
+	}
+	items, err := d.terminalReports.list()
+	if err != nil {
+		t.Fatalf("list queue: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("queue holds %d records, want 0", len(items))
+	}
+}
+
+// TestTerminalReportWithoutGenerationIsDeliveredButNotStored pins the first
+// case: an older server fenced nothing, so the callback still goes out (unfenced,
+// exactly as before this fence existed) but nothing is written to the durable
+// queue, because no generation-aware record can be built for it.
+func TestTerminalReportWithoutGenerationIsDeliveredButNotStored(t *testing.T) {
+	d := New(Config{
+		ServerBaseURL:  "https://api.example.test",
+		WorkspacesRoot: t.TempDir(),
+		DaemonID:       "daemon-legacy-server",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	var got terminalTaskReport
+	d.terminalReportSend = func(_ context.Context, report terminalTaskReport, _ []time.Duration) error {
+		got = report
+		return nil
+	}
+	report := terminalTaskReport{
+		kind: terminalTaskReportComplete, taskID: "task-legacy-server", output: "legacy answer",
+		claimGeneration: claimGenerationForTask(Task{}),
+	}
+	if err := d.reportTerminalTask(context.Background(), report); err != nil {
+		t.Fatalf("legacy callback failed: %v", err)
+	}
+	if got.taskID != report.taskID || !got.claimGeneration.dispatchedAt.IsZero() {
+		t.Fatalf("delivered report = %+v, want the unfenced original", got)
+	}
+	if items, err := d.terminalReports.list(); err != nil || len(items) != 0 {
+		t.Fatalf("queue holds %d records (%v), want 0", len(items), err)
+	}
+}
 
 func TestTaskDispatchedAtMirrorsTheClaimPayload(t *testing.T) {
 	// internal/daemon.Task is a hand-kept mirror of the server's claim response.
@@ -325,8 +417,8 @@ func TestTaskDispatchedAtMirrorsTheClaimPayload(t *testing.T) {
 		t.Fatalf("decode claim payload: %v", err)
 	}
 	want := time.Date(2026, time.September, 19, 4, 43, 58, 123456000, time.UTC)
-	if got := claimGeneration(task); !got.Equal(want) {
-		t.Fatalf("claim generation from the claim payload = %s, want %s", got, want)
+	if got := claimGenerationForTask(task); got.unreadable || !got.dispatchedAt.Equal(want) {
+		t.Fatalf("claim generation from the claim payload = %s (%v), want %s", got, got.unreadable, want)
 	}
 
 	// A server that predates the field must leave the generation unknown rather
@@ -335,7 +427,7 @@ func TestTaskDispatchedAtMirrorsTheClaimPayload(t *testing.T) {
 	if err := json.Unmarshal([]byte("{\"id\":\"task-2\"}"), &legacy); err != nil {
 		t.Fatalf("decode legacy claim payload: %v", err)
 	}
-	if got := claimGeneration(legacy); !got.IsZero() {
+	if got := claimGenerationForTask(legacy); !got.dispatchedAt.IsZero() || got.unreadable {
 		t.Fatalf("legacy claim payload produced a generation: %s", got)
 	}
 }
@@ -359,7 +451,7 @@ func TestTerminalReportEnqueueKeepsGenerationForEveryReportKind(t *testing.T) {
 		if err != nil {
 			t.Fatalf("list %d report: %v", kind, err)
 		}
-		if len(items) != 1 || !items[0].report.claimDispatchedAt.Equal(report.claimDispatchedAt) {
+		if len(items) != 1 || !items[0].report.claimGeneration.dispatchedAt.Equal(report.claimGeneration.dispatchedAt) {
 			t.Fatalf("kind %d lost its generation: %+v", kind, items)
 		}
 	}

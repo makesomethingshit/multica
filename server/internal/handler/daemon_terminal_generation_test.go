@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,6 +205,39 @@ func TestCompleteTaskClaimGenerationFence(t *testing.T) {
 			t.Fatalf("status = %q, want running (untouched)", status)
 		}
 	})
+
+	// The server-terminal case that is NOT idempotent: the row was settled by a
+	// later claim. Acknowledging the older report as "already finalized" would
+	// tell the daemon its stale result had landed, and the payload would be
+	// deleted instead of retired.
+	t.Run("stale completion after the reclaim already completed is a conflict", func(t *testing.T) {
+		taskID, generation := fencedTerminalTask(t, "running", nil)
+		reclaimed := reclaimTask(t, taskID)
+		if w := postTerminalCallback(t, taskID, "complete", map[string]any{
+			"output":                 "result of the new claim",
+			"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
+		}); w.Code != http.StatusOK {
+			t.Fatalf("new claim could not settle its own row: got %d: %s", w.Code, w.Body.String())
+		}
+
+		w := postTerminalCallback(t, taskID, "complete", map[string]any{
+			"output":                 "result of the old claim",
+			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+		})
+		if w.Code != http.StatusConflict {
+			t.Fatalf("stale completion after a newer settlement: got %d: %s, want 409", w.Code, w.Body.String())
+		}
+		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
+			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
+		}
+		status, current, result, _ := taskRowState(t, taskID)
+		if status != "completed" || !current.Equal(reclaimed) {
+			t.Fatalf("settled row changed: status=%s generation=%s", status, current)
+		}
+		if !json.Valid(result) || !strings.Contains(string(result), "result of the new claim") {
+			t.Fatalf("settled result was overwritten: %s", result)
+		}
+	})
 }
 
 func TestFailTaskClaimGenerationFence(t *testing.T) {
@@ -276,6 +310,32 @@ func TestFailTaskClaimGenerationFence(t *testing.T) {
 		}
 		if got, _, _, _ := taskRowState(t, taskID); got != "failed" {
 			t.Fatalf("status = %q, want failed", got)
+		}
+	})
+
+	t.Run("stale failure after the reclaim already failed is a conflict", func(t *testing.T) {
+		taskID, generation := fencedTerminalTask(t, "running", nil)
+		reclaimed := reclaimTask(t, taskID)
+		if w := postTerminalCallback(t, taskID, "fail", map[string]any{
+			"error":                  "the new claim failed",
+			"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
+		}); w.Code != http.StatusOK {
+			t.Fatalf("new claim could not fail its own row: got %d: %s", w.Code, w.Body.String())
+		}
+
+		w := postTerminalCallback(t, taskID, "fail", map[string]any{
+			"error":                  "the old claim failed",
+			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+		})
+		if w.Code != http.StatusConflict {
+			t.Fatalf("stale failure after a newer settlement: got %d: %s, want 409", w.Code, w.Body.String())
+		}
+		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
+			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
+		}
+		status, current, _, _ := taskRowState(t, taskID)
+		if status != "failed" || !current.Equal(reclaimed) {
+			t.Fatalf("settled row changed: status=%s generation=%s", status, current)
 		}
 	})
 }

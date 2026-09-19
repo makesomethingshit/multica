@@ -118,16 +118,30 @@ func isTerminalAgentTaskStatus(status string) bool {
 	}
 }
 
+// sameClaimGeneration compares the generation a callback claims against the one
+// its row currently carries. Both are timestamptz instants: compare the
+// instants, never a rendered string, and treat a row without a generation as
+// ownership that cannot be the caller's.
+func sameClaimGeneration(row, expected pgtype.Timestamptz) bool {
+	return row.Valid && expected.Valid && row.Time.Equal(expected.Time)
+}
+
 // classifyFencedTerminalMiss decides what a fenced terminal UPDATE that
 // returned no rows means. The ownership decision already happened atomically
-// inside that UPDATE, so this lookup only classifies its outcome:
+// inside that UPDATE, so this lookup only classifies its outcome — and it never
+// mutates anything:
 //
-//   - the row is terminal: an idempotent replay, reported as success;
-//   - the row is live on another generation (or gone): a stale report, reported
-//     as ErrTaskClaimGenerationMismatch so the daemon stops replaying it;
+//   - the row is terminal on the callback's own generation: the transition this
+//     very report already committed and whose response was lost. Idempotent
+//     success.
+//   - the row carries another generation (or none at all): the report belongs to
+//     an older or unknown claim, reported as ErrTaskClaimGenerationMismatch so
+//     the daemon retires it. This holds whether the row is still live or was
+//     already settled, which is what keeps an old completion from being
+//     acknowledged as if it had produced the newer claim's outcome.
 //   - the lookup itself failed: unknown, so the caller keeps its existing
 //     retryable error path rather than guessing.
-func (s *TaskService) classifyFencedTerminalMiss(ctx context.Context, taskID pgtype.UUID) (db.AgentTaskQueue, bool, error) {
+func (s *TaskService) classifyFencedTerminalMiss(ctx context.Context, taskID pgtype.UUID, expected pgtype.Timestamptz) (db.AgentTaskQueue, bool, error) {
 	existing, err := s.Queries.GetAgentTask(ctx, taskID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return db.AgentTaskQueue{}, false, fmt.Errorf("%w: task %s no longer exists",
@@ -136,10 +150,17 @@ func (s *TaskService) classifyFencedTerminalMiss(ctx context.Context, taskID pgt
 	if err != nil {
 		return db.AgentTaskQueue{}, false, err
 	}
+	if !sameClaimGeneration(existing.DispatchedAt, expected) {
+		return existing, false, fmt.Errorf("%w: task %s is owned by another claim generation",
+			ErrTaskClaimGenerationMismatch, util.UUIDToString(taskID))
+	}
 	if isTerminalAgentTaskStatus(existing.Status) {
 		return existing, true, nil
 	}
-	return existing, false, fmt.Errorf("%w: task %s is owned by another claim generation",
+	// Same generation, non-terminal: the row moved (requeued or settled by a
+	// concurrent transition) between the UPDATE and this read. Nothing here can
+	// settle it, and retrying forever helps no one.
+	return existing, false, fmt.Errorf("%w: task %s is no longer on the claimed generation",
 		ErrTaskClaimGenerationMismatch, util.UUIDToString(taskID))
 }
 
@@ -4468,7 +4489,7 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 		return nil
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) && expectedDispatchedAt.Valid {
-			existing, idempotent, classifyErr := s.classifyFencedTerminalMiss(ctx, taskID)
+			existing, idempotent, classifyErr := s.classifyFencedTerminalMiss(ctx, taskID, expectedDispatchedAt)
 			switch {
 			case idempotent:
 				// A duplicate callback after the terminal transition committed
@@ -5126,7 +5147,7 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		return nil
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) && expectedDispatchedAt.Valid {
-			existing, idempotent, classifyErr := s.classifyFencedTerminalMiss(ctx, taskID)
+			existing, idempotent, classifyErr := s.classifyFencedTerminalMiss(ctx, taskID, expectedDispatchedAt)
 			switch {
 			case idempotent:
 				// The failure already landed (or the row was cancelled); the
