@@ -88,16 +88,15 @@ const DaemonTaskClaimGenerationMismatchCode = "task_claim_generation_mismatch"
 // second is a mixed deployment the daemon must retry.
 const DaemonTaskNotFoundCode = "task_not_found"
 
-// TerminalReportGenerationFenceV1 names the complete terminal-report generation
-// fence contract: a claim that advertises it round-trips dispatched_at exactly,
-// and /complete and /fail compare that generation inside the terminal UPDATE.
+// TerminalReportGenerationFenceV1 marks a claim whose dispatched_at may be used
+// as an authoritative terminal-report generation: the server round-trips that
+// timestamp exactly and compares it inside the terminal UPDATE. Claims without
+// the flag stay legacy even when they carry dispatched_at, because older servers
+// send that timestamp while ignoring the terminal callback's fence.
 //
-// The name travels two ways on purpose. The claim payload carries it as
-// terminal_report_generation_fence_v1, which is what makes a claim
-// generation-aware, and the heartbeat ack lists it in ServerCapabilities, which
-// is what lets a daemon holding a persisted report — after a restart, or after
-// the server was rolled back — prove the CONNECTED server enforces the fence
-// before it sends that report.
+// It is a claim-only capability. Whether a particular request is fenced is
+// settled per request by the versioned terminal endpoint, which has no unfenced
+// mode.
 const TerminalReportGenerationFenceV1 = "terminal_report_generation_fence_v1"
 
 // ChatQuickAction is a server-validated follow-up attached to one assistant

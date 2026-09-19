@@ -77,12 +77,10 @@ func hasErrorCode(body, code string) bool {
 	return envelope.Code == code
 }
 
-// isFencedTerminalEndpointUnsupported reports that a generation-aware report
-// reached a server with no versioned terminal route: a mixed deployment, or a
-// rollback to a build that predates the fence. The report was not rejected — the
-// replica simply cannot settle it — so it stays pending and is retried, and it
-// must never be acknowledged, quarantined as a semantic task-not-found, or
-// turned into a failure compensation.
+// isFencedTerminalEndpointUnsupported reports that a generation-aware report hit
+// a replica with no versioned terminal route (an old build in a mixed
+// deployment). The replica could not settle it, so the report stays pending:
+// never acknowledged, never quarantined, never compensated.
 func isFencedTerminalEndpointUnsupported(err error) bool {
 	var reqErr *requestError
 	if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusNotFound {
@@ -639,16 +637,11 @@ func (c *Client) failTaskWithRetrySchedule(ctx context.Context, taskID, errMsg, 
 	return c.postJSONWithRetry(ctx, terminalTaskPath(taskID, "fail", !claimDispatchedAt.IsZero()), body, nil, schedule)
 }
 
-// terminalTaskPath selects the terminal surface for one report. The choice is
-// structural — a report either carries the claim generation that makes it
-// generation-aware, or it does not — and it is never derived from the last
-// heartbeat: replicas behind a load balancer are independent, so a capability a
-// heartbeat proved says nothing about the replica that would handle this request.
-//
-// The versioned route is the per-request safety boundary. It has no unfenced
-// mode, so a report produced under a fence is either settled by a server that
-// enforces the fence or refused; there is deliberately no fallback from it to
-// the legacy route, which would recreate the unfenced mutation.
+// terminalTaskPath selects the terminal surface for one report: no generation
+// → legacy route, generation → versioned route. The choice is structural and is
+// never derived from heartbeat state. The versioned route has no unfenced mode,
+// and there is no fallback to the legacy route: that would recreate the unfenced
+// mutation the fence exists to prevent.
 func terminalTaskPath(taskID, action string, generationAware bool) string {
 	if generationAware {
 		return fmt.Sprintf("/api/daemon/v2/tasks/%s/%s", taskID, action)
@@ -671,10 +664,9 @@ func addClaimGeneration(body map[string]any, claimDispatchedAt time.Time) {
 }
 
 // isStaleClaimGenerationError reports whether err is the server's atomic
-// generation fence refusing this report: a later claim owns the task row now,
-// so this result can never settle it. The server answers with a stable code,
-// which distinguishes it from every ordinary conflict and from an outage — a
-// transient failure stays retryable, this one must not be retried at all.
+// generation fence refusing this report: a later claim owns the row, so this
+// result can never settle it. The stable code distinguishes it from an ordinary
+// conflict (retryable) and from an outage.
 func isStaleClaimGenerationError(err error) bool {
 	var reqErr *requestError
 	if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusConflict {

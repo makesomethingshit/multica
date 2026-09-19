@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,7 +86,6 @@ func TestTerminalReportReplaySurvivesMixedReplicaDeployment(t *testing.T) {
 		WorkspacesRoot: t.TempDir(),
 		DaemonID:       "daemon-mixed-replica",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	serverAdvertisesFence(d)
 	report := generationReport("task-mixed", testClaimGeneration(), "fenced answer")
 	if err := d.terminalReports.enqueue(report); err != nil {
 		t.Fatalf("enqueue: %v", err)
@@ -110,6 +108,11 @@ func TestTerminalReportReplaySurvivesMixedReplicaDeployment(t *testing.T) {
 	entries, err := os.ReadDir(d.terminalReports.failedDir())
 	if err == nil && len(entries) != 0 {
 		t.Fatalf("failed queue = %v, want nothing: an unsupported route is not a rejection", entries)
+	}
+	// An unsupported route is not a rejection, so nothing may be compensated
+	// either: the legacy route would have been hit for that.
+	if got := legacyCalls.Load(); got != 0 {
+		t.Fatalf("compensation or fallback requests = %d, want 0", got)
 	}
 
 	// Attempt 2: the new replica enforces the fence.
@@ -181,44 +184,6 @@ func TestGenerationAwareForegroundReportNeverFallsBackToLegacy(t *testing.T) {
 	}
 }
 
-// TestReplayHoldsWhenReplicaLacksTheFencedEndpoint covers the same hole for
-// durable replay: the report stays pending, nothing is compensated, and the
-// operator sees a hold rather than a rejection.
-func TestReplayHoldsWhenReplicaLacksTheFencedEndpoint(t *testing.T) {
-	var failCalls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if strings.HasSuffix(req.URL.Path, "/fail") {
-			failCalls.Add(1)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte("404 page not found\n"))
-	}))
-	t.Cleanup(srv.Close)
-
-	d := New(Config{
-		ServerBaseURL:  srv.URL,
-		WorkspacesRoot: t.TempDir(),
-		DaemonID:       "daemon-replay-hold",
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	serverAdvertisesFence(d)
-	report := generationReport("task-replay-hold", testClaimGeneration(), "answer")
-	if err := d.terminalReports.enqueue(report); err != nil {
-		t.Fatalf("enqueue: %v", err)
-	}
-	pending, delivered := d.replayPendingTerminalReports(context.Background())
-	if pending != 1 || delivered != 0 {
-		t.Fatalf("replay pending=%d delivered=%d, want 1/0", pending, delivered)
-	}
-	if got := failCalls.Load(); got != 0 {
-		t.Fatalf("/fail compensation calls = %d, want 0: an unsupported route is not a rejection", got)
-	}
-	if items, err := d.terminalReports.list(); err != nil || len(items) != 1 {
-		t.Fatalf("queue = %d records (%v), want the report pending", len(items), err)
-	}
-}
-
 // TestRealTaskNotFoundOnFencedEndpointIsSemantic pins the other side of the
 // classification: a structured task-not-found from a NEW server is a real
 // absence, so it keeps the legacy terminal semantics instead of being read as a
@@ -263,56 +228,5 @@ func TestRealTaskNotFoundOnFencedEndpointIsSemantic(t *testing.T) {
 	}
 	if isTaskNotFoundError(err) {
 		t.Fatalf("plain 404 was misread as a semantic task-not-found: %v", err)
-	}
-}
-
-// TestFencedStaleGenerationStillRetiresThroughTheVersionedRoute keeps the
-// existing stale semantics after the endpoint split: the fenced route answers
-// the stable conflict, the report is retired with no compensation, and the
-// legacy route is never touched.
-func TestFencedStaleGenerationStillRetiresThroughTheVersionedRoute(t *testing.T) {
-	var mu sync.Mutex
-	var paths []string
-	var failCalls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		mu.Lock()
-		paths = append(paths, req.URL.Path)
-		mu.Unlock()
-		if strings.HasSuffix(req.URL.Path, "/fail") {
-			failCalls.Add(1)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte("{\"error\":\"stale\",\"code\":\"" + protocol.DaemonTaskClaimGenerationMismatchCode + "\"}\n"))
-	}))
-	t.Cleanup(srv.Close)
-
-	d := New(Config{
-		ServerBaseURL:  srv.URL,
-		WorkspacesRoot: t.TempDir(),
-		DaemonID:       "daemon-fenced-stale",
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err := d.reportTerminalTask(context.Background(), generationReport("task-fenced-stale", testClaimGeneration(), "answer")); err == nil {
-		t.Fatal("stale fenced report reported success")
-	}
-	if items, err := d.terminalReports.list(); err != nil || len(items) != 0 {
-		t.Fatalf("pending queue = %d records (%v), want the stale report retired", len(items), err)
-	}
-	if got := failCalls.Load(); got != 0 {
-		t.Fatalf("/fail compensation calls = %d, want 0", got)
-	}
-	if body, err := os.ReadFile(filepath.Join(d.terminalReports.failedDir(), reportFileName(generationReport("task-fenced-stale", testClaimGeneration(), "answer")))); err != nil {
-		t.Fatalf("retired report missing: %v", err)
-	} else if !strings.Contains(string(body), "superseded_at") {
-		t.Fatalf("retired report was not marked superseded: %s", body)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	for _, path := range paths {
-		if !strings.Contains(path, "/api/daemon/v2/") {
-			t.Fatalf("stale report touched the legacy route: %v", paths)
-		}
 	}
 }

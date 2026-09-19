@@ -127,246 +127,6 @@ func responseCode(t *testing.T, w *httptest.ResponseRecorder) string {
 	return code
 }
 
-func TestCompleteTaskClaimGenerationFence(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-
-	t.Run("matching generation completes", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		w := postTerminalCallback(t, taskID, "complete", map[string]any{
-			"output":                 "done",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusOK {
-			t.Fatalf("complete with matching generation: got %d: %s", w.Code, w.Body.String())
-		}
-		if status, _, _, _ := taskRowState(t, taskID); status != "completed" {
-			t.Fatalf("status = %q, want completed", status)
-		}
-	})
-
-	t.Run("replayed callback after the terminal transition stays successful", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		body := map[string]any{
-			"output":                 "done",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		}
-		if w := postTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
-			t.Fatalf("first callback: got %d: %s", w.Code, w.Body.String())
-		}
-		// The first response was lost in transit; the daemon replays the same
-		// report. Server-terminal state wins and the answer stays a success.
-		if w := postTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
-			t.Fatalf("replayed callback: got %d: %s", w.Code, w.Body.String())
-		}
-		if status, _, _, _ := taskRowState(t, taskID); status != "completed" {
-			t.Fatalf("status = %q, want completed", status)
-		}
-	})
-
-	t.Run("stale generation after a reclaim never completes the new claim", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		reclaimed := reclaimTask(t, taskID)
-
-		w := postTerminalCallback(t, taskID, "complete", map[string]any{
-			"output":                 "result of the old claim",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusConflict {
-			t.Fatalf("stale complete: got %d: %s, want 409", w.Code, w.Body.String())
-		}
-		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
-			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
-		}
-		status, current, result, completedAt := taskRowState(t, taskID)
-		if status != "running" {
-			t.Fatalf("reclaimed task status = %q, want running (untouched)", status)
-		}
-		if !current.Equal(reclaimed) {
-			t.Fatalf("reclaimed generation = %s, want %s", current, reclaimed)
-		}
-		if result != nil || completedAt != nil {
-			t.Fatalf("reclaimed task was mutated: result=%s completed_at=%v", result, completedAt)
-		}
-	})
-
-	t.Run("cancelled row keeps its outcome when an old report arrives", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		if _, err := testPool.Exec(context.Background(),
-			`UPDATE agent_task_queue SET status = 'cancelled', completed_at = now() WHERE id = $1`, taskID); err != nil {
-			t.Fatalf("cancel task: %v", err)
-		}
-		w := postTerminalCallback(t, taskID, "complete", map[string]any{
-			"output":                 "late result",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusOK {
-			t.Fatalf("cancelled replay: got %d: %s, want idempotent 200", w.Code, w.Body.String())
-		}
-		if status, _, _, _ := taskRowState(t, taskID); status != "cancelled" {
-			t.Fatalf("status = %q, want cancelled", status)
-		}
-	})
-
-	t.Run("legacy callback without a generation still completes", func(t *testing.T) {
-		taskID, _ := fencedTerminalTask(t, "running", nil)
-		if w := postTerminalCallback(t, taskID, "complete", map[string]any{"output": "old daemon"}); w.Code != http.StatusOK {
-			t.Fatalf("unfenced complete: got %d: %s", w.Code, w.Body.String())
-		}
-		if status, _, _, _ := taskRowState(t, taskID); status != "completed" {
-			t.Fatalf("status = %q, want completed", status)
-		}
-	})
-
-	t.Run("malformed generation is refused instead of silently unfenced", func(t *testing.T) {
-		taskID, _ := fencedTerminalTask(t, "running", nil)
-		w := postTerminalCallback(t, taskID, "complete", map[string]any{
-			"output":                 "done",
-			"expected_dispatched_at": "yesterday",
-		})
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("malformed generation: got %d: %s, want 400", w.Code, w.Body.String())
-		}
-		if status, _, _, _ := taskRowState(t, taskID); status != "running" {
-			t.Fatalf("status = %q, want running (untouched)", status)
-		}
-	})
-
-	// The server-terminal case that is NOT idempotent: the row was settled by a
-	// later claim. Acknowledging the older report as "already finalized" would
-	// tell the daemon its stale result had landed, and the payload would be
-	// deleted instead of retired.
-	t.Run("stale completion after the reclaim already completed is a conflict", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		reclaimed := reclaimTask(t, taskID)
-		if w := postTerminalCallback(t, taskID, "complete", map[string]any{
-			"output":                 "result of the new claim",
-			"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
-		}); w.Code != http.StatusOK {
-			t.Fatalf("new claim could not settle its own row: got %d: %s", w.Code, w.Body.String())
-		}
-
-		w := postTerminalCallback(t, taskID, "complete", map[string]any{
-			"output":                 "result of the old claim",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusConflict {
-			t.Fatalf("stale completion after a newer settlement: got %d: %s, want 409", w.Code, w.Body.String())
-		}
-		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
-			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
-		}
-		status, current, result, _ := taskRowState(t, taskID)
-		if status != "completed" || !current.Equal(reclaimed) {
-			t.Fatalf("settled row changed: status=%s generation=%s", status, current)
-		}
-		if !json.Valid(result) || !strings.Contains(string(result), "result of the new claim") {
-			t.Fatalf("settled result was overwritten: %s", result)
-		}
-	})
-}
-
-func TestFailTaskClaimGenerationFence(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-
-	for _, status := range []string{"dispatched", "running", "waiting_local_directory"} {
-		t.Run("matching generation fails a "+status+" task", func(t *testing.T) {
-			taskID, generation := fencedTerminalTask(t, status, nil)
-			w := postTerminalCallback(t, taskID, "fail", map[string]any{
-				"error":                  "provider failed",
-				"failure_reason":         "agent_error.process_failure",
-				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-			})
-			if w.Code != http.StatusOK {
-				t.Fatalf("fail with matching generation: got %d: %s", w.Code, w.Body.String())
-			}
-			if got, _, _, _ := taskRowState(t, taskID); got != "failed" {
-				t.Fatalf("status = %q, want failed", got)
-			}
-		})
-	}
-
-	t.Run("stale generation leaves the reclaim untouched", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		reclaimed := reclaimTask(t, taskID)
-
-		w := postTerminalCallback(t, taskID, "fail", map[string]any{
-			"error":                  "old claim failed",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusConflict {
-			t.Fatalf("stale fail: got %d: %s, want 409", w.Code, w.Body.String())
-		}
-		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
-			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
-		}
-		status, current, result, completedAt := taskRowState(t, taskID)
-		if status != "running" {
-			t.Fatalf("reclaim status = %q, want running", status)
-		}
-		if !current.Equal(reclaimed) {
-			t.Fatalf("reclaim generation = %s, want %s", current, reclaimed)
-		}
-		if result != nil || completedAt != nil {
-			t.Fatalf("reclaim was mutated: result=%s completed_at=%v", result, completedAt)
-		}
-	})
-
-	t.Run("stale prelaunch failure leaves the reclaim untouched", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "waiting_local_directory", nil)
-		reclaimTask(t, taskID)
-		w := postTerminalCallback(t, taskID, "fail", map[string]any{
-			"error":                  "old claim never launched",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusConflict {
-			t.Fatalf("stale prelaunch fail: got %d: %s, want 409", w.Code, w.Body.String())
-		}
-		if status, _, _, _ := taskRowState(t, taskID); status != "waiting_local_directory" {
-			t.Fatalf("status = %q, want waiting_local_directory (untouched)", status)
-		}
-	})
-
-	t.Run("legacy callback without a generation still fails the task", func(t *testing.T) {
-		taskID, _ := fencedTerminalTask(t, "dispatched", nil)
-		if w := postTerminalCallback(t, taskID, "fail", map[string]any{"error": "old daemon"}); w.Code != http.StatusOK {
-			t.Fatalf("unfenced fail: got %d: %s", w.Code, w.Body.String())
-		}
-		if got, _, _, _ := taskRowState(t, taskID); got != "failed" {
-			t.Fatalf("status = %q, want failed", got)
-		}
-	})
-
-	t.Run("stale failure after the reclaim already failed is a conflict", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		reclaimed := reclaimTask(t, taskID)
-		if w := postTerminalCallback(t, taskID, "fail", map[string]any{
-			"error":                  "the new claim failed",
-			"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
-		}); w.Code != http.StatusOK {
-			t.Fatalf("new claim could not fail its own row: got %d: %s", w.Code, w.Body.String())
-		}
-
-		w := postTerminalCallback(t, taskID, "fail", map[string]any{
-			"error":                  "the old claim failed",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusConflict {
-			t.Fatalf("stale failure after a newer settlement: got %d: %s, want 409", w.Code, w.Body.String())
-		}
-		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
-			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
-		}
-		status, current, _, _ := taskRowState(t, taskID)
-		if status != "failed" || !current.Equal(reclaimed) {
-			t.Fatalf("settled row changed: status=%s generation=%s", status, current)
-		}
-	})
-}
-
 // TestTerminalCallbackFenceIsTheUpdateAndNotAPriorLookup documents the TOCTOU
 // shape: the generation the callback carries was read from the row before the
 // reclaim, so any "GET the row, compare, then POST" implementation would have
@@ -382,7 +142,7 @@ func TestTerminalCallbackFenceIsTheUpdateAndNotAPriorLookup(t *testing.T) {
 	// its callback reaches the terminal UPDATE.
 	reclaimed := reclaimTask(t, taskID)
 
-	w := postTerminalCallback(t, taskID, "complete", map[string]any{
+	w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
 		"output":                 "hard-fought result",
 		"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
 	})
@@ -395,7 +155,7 @@ func TestTerminalCallbackFenceIsTheUpdateAndNotAPriorLookup(t *testing.T) {
 	}
 
 	// The reclaim that owns the row can still settle it with its own generation.
-	if w := postTerminalCallback(t, taskID, "complete", map[string]any{
+	if w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
 		"output":                 "result of the new claim",
 		"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
 	}); w.Code != http.StatusOK {
@@ -403,100 +163,214 @@ func TestTerminalCallbackFenceIsTheUpdateAndNotAPriorLookup(t *testing.T) {
 	}
 }
 
-// TestClaimPayloadRoundTripsClaimGeneration pins the other half of the fence:
-// TestFencedTerminalEndpointContract pins the versioned terminal route, which is
-// the per-request safety boundary during a rolling deployment: it has no
-// unfenced mode, so a report produced under a fence is either settled by a
-// server that enforces the fence or refused — never applied as a legacy
-// callback by a replica that ignores the field.
+// TestFencedTerminalEndpointContract owns the generation contract. The versioned
+// route is the only surface a current daemon sends generation-aware reports to,
+// so the semantics live here: the generation is mandatory, it is compared inside
+// the terminal UPDATE, and every outcome the daemon must distinguish has a stable
+// shape.
 func TestFencedTerminalEndpointContract(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
 
-	for _, endpoint := range []string{"complete", "fail"} {
-		t.Run(endpoint+" requires the generation", func(t *testing.T) {
-			taskID, _ := fencedTerminalTask(t, "running", nil)
-			body := map[string]any{"output": "done", "error": "failed"}
-			for name, value := range map[string]any{
-				"missing":   nil,
-				"empty":     "",
-				"malformed": "yesterday",
-			} {
-				payload := map[string]any{}
-				for key, item := range body {
-					payload[key] = item
-				}
-				if value != nil {
-					payload["expected_dispatched_at"] = value
-				}
-				w := postFencedTerminalCallback(t, taskID, endpoint, payload)
-				if w.Code != http.StatusBadRequest {
-					t.Fatalf("%s generation (%s): got %d: %s, want 400", endpoint, name, w.Code, w.Body.String())
-				}
+	t.Run("complete", func(t *testing.T) {
+		t.Run("matching generation completes and replays idempotently", func(t *testing.T) {
+			taskID, generation := fencedTerminalTask(t, "running", nil)
+			body := map[string]any{
+				"output":                 "done",
+				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
 			}
-			if status, _, _, _ := taskRowState(t, taskID); status != "running" {
-				t.Fatalf("status = %q, want running (untouched by an invalid fenced request)", status)
+			if w := postFencedTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
+				t.Fatalf("fenced complete: got %d: %s", w.Code, w.Body.String())
+			}
+			// The response was lost; the daemon replays the same fenced report.
+			if w := postFencedTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
+				t.Fatalf("fenced replay: got %d: %s, want idempotent 200", w.Code, w.Body.String())
+			}
+			if status, _, _, _ := taskRowState(t, taskID); status != "completed" {
+				t.Fatalf("status = %q, want completed", status)
 			}
 		})
+
+		t.Run("stale generation conflicts and leaves the reclaim alone", func(t *testing.T) {
+			taskID, generation := fencedTerminalTask(t, "running", nil)
+			reclaimTask(t, taskID)
+			w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
+				"output":                 "old claim result",
+				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+			})
+			if w.Code != http.StatusConflict {
+				t.Fatalf("stale fenced complete: got %d: %s, want 409", w.Code, w.Body.String())
+			}
+			if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
+				t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
+			}
+			if status, _, _, _ := taskRowState(t, taskID); status != "running" {
+				t.Fatalf("status = %q, want running (untouched)", status)
+			}
+		})
+
+		// The server-terminal case that is NOT idempotent: the row was settled by
+		// a later claim, so acknowledging the older report as "already finalized"
+		// would tell the daemon its stale result had landed.
+		t.Run("stale generation after a newer settlement conflicts", func(t *testing.T) {
+			taskID, generation := fencedTerminalTask(t, "running", nil)
+			reclaimed := reclaimTask(t, taskID)
+			if w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
+				"output":                 "result of the new claim",
+				"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
+			}); w.Code != http.StatusOK {
+				t.Fatalf("new claim could not settle its own row: got %d: %s", w.Code, w.Body.String())
+			}
+			w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
+				"output":                 "result of the old claim",
+				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+			})
+			if w.Code != http.StatusConflict {
+				t.Fatalf("stale complete after a newer settlement: got %d: %s, want 409", w.Code, w.Body.String())
+			}
+			status, current, result, _ := taskRowState(t, taskID)
+			if status != "completed" || !current.Equal(reclaimed) {
+				t.Fatalf("settled row changed: status=%s generation=%s", status, current)
+			}
+			if !json.Valid(result) || !strings.Contains(string(result), "result of the new claim") {
+				t.Fatalf("settled result was overwritten: %s", result)
+			}
+		})
+
+		t.Run("cancelled row keeps its outcome", func(t *testing.T) {
+			taskID, generation := fencedTerminalTask(t, "running", nil)
+			if _, err := testPool.Exec(context.Background(),
+				"UPDATE agent_task_queue SET status = 'cancelled', completed_at = now() WHERE id = $1", taskID); err != nil {
+				t.Fatalf("cancel task: %v", err)
+			}
+			w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
+				"output":                 "late result",
+				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+			})
+			if w.Code != http.StatusOK {
+				t.Fatalf("cancelled replay: got %d: %s, want idempotent 200", w.Code, w.Body.String())
+			}
+			if status, _, _, _ := taskRowState(t, taskID); status != "cancelled" {
+				t.Fatalf("status = %q, want cancelled", status)
+			}
+		})
+
+		t.Run("rejects an absent or malformed generation", func(t *testing.T) {
+			taskID, _ := fencedTerminalTask(t, "running", nil)
+			if w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{"output": "done"}); w.Code != http.StatusBadRequest {
+				t.Fatalf("missing generation: got %d: %s, want 400", w.Code, w.Body.String())
+			}
+			if w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
+				"output":                 "done",
+				"expected_dispatched_at": "yesterday",
+			}); w.Code != http.StatusBadRequest {
+				t.Fatalf("malformed generation: got %d: %s, want 400", w.Code, w.Body.String())
+			}
+			if status, _, _, _ := taskRowState(t, taskID); status != "running" {
+				t.Fatalf("status = %q, want running (untouched)", status)
+			}
+		})
+	})
+
+	t.Run("fail", func(t *testing.T) {
+		for _, status := range []string{"dispatched", "running", "waiting_local_directory"} {
+			t.Run("matching generation fails a "+status+" task", func(t *testing.T) {
+				taskID, generation := fencedTerminalTask(t, status, nil)
+				w := postFencedTerminalCallback(t, taskID, "fail", map[string]any{
+					"error":                  "provider failed",
+					"failure_reason":         "agent_error.process_failure",
+					"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+				})
+				if w.Code != http.StatusOK {
+					t.Fatalf("fenced fail: got %d: %s", w.Code, w.Body.String())
+				}
+				if got, _, _, _ := taskRowState(t, taskID); got != "failed" {
+					t.Fatalf("status = %q, want failed", got)
+				}
+			})
+		}
+
+		t.Run("stale generation conflicts and leaves the reclaim alone", func(t *testing.T) {
+			taskID, generation := fencedTerminalTask(t, "running", nil)
+			reclaimed := reclaimTask(t, taskID)
+			w := postFencedTerminalCallback(t, taskID, "fail", map[string]any{
+				"error":                  "old claim failed",
+				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
+			})
+			if w.Code != http.StatusConflict {
+				t.Fatalf("stale fenced fail: got %d: %s, want 409", w.Code, w.Body.String())
+			}
+			status, current, result, completedAt := taskRowState(t, taskID)
+			if status != "running" || !current.Equal(reclaimed) || result != nil || completedAt != nil {
+				t.Fatalf("reclaim was mutated: status=%s generation=%s result=%s", status, current, result)
+			}
+		})
+
+		t.Run("rejects an absent or malformed generation", func(t *testing.T) {
+			taskID, _ := fencedTerminalTask(t, "dispatched", nil)
+			if w := postFencedTerminalCallback(t, taskID, "fail", map[string]any{"error": "failed"}); w.Code != http.StatusBadRequest {
+				t.Fatalf("missing generation: got %d: %s, want 400", w.Code, w.Body.String())
+			}
+			if w := postFencedTerminalCallback(t, taskID, "fail", map[string]any{
+				"error":                  "failed",
+				"expected_dispatched_at": "yesterday",
+			}); w.Code != http.StatusBadRequest {
+				t.Fatalf("malformed generation: got %d: %s, want 400", w.Code, w.Body.String())
+			}
+			if got, _, _, _ := taskRowState(t, taskID); got != "dispatched" {
+				t.Fatalf("status = %q, want dispatched (untouched)", got)
+			}
+		})
+	})
+
+	// The daemon must tell a real absence from a replica that has no fenced
+	// route, so a missing task answers with the stable code instead of the
+	// ordinary unstructured 404 an unknown path produces.
+	t.Run("missing task carries the structured code", func(t *testing.T) {
+		missingTaskID := "00000000-0000-0000-0000-0000000000ff"
+		for _, endpoint := range []string{"complete", "fail"} {
+			body := map[string]any{
+				"error":                  "gone",
+				"expected_dispatched_at": time.Now().UTC().Format(time.RFC3339Nano),
+			}
+			w := postFencedTerminalCallback(t, missingTaskID, endpoint, body)
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("fenced %s for a missing task: got %d: %s, want 404", endpoint, w.Code, w.Body.String())
+			}
+			if code := responseCode(t, w); code != protocol.DaemonTaskNotFoundCode {
+				t.Fatalf("missing-task code = %q, want %q", code, protocol.DaemonTaskNotFoundCode)
+			}
+		}
+	})
+}
+
+// TestLegacyTerminalEndpointsStayCompatible is the only legacy generation
+// concern left: an installed daemon that predates the fence keeps working
+// without any generation field. Generation semantics belong to the versioned
+// route above.
+func TestLegacyTerminalEndpointsStayCompatible(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
 	}
 
-	t.Run("matching generation settles and replays idempotently", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		body := map[string]any{
-			"output":                 "done",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		}
-		if w := postFencedTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
-			t.Fatalf("fenced complete: got %d: %s", w.Code, w.Body.String())
-		}
-		// The response was lost; the daemon replays the same fenced report.
-		if w := postFencedTerminalCallback(t, taskID, "complete", body); w.Code != http.StatusOK {
-			t.Fatalf("fenced replay: got %d: %s, want idempotent 200", w.Code, w.Body.String())
+	t.Run("complete without a generation settles", func(t *testing.T) {
+		taskID, _ := fencedTerminalTask(t, "running", nil)
+		if w := postTerminalCallback(t, taskID, "complete", map[string]any{"output": "old daemon"}); w.Code != http.StatusOK {
+			t.Fatalf("legacy complete: got %d: %s", w.Code, w.Body.String())
 		}
 		if status, _, _, _ := taskRowState(t, taskID); status != "completed" {
 			t.Fatalf("status = %q, want completed", status)
 		}
 	})
 
-	t.Run("stale generation conflicts on the fenced route", func(t *testing.T) {
-		taskID, generation := fencedTerminalTask(t, "running", nil)
-		reclaimTask(t, taskID)
-		w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
-			"output":                 "old claim result",
-			"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusConflict {
-			t.Fatalf("fenced stale complete: got %d: %s, want 409", w.Code, w.Body.String())
+	t.Run("fail without a generation settles", func(t *testing.T) {
+		taskID, _ := fencedTerminalTask(t, "running", nil)
+		if w := postTerminalCallback(t, taskID, "fail", map[string]any{"error": "old daemon"}); w.Code != http.StatusOK {
+			t.Fatalf("legacy fail: got %d: %s", w.Code, w.Body.String())
 		}
-		if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
-			t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
-		}
-		if status, _, _, _ := taskRowState(t, taskID); status != "running" {
-			t.Fatalf("status = %q, want running (untouched)", status)
-		}
-	})
-
-	// The daemon must be able to tell a real absence from a replica that has no
-	// fenced route, so a missing task answers with the stable code instead of an
-	// ordinary unstructured 404.
-	t.Run("missing task carries the structured code", func(t *testing.T) {
-		missingTaskID := "00000000-0000-0000-0000-0000000000ff"
-		w := postFencedTerminalCallback(t, missingTaskID, "complete", map[string]any{
-			"output":                 "done",
-			"expected_dispatched_at": time.Now().UTC().Format(time.RFC3339Nano),
-		})
-		if w.Code != http.StatusNotFound {
-			t.Fatalf("fenced callback for a missing task: got %d: %s, want 404", w.Code, w.Body.String())
-		}
-		if code := responseCode(t, w); code != protocol.DaemonTaskNotFoundCode {
-			t.Fatalf("missing-task code = %q, want %q", code, protocol.DaemonTaskNotFoundCode)
-		}
-		// The legacy route answers with the same code on a current server, so a
-		// daemon can classify both surfaces the same way.
-		legacy := postTerminalCallback(t, missingTaskID, "complete", map[string]any{"output": "done"})
-		if legacy.Code != http.StatusNotFound || responseCode(t, legacy) != protocol.DaemonTaskNotFoundCode {
-			t.Fatalf("legacy missing task = %d %s, want 404 with the stable code", legacy.Code, legacy.Body.String())
+		if status, _, _, _ := taskRowState(t, taskID); status != "failed" {
+			t.Fatalf("status = %q, want failed", status)
 		}
 	})
 }

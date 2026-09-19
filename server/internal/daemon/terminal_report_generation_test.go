@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -87,18 +88,6 @@ func TestTerminalReportQueuePersistsClaimGeneration(t *testing.T) {
 		t.Fatalf("persisted claim_dispatched_at = %q, want %s", raw, report.claimGeneration.dispatchedAt)
 	}
 
-	// A different generation of the same task is a different identity, so it
-	// gets its own record instead of touching this one; the payload-conflict
-	// rules for one identity are pinned in the identity tests.
-	other := report
-	other.claimGeneration = claimGeneration{dispatchedAt: report.claimGeneration.dispatchedAt.Add(time.Second)}
-	other.output = "result of a later claim"
-	if err := store.enqueue(other); err != nil {
-		t.Fatalf("enqueue of a later claim generation: %v", err)
-	}
-	if items, err := store.list(); err != nil || len(items) != 2 {
-		t.Fatalf("queue holds %d records (%v), want the original and the later claim", len(items), err)
-	}
 }
 
 func TestTerminalReportLegacyRecordWithoutGenerationIsNeverReplayed(t *testing.T) {
@@ -157,7 +146,12 @@ func TestTerminalReportLegacyRecordWithoutGenerationIsNeverReplayed(t *testing.T
 func TestTerminalReportStaleClaimGenerationIsRetiredWithoutCompensation(t *testing.T) {
 	var failCalls atomic.Int32
 	var completeCalls atomic.Int32
+	var mu sync.Mutex
+	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		mu.Lock()
+		paths = append(paths, req.URL.Path)
+		mu.Unlock()
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/fail"):
 			failCalls.Add(1)
@@ -193,6 +187,14 @@ func TestTerminalReportStaleClaimGenerationIsRetiredWithoutCompensation(t *testi
 		t.Fatalf("/fail calls = %d, want 0: a stale completion must never fail the reclaim that owns the task",
 			failCalls.Load())
 	}
+	// A generation-aware report is only ever sent to the versioned route.
+	mu.Lock()
+	for _, path := range paths {
+		if !strings.Contains(path, "/api/daemon/v2/") {
+			t.Fatalf("stale report used a non-fenced route: %v", paths)
+		}
+	}
+	mu.Unlock()
 
 	// The payload is retained for operators instead of being discarded.
 	entries, err := os.ReadDir(d.terminalReports.failedDir())
@@ -243,7 +245,6 @@ func TestTerminalReportOrdinaryConflictStaysPending(t *testing.T) {
 	if err := d.terminalReports.enqueue(claimGenerationReport("task-ordinary-conflict")); err != nil {
 		t.Fatalf("enqueue report: %v", err)
 	}
-	serverAdvertisesFence(d)
 	pending, delivered := d.replayPendingTerminalReports(context.Background())
 	if pending != 1 || delivered != 0 {
 		t.Fatalf("ordinary conflict pending=%d delivered=%d, want 1/0", pending, delivered)
@@ -287,7 +288,6 @@ func TestTerminalReportReplayUsesThePersistedClaimGeneration(t *testing.T) {
 	}
 
 	afterRestart := New(cfg, logger)
-	serverAdvertisesFence(afterRestart)
 	pending, delivered := afterRestart.replayPendingTerminalReports(context.Background())
 	if pending != 0 || delivered != 1 {
 		t.Fatalf("restart replay pending=%d delivered=%d, want 0/1", pending, delivered)
@@ -384,37 +384,6 @@ func TestTerminalReportRefusesAnUnreadableClaimGeneration(t *testing.T) {
 	}
 }
 
-// TestTerminalReportWithoutGenerationIsDeliveredButNotStored pins the first
-// case: an older server fenced nothing, so the callback still goes out (unfenced,
-// exactly as before this fence existed) but nothing is written to the durable
-// queue, because no generation-aware record can be built for it.
-func TestTerminalReportWithoutGenerationIsDeliveredButNotStored(t *testing.T) {
-	d := New(Config{
-		ServerBaseURL:  "https://api.example.test",
-		WorkspacesRoot: t.TempDir(),
-		DaemonID:       "daemon-legacy-server",
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	var got terminalTaskReport
-	d.terminalReportSend = func(_ context.Context, report terminalTaskReport, _ []time.Duration) error {
-		got = report
-		return nil
-	}
-	report := terminalTaskReport{
-		kind: terminalTaskReportComplete, taskID: "task-legacy-server", output: "legacy answer",
-		claimGeneration: claimGenerationForTask(Task{}),
-	}
-	if err := d.reportTerminalTask(context.Background(), report); err != nil {
-		t.Fatalf("legacy callback failed: %v", err)
-	}
-	if got.taskID != report.taskID || !got.claimGeneration.dispatchedAt.IsZero() {
-		t.Fatalf("delivered report = %+v, want the unfenced original", got)
-	}
-	if items, err := d.terminalReports.list(); err != nil || len(items) != 0 {
-		t.Fatalf("queue holds %d records (%v), want 0", len(items), err)
-	}
-}
-
 func TestTaskDispatchedAtMirrorsTheClaimPayload(t *testing.T) {
 	// internal/daemon.Task is a hand-kept mirror of the server's claim response.
 	// A missing or renamed JSON tag here would silently drop the capability or
@@ -465,5 +434,88 @@ func TestTerminalReportEnqueueKeepsGenerationForEveryReportKind(t *testing.T) {
 		if len(items) != 1 || !items[0].report.claimGeneration.dispatchedAt.Equal(report.claimGeneration.dispatchedAt) {
 			t.Fatalf("kind %d lost its generation: %+v", kind, items)
 		}
+	}
+}
+
+// These two cases stay as the claim-negotiation proof: the timestamp alone is never
+// fence support, and only an advertised capability makes a claim generation-aware.
+// fenceCapableServer is an httptest server that records every terminal callback
+// path and body it receives and answers 200.
+func fenceCapableServer(t *testing.T) (*httptest.Server, func() []map[string]any, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var bodies []map[string]any
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode %s body: %v", req.URL.Path, err)
+		}
+		mu.Lock()
+		bodies = append(bodies, body)
+		paths = append(paths, req.URL.Path)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []map[string]any {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]map[string]any(nil), bodies...)
+		}, func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string(nil), paths...)
+		}
+}
+
+// TestOldServerClaimWithDispatchedAtStaysLegacy is the version-skew regression.
+// The payload is exactly what an older server sends today: a dispatched_at and
+// no fence capability. It must stay legacy — no fenced callback, no durable
+
+func TestOldServerClaimWithDispatchedAtStaysLegacy(t *testing.T) {
+	for _, dispatchedAt := range []string{
+		"2026-09-19T04:43:58Z",             // second precision, the old shape
+		"2026-09-19T04:43:58.123456Z",      // even a nanosecond-looking value
+		"2026-09-19T13:43:58.123456+09:00", // and another timezone
+	} {
+		t.Run(dispatchedAt, func(t *testing.T) {
+			var task Task
+			payload := `{"id":"task-old-server","dispatched_at":"` + dispatchedAt + `"}`
+			if err := json.Unmarshal([]byte(payload), &task); err != nil {
+				t.Fatalf("decode claim payload: %v", err)
+			}
+			if got := claimGenerationForTask(task); !got.dispatchedAt.IsZero() || got.unreadable {
+				t.Fatalf("old-server claim produced generation %s (unreadable=%v), want legacy/absent", got, got.unreadable)
+			}
+
+			srv, sentBodies, sentPaths := fenceCapableServer(t)
+			d := New(Config{
+				ServerBaseURL:  srv.URL,
+				WorkspacesRoot: t.TempDir(),
+				DaemonID:       "daemon-old-server",
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			report := terminalTaskReport{
+				kind: terminalTaskReportComplete, taskID: task.ID, output: "legacy answer",
+				claimGeneration: claimGenerationForTask(task),
+			}
+			if err := d.reportTerminalTask(context.Background(), report); err != nil {
+				t.Fatalf("legacy terminal report: %v", err)
+			}
+
+			bodies := sentBodies()
+			if len(bodies) != 1 {
+				t.Fatalf("terminal requests = %d, want the one legacy live callback", len(bodies))
+			}
+			if value, present := bodies[0]["expected_dispatched_at"]; present {
+				t.Fatalf("legacy callback carried a fence (%v); an old server ignores it", value)
+			}
+			if got := sentPaths(); len(got) != 1 || got[0] != "/api/daemon/tasks/task-old-server/complete" {
+				t.Fatalf("legacy callback paths = %v, want the legacy terminal route", got)
+			}
+			if items, err := d.terminalReports.list(); err != nil || len(items) != 0 {
+				t.Fatalf("durable queue = %d records (%v), want none for an old-server claim", len(items), err)
+			}
+		})
 	}
 }

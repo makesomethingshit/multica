@@ -922,8 +922,7 @@ func (d *Daemon) handleTerminalReportDeliveryError(ctx context.Context, item pen
 // bounded terminal schedule because there will be no later replay for it.
 //
 // Reports with no claim generation are counted as pending but never sent: they
-// cannot be fenced to the claim that produced them, and after a restart the
-// daemon cannot tell whether the task id still belongs to that claim.
+// cannot be fenced to the claim that produced them.
 func (d *Daemon) replayPendingTerminalReports(ctx context.Context) (pending, delivered int) {
 	if d.terminalReports == nil {
 		return 0, 0
@@ -991,31 +990,14 @@ func (d *Daemon) replayPendingTerminalReports(ctx context.Context) (pending, del
 	for _, item := range items {
 		if item.report.claimGeneration.dispatchedAt.IsZero() {
 			// A version-1 record from before the fence carries no claim
-			// generation, so ownership of the task id cannot be proven. Sending it
-			// could settle a task a later claim now owns; deleting it would
-			// discard the only copy of the result. Retain it and keep reporting it
-			// as pending, so an operator sees the record on every pass instead of
-			// it silently disappearing. Legacy records were already given their
-			// one unfenced delivery by the daemon that wrote them (see
-			// reportTerminalTask), so nothing legitimate is lost here.
+			// generation, so ownership cannot be proven: sending it could settle a
+			// task a later claim now owns, and deleting it would discard the only
+			// copy. Retain it, and keep it visible as pending. The daemon that
+			// wrote it already gave it its one unfenced delivery.
 			d.logger.Warn("terminal report has no claim generation; retained without delivery",
 				"task", item.report.taskID,
 				"kind", item.report.kind,
 				"file", item.fileName,
-			)
-			continue
-		}
-		if !d.serverSupportsTerminalReportFence() {
-			// The generation-aware record was produced under a server contract
-			// that promised the fence, and it keeps that generation. But the
-			// server actually connected to has not proven it enforces the fence —
-			// a restart before the first heartbeat, or a rollback to a build that
-			// ignores expected_dispatched_at — so sending it could settle a task
-			// unfenced. Retain the record and say so, on every pass, instead.
-			d.logger.Warn("terminal report held: connected server has not advertised the generation fence capability",
-				"task", item.report.taskID,
-				"kind", item.report.kind,
-				"claim_dispatched_at", item.report.claimGeneration,
 			)
 			continue
 		}

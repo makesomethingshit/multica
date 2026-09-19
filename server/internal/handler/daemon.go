@@ -1379,7 +1379,7 @@ func (h *Handler) processHeartbeat(ctx context.Context, runtimeID string, suppor
 	ack := &protocol.DaemonHeartbeatAckPayload{
 		RuntimeID:          runtimeID,
 		Status:             "ok",
-		ServerCapabilities: []string{protocol.DaemonCapabilityRPCV1, protocol.TerminalReportGenerationFenceV1},
+		ServerCapabilities: []string{protocol.DaemonCapabilityRPCV1},
 	}
 
 	probeUpdateCtx, cancelProbeUpdate := context.WithTimeout(ctx, heartbeatHasPendingTimeout)
