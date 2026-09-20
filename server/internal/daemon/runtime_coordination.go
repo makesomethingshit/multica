@@ -300,12 +300,10 @@ func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
 // the collision worse:
 //
 //  1. close the claim gate and let the claims that already entered finish their
-//     ClaimTask -> dispatch step, so no claim is left in flight under the drop
-//     (enterLegacyPeerStandby);
-//  2. per workspace, under its registration lock, stop tracking this process's
-//     runtimes and release their logical ownership claims, so a register response
-//     already in flight cannot republish what was just given up
-//     (yieldTrackedRuntimes);
+//     ClaimTask -> dispatch step (enterLegacyPeerStandby);
+//  2. per workspace, under its registration lock, drop local runtime tracking and
+//     release the logical ownership claims, so a register response already in
+//     flight cannot republish what was just given up (yieldTrackedRuntimes);
 //  3. nudge the runtime-set watchers so heartbeat and poll supervisors re-derive
 //     the empty set immediately;
 //  4. stay in standby until the peer is gone or upgraded; resumeAfterLegacyPeer
@@ -313,13 +311,12 @@ func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
 //
 // It never Deregisters these runtimes: both processes share the machine-scoped
 // daemon identity, so the row it would take offline is the row the legacy peer is
-// serving (GH #8280's sibling-shutdown failure through another path). The shared
-// row simply stops being heartbeated here.
+// serving (GH #8280's sibling-shutdown failure through another path), and the
+// shared row simply stops being heartbeated here.
 //
 // Tasks already executing are not cancelled by this daemon. The drain covers the
 // claim transition only; a task whose handleTask goroutine has not resolved its
-// runtime yet keeps the runtime_offline retry documented there, exactly as for
-// every other path that drops a runtime mid-claim.
+// runtime yet keeps the runtime_offline retry documented there.
 func (d *Daemon) yieldRuntimesToLegacyPeer(ctx context.Context, decision legacyPeerDecision) {
 	if !d.enterLegacyPeerStandby(ctx) {
 		// The daemon is shutting down: the claim gate stays closed, which is the
