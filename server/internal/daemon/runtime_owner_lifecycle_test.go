@@ -495,15 +495,10 @@ func TestRuntimeCoordination_UnresponsivePeerBlocksActivation(t *testing.T) {
 	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
 	withStagedPeerConfig(t, "desktop-host", fx.server.URL)
 
-	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
-	t.Cleanup(func() {
-		peerProbeFunc = originalProbe
-		peerHealthPortOwnedFunc = originalPort
-	})
 	// The peer does not answer.
-	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
+	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
 		return peerCoordinationStatus{}
-	}
+	}, nil)
 
 	// ...but its health port is still held: the peer is alive, just not
 	// answering (or not answering usefully), so activation is refused.
@@ -555,11 +550,7 @@ func TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes(t *testing.T) {
 	d.cfg.ServerBaseURL = fx.server.URL
 	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
 
-	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
-	t.Cleanup(func() {
-		peerProbeFunc = originalProbe
-		peerHealthPortOwnedFunc = originalPort
-	})
+	stubRuntimeCoordination(t, nil, nil)
 
 	// No peer yet: this process becomes the active owner.
 	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
@@ -663,11 +654,7 @@ func TestRuntimeCoordination_YieldIsSerializedAgainstRegistration(t *testing.T) 
 	d.cfg.ServerBaseURL = fx.server.URL
 	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
 
-	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
-	t.Cleanup(func() {
-		peerProbeFunc = originalProbe
-		peerHealthPortOwnedFunc = originalPort
-	})
+	stubRuntimeCoordination(t, nil, nil)
 
 	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
 		t.Fatalf("sync: %v", err)
@@ -944,92 +931,70 @@ func TestRuntimeOwnership_RuntimeGoneRecoversOnlyTheDeletedRuntime(t *testing.T)
 	}
 }
 
-// TestRuntimeCoordination_UnreadableLiveProfileBlocksActivation is item 4's case
-// A: a sibling profile whose configuration cannot be read leaves its backend
-// unknown, so backend identity cannot exclude it. If something is running under
-// that profile, this daemon refuses to activate rather than assume the peer
-// belongs elsewhere. That is a deliberate false positive - the log has to say
-// so, and name what to repair.
-func TestRuntimeCoordination_UnreadableLiveProfileBlocksActivation(t *testing.T) {
-	isolatedProfileHome(t)
-	fx := newBatchFixture(t)
-	fx.enableStableRuntimeIDs()
-	lockDir := scopeLockDirForTest(t, "unreadable-live-profile")
-	fx.shareRuntimeOwnership(lockDir)
-	d := fx.daemon
-	d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
-	d.cfg.ServerBaseURL = fx.server.URL
-	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
-	stageUnreadablePeerProfile(t, "broken-host")
+// TestRuntimeCoordination_UnreadableProfile covers both halves of the fail-closed
+// rule for a sibling profile whose backend cannot be established: while something
+// holds its health port this daemon stands by, because it cannot prove the peer
+// is unrelated, and a free port means the directory is stale, so normal
+// activation proceeds and a corrupt leftover cannot disable the daemon.
+func TestRuntimeCoordination_UnreadableProfile(t *testing.T) {
+	tests := []struct {
+		name        string
+		profile     string
+		portHeld    bool
+		wantBlocked bool
+	}{
+		{name: "live blocks", profile: "broken-host", portHeld: true, wantBlocked: true},
+		{name: "stale does not block", profile: "stale-host", portHeld: false, wantBlocked: false},
+	}
 
-	originalPort := peerHealthPortOwnedFunc
-	t.Cleanup(func() { peerHealthPortOwnedFunc = originalPort })
-	// Something holds that profile's health port, and there is no readable
-	// config that could prove it serves another backend.
-	peerHealthPortOwnedFunc = func(int) bool { return true }
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			isolatedProfileHome(t)
+			fx := newBatchFixture(t)
+			fx.enableStableRuntimeIDs()
+			fx.shareRuntimeOwnership(scopeLockDirForTest(t, "unreadable-"+tc.profile))
+			d := fx.daemon
+			d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
+			d.cfg.ServerBaseURL = fx.server.URL
+			fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
+			stageUnreadablePeerProfile(t, tc.profile)
+			stubRuntimeCoordination(t, nil, func(int) bool { return tc.portHeld })
 
-	decision := d.checkRuntimeCoordinationPeers(context.Background())
-	if !decision.Blocked {
-		t.Fatal("a live profile with unreadable configuration did not block activation")
-	}
-	if len(decision.Peers) != 1 {
-		t.Fatalf("decision.Peers = %v, want the unreadable peer named", decision.Peers)
-	}
-	detail := decision.Peers[0]
-	if !strings.Contains(detail, "broken-host") || !strings.Contains(detail, "configuration could not be read") {
-		t.Errorf("the block detail does not name the unreadable profile: %q", detail)
-	}
-	if !strings.Contains(detail, "cannot prove") {
-		t.Errorf("the block detail does not explain that the backend is unknown: %q", detail)
-	}
-	if strings.Contains(detail, "does not advertise runtime coordination") {
-		t.Errorf("the block detail claims a confirmed same-backend legacy peer: %q", detail)
-	}
-	if got := fx.registerCallCount(); got != 0 {
-		t.Fatalf("precondition: %d Register calls before the blocked sync", got)
-	}
-	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
-		t.Fatalf("sync while blocked: %v", err)
-	}
-	if got := fx.registerCallCount(); got != 0 {
-		t.Errorf("made %d Register calls while an unidentified daemon is running", got)
-	}
-	if d.tryEnterClaim() {
-		t.Error("work could still be claimed while the conflict is unresolved")
-	}
-}
+			decision := d.checkRuntimeCoordinationPeers(context.Background())
+			if decision.Blocked != tc.wantBlocked {
+				t.Fatalf("Blocked = %v, want %v (%v)", decision.Blocked, tc.wantBlocked, decision.Peers)
+			}
+			if tc.wantBlocked {
+				if len(decision.Peers) != 1 {
+					t.Fatalf("decision.Peers = %v, want the unreadable peer named", decision.Peers)
+				}
+				detail := decision.Peers[0]
+				if !strings.Contains(detail, tc.profile) || !strings.Contains(detail, "backend could not be established") {
+					t.Errorf("the block detail does not identify the profile and its config error: %q", detail)
+				}
+				if strings.Contains(detail, "does not advertise runtime coordination") {
+					t.Errorf("the block detail claims a confirmed same-backend legacy peer: %q", detail)
+				}
+			}
 
-// TestRuntimeCoordination_UnreadableStaleProfileDoesNotBlock is item 4's case B:
-// the fail-closed rule needs local liveness to stay bounded. An unreadable
-// profile whose health port is free has no daemon behind it, so the directory is
-// stale and normal activation proceeds - otherwise a corrupt leftover profile
-// would disable the daemon permanently.
-func TestRuntimeCoordination_UnreadableStaleProfileDoesNotBlock(t *testing.T) {
-	isolatedProfileHome(t)
-	fx := newBatchFixture(t)
-	fx.enableStableRuntimeIDs()
-	lockDir := scopeLockDirForTest(t, "unreadable-stale-profile")
-	fx.shareRuntimeOwnership(lockDir)
-	d := fx.daemon
-	d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
-	d.cfg.ServerBaseURL = fx.server.URL
-	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
-	stageUnreadablePeerProfile(t, "stale-host")
-
-	originalPort := peerHealthPortOwnedFunc
-	t.Cleanup(func() { peerHealthPortOwnedFunc = originalPort })
-	peerHealthPortOwnedFunc = func(int) bool { return false }
-
-	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
-		t.Fatalf("a stale unreadable profile blocked activation: %v", decision.Peers)
-	}
-	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
-		t.Fatalf("sync: %v", err)
-	}
-	if got := fx.registerCallCount(); got != 1 {
-		t.Errorf("Register calls = %d, want the normal registration", got)
-	}
-	if !d.ownsTarget(runtimeOwnerTarget("ws-1", "codex", "")) {
-		t.Error("the runtime was not taken after the stale profile was ignored")
+			if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
+				t.Fatalf("sync: %v", err)
+			}
+			if tc.wantBlocked {
+				if got := fx.registerCallCount(); got != 0 {
+					t.Errorf("made %d Register calls while an unidentified daemon is running", got)
+				}
+				if d.tryEnterClaim() {
+					t.Error("work could still be claimed while the conflict is unresolved")
+				}
+				return
+			}
+			if got := fx.registerCallCount(); got != 1 {
+				t.Errorf("Register calls = %d, want the normal registration", got)
+			}
+			if !d.ownsTarget(runtimeOwnerTarget("ws-1", "codex", "")) {
+				t.Error("the runtime was not taken after the stale profile was ignored")
+			}
+		})
 	}
 }

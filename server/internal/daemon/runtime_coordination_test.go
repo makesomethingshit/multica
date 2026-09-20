@@ -21,6 +21,28 @@ func withStagedPeerConfig(t *testing.T, profile, serverURL string) {
 	}
 }
 
+// stubRuntimeCoordination replaces the remote peer probe and the local liveness
+// probe for one test, restoring both when it ends. A nil argument leaves that
+// probe as the production implementation.
+func stubRuntimeCoordination(
+	t *testing.T,
+	probe func(context.Context, string) peerCoordinationStatus,
+	portOwned func(int) bool,
+) {
+	t.Helper()
+	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
+	t.Cleanup(func() {
+		peerProbeFunc = originalProbe
+		peerHealthPortOwnedFunc = originalPort
+	})
+	if probe != nil {
+		peerProbeFunc = probe
+	}
+	if portOwned != nil {
+		peerHealthPortOwnedFunc = portOwned
+	}
+}
+
 // TestRuntimeCoordination_LegacyPeerBlocksActivation is spec case 11: a live
 // same-machine, same-backend peer that does not advertise the capability stops
 // this daemon from activating a runtime.
@@ -37,13 +59,11 @@ func TestRuntimeCoordination_LegacyPeerBlocksActivation(t *testing.T) {
 	}
 
 	// The peer is alive but cannot be coordinated with (a pre-claim daemon).
-	original := peerProbeFunc
-	t.Cleanup(func() { peerProbeFunc = original })
 	probed := 0
-	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
+	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
 		probed++
 		return peerCoordinationStatus{Alive: true}
-	}
+	}, nil)
 	decision := d.checkRuntimeCoordinationPeers(context.Background())
 	if probed == 0 {
 		t.Fatal("no peer was probed")
@@ -70,11 +90,9 @@ func TestRuntimeCoordination_CoordinatingPeerDoesNotBlock(t *testing.T) {
 		cfg:    Config{ServerBaseURL: backend, Profile: ""},
 		logger: quietTaskLog(),
 	}
-	original := peerProbeFunc
-	t.Cleanup(func() { peerProbeFunc = original })
-	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
+	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
 		return peerCoordinationStatus{Alive: true, Coordinates: true}
-	}
+	}, nil)
 	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
 		t.Fatalf("a coordinating peer blocked activation: %v", decision.Peers)
 	}
@@ -93,20 +111,15 @@ func TestRuntimeCoordination_PeerOnAnotherBackendIsIgnored(t *testing.T) {
 		cfg:    Config{ServerBaseURL: "https://same.example", Profile: ""},
 		logger: quietTaskLog(),
 	}
-	original := peerProbeFunc
-	originalPort := peerHealthPortOwnedFunc
-	t.Cleanup(func() { peerProbeFunc = original })
-	t.Cleanup(func() { peerHealthPortOwnedFunc = originalPort })
-	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
+	// The port is live: a readable profile that provably serves another backend
+	// must be filtered out during discovery no matter how alive it is, and must
+	// not be probed.
+	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
 		t.Error("a peer on another backend was probed")
 		return peerCoordinationStatus{Alive: true}
-	}
-	// The port is live: a readable profile that provably serves another backend
-	// must not block, however alive it is.
-	peerHealthPortOwnedFunc = func(int) bool { return true }
-	peers := runtimeCoordinationPeers("https://same.example", "")
-	if len(peers) != 1 || peers[0].Backend != peerBackendOther {
-		t.Fatalf("peers = %+v, want one peer marked as serving another backend", peers)
+	}, func(int) bool { return true })
+	if peers := runtimeCoordinationPeers("https://same.example", ""); len(peers) != 0 {
+		t.Fatalf("peers on another backend were retained: %+v", peers)
 	}
 	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
 		t.Fatalf("a live peer on another backend blocked activation: %v", decision.Peers)
@@ -132,17 +145,11 @@ func TestRuntimeCoordination_LegacyPeerGoneAllowsActivation(t *testing.T) {
 		cfg:    Config{ServerBaseURL: backend, Profile: ""},
 		logger: quietTaskLog(),
 	}
-	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
-	t.Cleanup(func() {
-		peerProbeFunc = originalProbe
-		peerHealthPortOwnedFunc = originalPort
-	})
 	// Not alive, and the port is free: no process is running under that profile,
 	// so the profile directory is stale and activation may proceed.
-	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
+	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
 		return peerCoordinationStatus{}
-	}
-	peerHealthPortOwnedFunc = func(int) bool { return false }
+	}, func(int) bool { return false })
 	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
 		t.Fatalf("a stopped peer blocked activation: %v", decision.Peers)
 	}
