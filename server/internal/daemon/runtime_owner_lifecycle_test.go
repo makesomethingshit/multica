@@ -2,11 +2,15 @@ package daemon
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
 
@@ -79,6 +83,24 @@ func waitUntil(deadline time.Duration, condition func() bool) bool {
 		time.Sleep(time.Millisecond)
 	}
 	return condition()
+}
+
+// stageUnreadablePeerProfile creates a sibling profile whose config exists but
+// cannot be parsed, which is the state that leaves the peer's backend unknown.
+// The directory is what makes the peer discoverable; the broken file is what
+// makes it unattributable.
+func stageUnreadablePeerProfile(t *testing.T, profile string) {
+	t.Helper()
+	path, err := cli.CLIConfigPathForProfile(profile)
+	if err != nil {
+		t.Fatalf("resolve config path for %q: %v", profile, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create profile dir for %q: %v", profile, err)
+	}
+	if err := os.WriteFile(path, []byte("{ this is not a config"), 0o644); err != nil {
+		t.Fatalf("write unreadable config for %q: %v", profile, err)
+	}
 }
 
 func countString(got []string, want string) int {
@@ -821,6 +843,13 @@ func TestRuntimeCoordination_YieldWaitsForClaimsInFlight(t *testing.T) {
 // transition drains the claim step only. A task that is already executing keeps
 // running and is not waited for - the acceptance requirement is "no new work
 // starts", not "drain in flight".
+//
+// The invariant under test is LOCAL: the yield neither waits for nor cancels
+// active tasks. It is NOT "active tasks survive a late legacy daemon" - this
+// test does not start a real legacy process, and it cannot prove anything about
+// what one would do. A legacy binary does not participate in the ownership
+// protocol and may run its own startup recovery against the shared runtime row,
+// which is outside this daemon's control (see yieldRuntimesToLegacyPeer).
 func TestRuntimeCoordination_YieldDoesNotWaitForRunningTasks(t *testing.T) {
 	isolatedProfileHome(t)
 	fx := newBatchFixture(t)
@@ -912,5 +941,95 @@ func TestRuntimeOwnership_RuntimeGoneRecoversOnlyTheDeletedRuntime(t *testing.T)
 	}
 	if !fx.runtimeOnline(codexRuntime) {
 		t.Error("the re-registered runtime was not brought back online")
+	}
+}
+
+// TestRuntimeCoordination_UnreadableLiveProfileBlocksActivation is item 4's case
+// A: a sibling profile whose configuration cannot be read leaves its backend
+// unknown, so backend identity cannot exclude it. If something is running under
+// that profile, this daemon refuses to activate rather than assume the peer
+// belongs elsewhere. That is a deliberate false positive - the log has to say
+// so, and name what to repair.
+func TestRuntimeCoordination_UnreadableLiveProfileBlocksActivation(t *testing.T) {
+	isolatedProfileHome(t)
+	fx := newBatchFixture(t)
+	fx.enableStableRuntimeIDs()
+	lockDir := scopeLockDirForTest(t, "unreadable-live-profile")
+	fx.shareRuntimeOwnership(lockDir)
+	d := fx.daemon
+	d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
+	d.cfg.ServerBaseURL = fx.server.URL
+	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
+	stageUnreadablePeerProfile(t, "broken-host")
+
+	originalPort := peerHealthPortOwnedFunc
+	t.Cleanup(func() { peerHealthPortOwnedFunc = originalPort })
+	// Something holds that profile's health port, and there is no readable
+	// config that could prove it serves another backend.
+	peerHealthPortOwnedFunc = func(int) bool { return true }
+
+	decision := d.checkRuntimeCoordinationPeers(context.Background())
+	if !decision.Blocked {
+		t.Fatal("a live profile with unreadable configuration did not block activation")
+	}
+	if len(decision.Peers) != 1 {
+		t.Fatalf("decision.Peers = %v, want the unreadable peer named", decision.Peers)
+	}
+	detail := decision.Peers[0]
+	if !strings.Contains(detail, "broken-host") || !strings.Contains(detail, "configuration could not be read") {
+		t.Errorf("the block detail does not name the unreadable profile: %q", detail)
+	}
+	if !strings.Contains(detail, "cannot prove") {
+		t.Errorf("the block detail does not explain that the backend is unknown: %q", detail)
+	}
+	if strings.Contains(detail, "does not advertise runtime coordination") {
+		t.Errorf("the block detail claims a confirmed same-backend legacy peer: %q", detail)
+	}
+	if got := fx.registerCallCount(); got != 0 {
+		t.Fatalf("precondition: %d Register calls before the blocked sync", got)
+	}
+	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
+		t.Fatalf("sync while blocked: %v", err)
+	}
+	if got := fx.registerCallCount(); got != 0 {
+		t.Errorf("made %d Register calls while an unidentified daemon is running", got)
+	}
+	if d.tryEnterClaim() {
+		t.Error("work could still be claimed while the conflict is unresolved")
+	}
+}
+
+// TestRuntimeCoordination_UnreadableStaleProfileDoesNotBlock is item 4's case B:
+// the fail-closed rule needs local liveness to stay bounded. An unreadable
+// profile whose health port is free has no daemon behind it, so the directory is
+// stale and normal activation proceeds - otherwise a corrupt leftover profile
+// would disable the daemon permanently.
+func TestRuntimeCoordination_UnreadableStaleProfileDoesNotBlock(t *testing.T) {
+	isolatedProfileHome(t)
+	fx := newBatchFixture(t)
+	fx.enableStableRuntimeIDs()
+	lockDir := scopeLockDirForTest(t, "unreadable-stale-profile")
+	fx.shareRuntimeOwnership(lockDir)
+	d := fx.daemon
+	d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
+	d.cfg.ServerBaseURL = fx.server.URL
+	fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
+	stageUnreadablePeerProfile(t, "stale-host")
+
+	originalPort := peerHealthPortOwnedFunc
+	t.Cleanup(func() { peerHealthPortOwnedFunc = originalPort })
+	peerHealthPortOwnedFunc = func(int) bool { return false }
+
+	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
+		t.Fatalf("a stale unreadable profile blocked activation: %v", decision.Peers)
+	}
+	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if got := fx.registerCallCount(); got != 1 {
+		t.Errorf("Register calls = %d, want the normal registration", got)
+	}
+	if !d.ownsTarget(runtimeOwnerTarget("ws-1", "codex", "")) {
+		t.Error("the runtime was not taken after the stale profile was ignored")
 	}
 }

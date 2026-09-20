@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,14 +25,24 @@ import (
 // this revision exists to prevent. Nothing inside the lock can detect that,
 // because the legacy process is not misbehaving by its own rules.
 //
-// So a new daemon refuses to ACTIVATE a runtime while it can see a live
-// same-machine, same-backend peer that does not advertise the coordination
-// capability. The advertisement is additive on the health surface every daemon
-// already exposes per profile, so no new protocol is needed.
+// So a new daemon refuses to ACTIVATE a runtime while it can see a live peer
+// that may be serving the same machine-scoped runtime: a same-backend peer that
+// does not advertise the coordination capability, or a live profile whose
+// configuration cannot be read and therefore cannot be shown to belong to
+// another backend. The advertisement is additive on the health surface every
+// daemon already exposes per profile, so no new protocol is needed.
 //
 // This is a fail-closed standby rather than a startup abort: the new daemon keeps
 // probing and takes over once the legacy peer is gone, which is the same takeover
 // path an owner crash uses.
+//
+// The guarantee is one-DIRECTIONAL, because only that direction is enforceable:
+// this process controls whether ITSELF activates. A legacy process that starts
+// afterwards neither takes the ownership claim nor knows this daemon is standing
+// by, so it can still register the shared runtime and run its own startup work
+// against it. Detecting that then makes this daemon yield its local serving
+// authority (yieldRuntimesToLegacyPeer) - mitigation of a conflict that already
+// exists, not coordination with the process that caused it.
 
 // RuntimeCoordinationVersion is the capability a daemon advertises when it
 // participates in the runtime-owner claim. Additive: a peer that does not
@@ -54,7 +65,30 @@ type runtimeCoordinationPeer struct {
 	// Port is the peer profile's health port, kept beside the URL because the
 	// local liveness check below has to dial it as a plain TCP port.
 	Port int
+	// Backend is what this daemon could prove about the peer's configured
+	// backend. Only a peer that provably serves ANOTHER backend may be ignored
+	// without further evidence - see checkRuntimeCoordinationPeers.
+	Backend peerBackend
+	// ConfigErr is why the peer's backend is unknown, when it is. Kept so the
+	// actionable log can name the file the operator has to repair.
+	ConfigErr error
 }
+
+// peerBackend is the backend evidence available for one sibling profile.
+type peerBackend int
+
+const (
+	// peerBackendSame: the profile's config names this daemon's backend, so the
+	// peer can be contending for the same server runtimes.
+	peerBackendSame peerBackend = iota
+	// peerBackendOther: the profile's config names a different backend, so it
+	// cannot be addressing this daemon's runtime rows.
+	peerBackendOther
+	// peerBackendUnknown: the profile exists but its config could not be read,
+	// so its backend cannot be established. Backend identity cannot exclude it;
+	// only the local liveness signal can.
+	peerBackendUnknown
+)
 
 // runtimeCoordinationPeers lists the health endpoints of every OTHER Multica
 // profile on this machine that points at the same normalized backend.
@@ -62,9 +96,13 @@ type runtimeCoordinationPeer struct {
 // The profile directories are the machine-local inventory of daemon processes:
 // each profile owns one config (its backend) and one health port, both derived
 // from names the daemon itself computed, so no service discovery or registry is
-// needed. A profile whose config cannot be read is skipped rather than guessed
-// at - an unreadable peer is indistinguishable from an absent one, and treating
-// it as absent is the unsafe direction.
+// needed.
+//
+// A profile whose config cannot be read is NOT skipped. Its backend is unknown,
+// which is precisely the case backend identity cannot settle: dropping it here
+// would let a live daemon this process cannot identify be ignored, and the only
+// remaining evidence - whether something holds that profile's health port - is
+// the caller's to weigh.
 func runtimeCoordinationPeers(backend string, ownProfile string) []runtimeCoordinationPeer {
 	root, err := cli.ProfileDir("")
 	if err != nil {
@@ -89,24 +127,41 @@ func runtimeCoordinationPeers(backend string, ownProfile string) []runtimeCoordi
 		if name == ownProfile {
 			continue
 		}
+		port := healthPortForProfile(name)
+		peer := runtimeCoordinationPeer{
+			Profile: name,
+			URL:     fmt.Sprintf("http://127.0.0.1:%d/health", port),
+			Port:    port,
+			Backend: peerBackendUnknown,
+		}
 		cfg, err := cli.LoadCLIConfigForProfile(name)
 		if err != nil {
+			peer.ConfigErr = err
+			peers = append(peers, peer)
 			continue
 		}
 		raw := strings.TrimSpace(cfg.ServerURL)
 		if raw == "" {
+			// A profile with no recorded backend is the same evidence gap as one
+			// whose config cannot be parsed: nothing here proves which runtime
+			// rows it could be addressing.
+			peer.ConfigErr = errors.New("profile config records no server URL")
+			peers = append(peers, peer)
 			continue
 		}
 		peerBackend, err := NormalizeServerBaseURL(raw)
-		if err != nil || peerBackend != backend {
+		if err != nil {
+			peer.ConfigErr = err
+			peers = append(peers, peer)
 			continue
 		}
-		port := healthPortForProfile(name)
-		peers = append(peers, runtimeCoordinationPeer{
-			Profile: name,
-			URL:     fmt.Sprintf("http://127.0.0.1:%d/health", port),
-			Port:    port,
-		})
+		if peerBackend != backend {
+			peer.Backend = peerBackendOther
+			peers = append(peers, peer)
+			continue
+		}
+		peer.Backend = peerBackendSame
+		peers = append(peers, peer)
 	}
 	return peers
 }
@@ -198,6 +253,24 @@ func (d *legacyPeerDecision) block(detail string) {
 	d.Peers = append(d.Peers, detail)
 }
 
+// blockUnreadable records a peer whose configuration could not be read while
+// something is running under its profile.
+//
+// This is a deliberate false-positive standby: the peer may well belong to
+// another backend, and this daemon cannot prove either way. The message must
+// not claim it is a confirmed same-backend peer, and it has to name the reason
+// so the operator can repair the file that caused it.
+func (d *legacyPeerDecision) blockUnreadable(peer runtimeCoordinationPeer, label string) {
+	detail := fmt.Sprintf("%s (%s) is running - port %d is held - but its configuration could not be read",
+		label, peer.URL, peer.Port)
+	if peer.ConfigErr != nil {
+		detail += " (" + peer.ConfigErr.Error() + ")"
+	}
+	detail += "; this daemon cannot prove the peer belongs to another backend, so runtime activation is refused " +
+		"to avoid an uncoordinated same-runtime collision"
+	d.block(detail)
+}
+
 // peerHealthPortOwnedFunc probes the local liveness signal for a peer that did
 // not answer its health endpoint. Indirected so tests can model a stale profile
 // directory and a slow-but-live peer without standing up a listener.
@@ -229,14 +302,15 @@ func peerHealthPortOwned(port int) bool {
 	return true
 }
 
-// checkRuntimeCoordinationPeers probes every same-backend sibling and reports
-// whether any of them is a live daemon that cannot be coordinated with.
+// checkRuntimeCoordinationPeers inspects every sibling profile that could be
+// contending for this machine's runtime rows and reports whether any of them is
+// a daemon this process must not activate a runtime against.
 //
 // A coordinating peer is not a blocker: it takes the same owner claim this
 // process does, so the claim - not this probe - decides which of them serves a
 // runtime, and the loser reports peer-owned candidates as standby.
 //
-// The other two outcomes are kept apart, and that is the fail-safe part:
+// The remaining outcomes are kept apart, and that is the fail-safe part:
 //
 //   - a peer that answered without the capability is a live legacy daemon. It
 //     does not take the claim, so nothing else can exclude it - this process has
@@ -246,6 +320,13 @@ func peerHealthPortOwned(port int) bool {
 //     its health port is consulted before this process concludes anything. Only
 //     a free port - proof that no daemon runs under that profile - lets
 //     activation proceed.
+//   - a peer whose configuration could not be read has an UNKNOWN backend, so
+//     backend identity cannot exclude it either. Only its health port can: held
+//     means a daemon this process cannot identify is running, and that is a
+//     standby rather than a guess. A free port says the profile directory is
+//     stale and nothing is serving under it.
+//   - a peer whose configuration proves it serves a different backend cannot be
+//     addressing this daemon's runtime rows, so it is not even probed.
 func (d *Daemon) checkRuntimeCoordinationPeers(ctx context.Context) legacyPeerDecision {
 	peers := runtimeCoordinationPeers(d.cfg.ServerBaseURL, d.cfg.Profile)
 	if len(peers) == 0 {
@@ -256,6 +337,15 @@ func (d *Daemon) checkRuntimeCoordinationPeers(ctx context.Context) legacyPeerDe
 		label := peer.Profile
 		if label == "" {
 			label = "default profile"
+		}
+		switch peer.Backend {
+		case peerBackendOther:
+			continue
+		case peerBackendUnknown:
+			if peerHealthPortOwnedFunc(peer.Port) {
+				decision.blockUnreadable(peer, label)
+			}
+			continue
 		}
 		status := peerProbeFunc(ctx, peer.URL)
 		switch {
@@ -272,8 +362,11 @@ func (d *Daemon) checkRuntimeCoordinationPeers(ctx context.Context) legacyPeerDe
 
 // logLegacyPeerStandby records the actionable reason a daemon is standing by.
 func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
-	d.logger.Warn("another Multica daemon on this machine serves the same backend but does not support runtime coordination; "+
-		"standing by so this process cannot activate a runtime that peer is already serving. "+
+	// The header deliberately does not claim a confirmed same-backend peer: an
+	// unreadable profile blocks without that proof, and the per-peer details
+	// below carry which evidence produced the standby.
+	d.logger.Warn("another Multica daemon on this machine may be serving this backend without runtime coordination; "+
+		"standing by so this process cannot activate a runtime a peer may already be serving. "+
 		"Update that daemon (or stop it) to hand the runtime over.",
 		"peers", decision.Peers)
 }
@@ -281,11 +374,17 @@ func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
 // yieldRuntimesToLegacyPeer is the transition for a live uncoordinated peer that
 // appears AFTER this process already started serving runtimes.
 //
-// Refusing to activate is only half the mixed-version guarantee. Simply
-// returning from the sync leaves this process claiming tasks, heartbeating and
-// re-registering runtimes that the legacy peer serves at the same time, which is
-// the two-owners failure the whole revision exists to prevent (GH #8280). So the
-// transition is explicit, and ordered:
+// This is mitigation, not coordination, and the difference matters. A new daemon
+// can enforce the other direction because it controls whether itself activates:
+// it refuses to start serving while an already-running legacy peer is visible.
+// A legacy peer that starts afterwards is outside that authority - it does not
+// take the ownership claim, does not read runtime_coordination_version, and
+// cannot see this process's standby state, so nothing here can stop it from
+// registering the shared runtime (same machine-scoped daemon_id) or from running
+// its own startup work against it, orphan recovery included. What this
+// transition can do is stop this daemon from making the collision worse the
+// moment the conflict is detected, which is what the two-owners failure needs to
+// stop spreading (GH #8280):
 //
 //  1. close the claim gate and let the claims that already entered finish their
 //     ClaimTask -> dispatch step (enterLegacyPeerStandby), so no claim is left
@@ -312,10 +411,12 @@ func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
 // nobody heartbeats it, and the reconcile below re-registers it when the peer is
 // gone.
 //
-// Tasks already running are NOT cancelled: the server has routed them and this
-// process is the only one that can finish them, so the boundary this revision
-// fixes is "no new work starts", not "drain in flight". That boundary is
-// deliberate and covered by TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes.
+// Tasks already executing are not cancelled by the yielding daemon itself: the
+// server has routed them and this process is the only one that can finish them,
+// so the boundary is "no new work starts", not "drain in flight". That is a
+// statement about THIS daemon, not about the peer - see the mitigation note
+// above, and TestRuntimeCoordination_YieldDoesNotWaitForRunningTasks, which pins
+// the local behaviour and deliberately does not model a legacy startup.
 //
 // The drain covers the claim transition - ClaimTask through the dispatch
 // accounting that exitClaim releases. A task whose handleTask goroutine has not
@@ -324,11 +425,11 @@ func (d *Daemon) logLegacyPeerStandby(decision legacyPeerDecision) {
 // that drops a runtime mid-claim. Waiting for those goroutines would mean
 // waiting for task execution, which this transition deliberately does not do.
 //
-// A task that is already executing is unaffected by the drop: its terminal and
-// cleanup paths read no runtimeIndex entry, and the only two lookups that do are
-// handleTask's entry check and runTask's custom-profile command lookup, both of
-// which predate this transition and behave the same for every other path that
-// stops serving a runtime.
+// A task that is already executing is unaffected by THIS daemon's drop: its
+// terminal and cleanup paths read no runtimeIndex entry, and the only two
+// lookups that do are handleTask's entry check and runTask's custom-profile
+// command lookup, both of which predate this transition and behave the same for
+// every other path that stops serving a runtime.
 func (d *Daemon) yieldRuntimesToLegacyPeer(ctx context.Context, decision legacyPeerDecision) {
 	if !d.enterLegacyPeerStandby(ctx) {
 		// The daemon is shutting down: the claim gate stays closed, which is the

@@ -94,16 +94,22 @@ func TestRuntimeCoordination_PeerOnAnotherBackendIsIgnored(t *testing.T) {
 		logger: quietTaskLog(),
 	}
 	original := peerProbeFunc
+	originalPort := peerHealthPortOwnedFunc
 	t.Cleanup(func() { peerProbeFunc = original })
+	t.Cleanup(func() { peerHealthPortOwnedFunc = originalPort })
 	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
 		t.Error("a peer on another backend was probed")
 		return peerCoordinationStatus{Alive: true}
 	}
-	if peers := runtimeCoordinationPeers("https://same.example", ""); len(peers) != 0 {
-		t.Fatalf("peers on another backend were enumerated: %v", peers)
+	// The port is live: a readable profile that provably serves another backend
+	// must not block, however alive it is.
+	peerHealthPortOwnedFunc = func(int) bool { return true }
+	peers := runtimeCoordinationPeers("https://same.example", "")
+	if len(peers) != 1 || peers[0].Backend != peerBackendOther {
+		t.Fatalf("peers = %+v, want one peer marked as serving another backend", peers)
 	}
 	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
-		t.Fatal("a peer on another backend blocked activation")
+		t.Fatalf("a live peer on another backend blocked activation: %v", decision.Peers)
 	}
 }
 
