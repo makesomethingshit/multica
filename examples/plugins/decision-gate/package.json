@@ -1,0 +1,15 @@
+{
+  "name": "@multica/decision-gate-plugin-server",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/main.mjs",
+    "test": "node server/manager.test.mjs"
+  },
+  "dependencies": {
+    "@receptron/laya": "1.0.3"
+  }
+}

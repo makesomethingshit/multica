@@ -1,0 +1,76 @@
+{
+  "manifest_version": 1,
+  "key": "ai.multica.decision-gate",
+  "name": "Decision Gate",
+  "description": "Provides one bounded decision tool backed by a lazy local decision model. The model is never used for final architecture, root-cause, merge, or blocker decisions.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Multica",
+    "url": "https://multica.ai"
+  },
+  "scopes": [
+    "net:decision-gate.example.com"
+  ],
+  "config": {
+    "decision_credential": {
+      "type": "secret",
+      "label": "Decision Gate server token",
+      "description": "Bearer token accepted by the Decision Gate MCP server.",
+      "required": true
+    }
+  },
+  "contributes": {
+    "hooks": [
+      {
+        "key": "decision",
+        "name": "Decision",
+        "description": "Make one small, bounded, closed-option judgment. Use for relevance filtering, routing, triage, retry/skip choices, taxonomy, or candidate prioritization. Treat the result and confidence as evidence, never as truth. Do not use for root-cause conclusions, architectural correctness, final merge/blocker decisions, or destructive actions.",
+        "input_schema": {
+          "type": "object",
+          "required": ["state", "question", "options", "mode"],
+          "properties": {
+            "state": {
+              "description": "Only the concise evidence needed for this bounded judgment.",
+              "oneOf": [
+                { "type": "string" },
+                { "type": "object" }
+              ]
+            },
+            "question": {
+              "type": "string",
+              "description": "One narrow question with an explicit candidate set."
+            },
+            "options": {
+              "type": "object",
+              "description": "Option ids mapped to short descriptions; keep the set mutually understandable and small.",
+              "additionalProperties": { "type": "string" }
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["choice", "boolean", "score"]
+            },
+            "backend": {
+              "type": "string",
+              "enum": ["auto", "laya", "von", "llama_cpp", "decider"],
+              "default": "auto"
+            }
+          },
+          "additionalProperties": false
+        },
+        "triggers": ["agent"],
+        "transport": {
+          "type": "mcp",
+          "url": "https://decision-gate.example.com/mcp"
+        },
+        "timeout_ms": 30000
+      }
+    ],
+    "resources": [
+      {
+        "type": "skill",
+        "key": "decision-gate",
+        "entry": "skills/decision-gate/SKILL.md"
+      }
+    ]
+  }
+}
