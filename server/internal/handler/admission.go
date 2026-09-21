@@ -37,6 +37,8 @@ const (
 	// DispatchDeferred: admitted but intentionally not started yet (e.g. a
 	// backlog issue parked until promotion, or suppress_run).
 	DispatchDeferred DispatchStatus = "deferred"
+	// DispatchSteering: the comment was durably assigned to the current turn.
+	DispatchSteering DispatchStatus = "steering"
 	// DispatchBlocked: the run was refused. ReasonCode carries why.
 	DispatchBlocked DispatchStatus = "blocked"
 )
@@ -53,6 +55,7 @@ const (
 	ReasonQueued                = dispatch.ReasonQueued
 	ReasonCoalesced             = dispatch.ReasonCoalesced
 	ReasonDeferred              = dispatch.ReasonDeferred
+	ReasonSteering              = dispatch.ReasonSteering
 	ReasonInvocationNotAllowed  = dispatch.ReasonInvocationNotAllowed
 	ReasonTargetUnavailable     = dispatch.ReasonTargetUnavailable
 	ReasonRuntimeOffline        = dispatch.ReasonRuntimeOffline

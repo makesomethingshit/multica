@@ -74,6 +74,10 @@ func TestBuildMetaSkillContentBriefContent(t *testing.T) {
 	if strings.Contains(out, "Get full issue details.") {
 		t.Errorf("brief still carries the retired legacy `issue get` description\n---\n%s", out)
 	}
+	if !strings.Contains(out, "A `[STEER]` message is a human comment delivered while this turn is active") ||
+		!strings.Contains(out, "preserving the original objective unless the message explicitly changes it") {
+		t.Errorf("brief is missing active-turn steer framing\n---\n%s", out)
+	}
 }
 
 // TestBuildMetaSkillContentIssueBodyFormatting pins the shared issue-body

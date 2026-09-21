@@ -82,7 +82,15 @@ type CommentResponse struct {
 	// was blocked (no invoke permission, target unavailable, runtime offline) now
 	// reports that here instead of silently dropping the trigger, so the client
 	// can show "comment posted, but N targets were not triggered".
-	TriggerOutcomes []CommentTriggerOutcome `json:"trigger_outcomes,omitempty"`
+	TriggerOutcomes []CommentTriggerOutcome        `json:"trigger_outcomes,omitempty"`
+	AgentDeliveries []CommentAgentDeliveryResponse `json:"agent_deliveries,omitempty"`
+}
+
+type CommentAgentDeliveryResponse struct {
+	AgentID     string  `json:"agent_id"`
+	AgentName   string  `json:"agent_name"`
+	Status      string  `json:"status"` // pending | delivered | follow_up
+	DeliveredAt *string `json:"delivered_at,omitempty"`
 }
 
 // CommentTriggerOutcome is the per-target result of an explicit @agent / @squad
@@ -644,11 +652,13 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 	}
 	grouped := h.groupReactions(r, commentIDs)
 	groupedAtt := h.groupAttachments(r, commentIDs)
+	deliveries := h.groupCommentAgentDeliveries(r.Context(), commentIDs)
 
 	resp := make([]CommentResponse, len(result.Comments))
 	for i, c := range result.Comments {
 		cid := uuidToString(c.ID)
 		resp[i] = commentToResponse(c, grouped[cid], groupedAtt[cid])
+		resp[i].AgentDeliveries = deliveries[cid]
 		// Attach roots_only orientation stats when present (nil map elsewhere).
 		if st, ok := result.RootStats[cid]; ok {
 			rc := st.ReplyCount
@@ -1502,6 +1512,7 @@ type CommentTriggerAgentResponse struct {
 	AvatarURL *string `json:"avatar_url,omitempty"`
 	Source    string  `json:"source"`
 	Reason    string  `json:"reason"`
+	Delivery  string  `json:"delivery"` // current_run | follow_up
 }
 
 type commentAgentTriggerSource string
@@ -1553,13 +1564,14 @@ func commentAgentTriggerReason(trigger commentAgentTrigger) string {
 	}
 }
 
-func (h *Handler) commentAgentTriggerToResponse(trigger commentAgentTrigger) CommentTriggerAgentResponse {
+func (h *Handler) commentAgentTriggerToResponse(trigger commentAgentTrigger, delivery string) CommentTriggerAgentResponse {
 	return CommentTriggerAgentResponse{
 		ID:        uuidToString(trigger.Agent.ID),
 		Name:      trigger.Agent.Name,
 		AvatarURL: h.resolveAvatarURLPtr(textToPtr(trigger.Agent.AvatarUrl)),
 		Source:    string(trigger.Source),
 		Reason:    commentAgentTriggerReason(trigger),
+		Delivery:  delivery,
 	}
 }
 
@@ -1644,8 +1656,21 @@ func (h *Handler) PreviewCommentTriggers(w http.ResponseWriter, r *http.Request)
 		Agents:  make([]CommentTriggerAgentResponse, 0, len(triggers)),
 		Blocked: commentBlockedTargetOutcomes(targets),
 	}
+	steerHeadSHA := pgtype.Text{}
+	if actorType == "member" && editingComment == nil && parentID.Valid {
+		steerHeadSHA = h.TaskService.ResolveIssueReviewSHAParam(r.Context(), issue.ID)
+	}
 	for _, trigger := range triggers {
-		resp.Agents = append(resp.Agents, h.commentAgentTriggerToResponse(trigger))
+		delivery := "follow_up"
+		if actorType == "member" && editingComment == nil && parentID.Valid {
+			count, err := h.Queries.CountSteerableTasksForComment(r.Context(), db.CountSteerableTasksForCommentParams{
+				IssueID: issue.ID, AgentID: trigger.Agent.ID, CommentID: parentID, HeadSha: steerHeadSHA,
+			})
+			if err == nil && count == 1 {
+				delivery = "current_run"
+			}
+		}
+		resp.Agents = append(resp.Agents, h.commentAgentTriggerToResponse(trigger, delivery))
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -1678,6 +1703,7 @@ func taskCoversReplyParent(task db.AgentTaskQueue, parentID pgtype.UUID) bool {
 }
 
 func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
+	r = h.withWakeupActor(r)
 	issueID := chi.URLParam(r, "id")
 	issue, ok := h.loadIssueForUser(w, r, issueID)
 	if !ok {
@@ -1884,7 +1910,7 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 		// still pins the requested set: an attachment deleted while this waited
 		// is refused before the comment is committed, rather than the comment
 		// committing without it.
-		tx, beginErr := h.TxStarter.Begin(r.Context())
+		tx, beginErr := h.beginWakeupWrite(r.Context())
 		if beginErr != nil {
 			slog.Warn("create comment failed", append(logger.RequestAttrs(r), "error", beginErr, "issue_id", issueID)...)
 			writeError(w, http.StatusInternalServerError, "failed to create comment: "+beginErr.Error())
@@ -1912,7 +1938,9 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 			err = tx.Commit(r.Context())
 		}
 	} else {
-		created, err = h.Queries.CreateComment(r.Context(), createParams)
+		created, err = wakeupWrite(h, r, func(q *db.Queries) (db.CreateCommentRow, error) {
+			return q.CreateComment(r.Context(), createParams)
+		})
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The issue was deleted, possibly while this waited for its row lock.
@@ -1944,15 +1972,68 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 	// so the reply is visible regardless of the unresolve outcome. Shared with
 	// the agent task path (TaskService.createAgentComment) — both reply paths
 	// must keep the resolved root in sync.
-	h.TaskService.AutoUnresolveThreadOnReply(r.Context(), rootComment, uuidToString(issue.WorkspaceID), authorType, authorID)
+	h.TaskService.AutoUnresolveThreadOnReply(r.Context(), rootComment, uuidToString(issue.WorkspaceID), authorType, authorID, h.wakeupSourceTaskID(r))
 
 	originatorUserID := h.invokeOriginatorFromRequest(r, authorType, authorID)
 	// The comment is already saved; a blocked mention must not fail the whole
 	// request. Surface the per-target outcomes so the client can show partial
 	// success instead of a silent no-op (MUL-4525 §2).
 	resp.TriggerOutcomes = h.triggerTasksForComment(r.Context(), issue, comment, parentComment, authorType, authorID, originatorUserID, suppressAgentIDs)
+	resp.AgentDeliveries = h.groupCommentAgentDeliveries(r.Context(), []pgtype.UUID{comment.ID})[uuidToString(comment.ID)]
+	if len(resp.AgentDeliveries) > 0 {
+		h.publish(protocol.EventCommentUpdated, uuidToString(issue.WorkspaceID), "system", "", map[string]any{
+			"comment": resp, "issue_revision": created.IssueRevision,
+		})
+	}
 
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (h *Handler) groupCommentAgentDeliveries(ctx context.Context, commentIDs []pgtype.UUID) map[string][]CommentAgentDeliveryResponse {
+	grouped := make(map[string][]CommentAgentDeliveryResponse)
+	if len(commentIDs) == 0 {
+		return grouped
+	}
+	rows, err := h.Queries.ListCommentAgentDeliveries(ctx, commentIDs)
+	if err != nil {
+		slog.Warn("list comment agent deliveries failed", "error", err)
+		return grouped
+	}
+	for _, row := range rows {
+		status := row.Status
+		if status == "steering" {
+			status = "pending"
+		}
+		grouped[uuidToString(row.CommentID)] = append(grouped[uuidToString(row.CommentID)], CommentAgentDeliveryResponse{
+			AgentID: uuidToString(row.AgentID), AgentName: row.AgentName, Status: status,
+			DeliveredAt: timestampToPtr(row.DeliveredAt),
+		})
+	}
+	return grouped
+}
+
+func (h *Handler) publishCommentDeliveryUpdate(r *http.Request, commentID pgtype.UUID) {
+	comment, err := h.Queries.GetComment(r.Context(), commentID)
+	if err != nil {
+		return
+	}
+	issue, err := h.Queries.GetIssue(r.Context(), comment.IssueID)
+	if err != nil {
+		return
+	}
+	id := uuidToString(comment.ID)
+	resp := commentToResponse(comment, h.groupReactions(r, []pgtype.UUID{comment.ID})[id], h.groupAttachments(r, []pgtype.UUID{comment.ID})[id])
+	resp.IssueRevision = issue.Revision
+	resp.AgentDeliveries = h.groupCommentAgentDeliveries(r.Context(), []pgtype.UUID{comment.ID})[id]
+	h.publish(protocol.EventCommentUpdated, uuidToString(issue.WorkspaceID), "system", "", map[string]any{
+		"comment": resp, "issue_revision": issue.Revision,
+	})
+}
+
+func (h *Handler) publishCommentDeliveryUpdates(r *http.Request, commentIDs []pgtype.UUID) {
+	for _, commentID := range commentIDs {
+		h.publishCommentDeliveryUpdate(r, commentID)
+	}
 }
 
 // clientAuthorableCommentTypes is what POST /comments accepts. `status_change`
@@ -2001,7 +2082,7 @@ func (h *Handler) triggerTasksForComment(ctx context.Context, issue db.Issue, co
 	})
 	triggers = filterSuppressedCommentAgentTriggers(triggers, suppressAgentIDs)
 	h.noteBlockedRuntimeTargets(ctx, issue, targets)
-	enqueued := h.enqueueCommentAgentTriggers(ctx, issue, comment.ID, triggers)
+	enqueued := h.enqueueCommentAgentTriggersWithSteer(ctx, issue, comment.ID, triggers, actorType == "member")
 	return commentTriggerOutcomes(targets, enqueued)
 }
 
@@ -2069,10 +2150,18 @@ type commentEnqueueResult struct {
 // executing agent) and returns the result keyed by executing agent id
 // (MUL-4525 §2). Outcomes are later fanned from these to every explicit mention
 // target that resolved to the agent, so coalescing a run never drops a named
-// target's outcome. queued / coalesced / deferred are success-shaped (the run
-// was handled, no duplicate task); only a real enqueue failure is blocked.
+// target's outcome. steering / queued / coalesced / deferred are success-shaped
+// (the run was handled, no duplicate task); only a real enqueue failure is blocked.
 func (h *Handler) enqueueCommentAgentTriggers(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, triggers []commentAgentTrigger) map[string]commentEnqueueResult {
+	return h.enqueueCommentAgentTriggersWithSteer(ctx, issue, triggerCommentID, triggers, false)
+}
+
+func (h *Handler) enqueueCommentAgentTriggersWithSteer(ctx context.Context, issue db.Issue, triggerCommentID pgtype.UUID, triggers []commentAgentTrigger, allowSteer bool) map[string]commentEnqueueResult {
 	results := make(map[string]commentEnqueueResult, len(triggers))
+	steerHeadSHA := pgtype.Text{}
+	if allowSteer {
+		steerHeadSHA = h.TaskService.ResolveIssueReviewSHAParam(ctx, issue.ID)
+	}
 	record := func(trigger commentAgentTrigger, status DispatchStatus, reason DispatchReasonCode) {
 		execSquadID := ""
 		if trigger.Squad != nil {
@@ -2081,7 +2170,59 @@ func (h *Handler) enqueueCommentAgentTriggers(ctx context.Context, issue db.Issu
 		results[uuidToString(trigger.Agent.ID)] = commentEnqueueResult{status: status, reason: reason, execSquadID: execSquadID}
 	}
 	for _, trigger := range triggers {
+		if allowSteer {
+			row, err := h.Queries.RegisterCommentSteer(ctx, db.RegisterCommentSteerParams{
+				CommentID: triggerCommentID,
+				AgentID:   trigger.Agent.ID,
+				IssueID:   issue.ID,
+				HeadSha:   steerHeadSHA,
+			})
+			if err == nil && row.Status != "follow_up" {
+				h.requestDaemonPendingWork(uuidToString(row.RuntimeID), protocol.PendingWorkKindTaskSteer)
+				record(trigger, DispatchSteering, ReasonSteering)
+				continue
+			}
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Registration is intentionally idempotent. A create retry or a
+				// comment edit can find the same delivery already pending, claimed,
+				// or delivered. None may fall through to the follow-up enqueue path:
+				// a claimed edit could otherwise inject the old body now and enqueue
+				// the edited body for a second run, while rewriting its receipt.
+				existing, loadErr := h.Queries.GetCommentAgentDelivery(ctx, db.GetCommentAgentDeliveryParams{
+					CommentID: triggerCommentID,
+					AgentID:   trigger.Agent.ID,
+				})
+				if loadErr == nil {
+					switch existing.Status {
+					case "pending":
+						h.requestDaemonPendingWork(uuidToString(existing.RuntimeID), protocol.PendingWorkKindTaskSteer)
+						fallthrough
+					case "steering", "delivered":
+						record(trigger, DispatchSteering, ReasonSteering)
+						continue
+					}
+				} else if !errors.Is(loadErr, pgx.ErrNoRows) {
+					slog.Warn("load existing comment steer failed; falling back to follow-up",
+						"issue_id", uuidToString(issue.ID), "agent_id", uuidToString(trigger.Agent.ID), "error", loadErr)
+				}
+			} else if err != nil {
+				slog.Warn("register comment steer failed; falling back to follow-up",
+					"issue_id", uuidToString(issue.ID), "agent_id", uuidToString(trigger.Agent.ID), "error", err)
+			}
+		}
 		status, reason := h.resolveCommentTriggerEnqueue(ctx, issue, trigger, triggerCommentID)
+		if allowSteer && status != DispatchBlocked {
+			if err := h.Queries.RecordCommentFollowUpDelivery(ctx, db.RecordCommentFollowUpDeliveryParams{
+				CommentID: triggerCommentID,
+				AgentID:   trigger.Agent.ID,
+				FailureReason: pgtype.Text{
+					String: string(reason), Valid: true,
+				},
+			}); err != nil {
+				slog.Warn("record comment follow-up receipt failed",
+					"issue_id", uuidToString(issue.ID), "agent_id", uuidToString(trigger.Agent.ID), "error", err)
+			}
+		}
 		record(trigger, status, reason)
 	}
 	return results
@@ -3279,6 +3420,7 @@ func (h *Handler) resolveMentionedAgentCommentTriggers(ctx context.Context, issu
 }
 
 func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
+	r = h.withWakeupActor(r)
 	commentId := chi.URLParam(r, "commentId")
 
 	userID, ok := requireUserID(w, r)
@@ -3405,7 +3547,7 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		// revision writes defer cancellation until the conditional UPDATE wins,
 		// so a race that returns 409 cannot mutate the task queue.
 		if !strictContentEdit {
-			cancelled, err = h.TaskService.CancelTasksByTriggerComment(r.Context(), existing.ID)
+			cancelled, err = h.TaskService.CancelTasksByEditedComment(r.Context(), existing.ID)
 			if err != nil {
 				slog.Warn("cancel tasks for edited comment failed", "comment_id", uuidToString(existing.ID), "error", err)
 				writeError(w, http.StatusInternalServerError, "failed to prepare comment edit")
@@ -3434,7 +3576,7 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		// lock before the attachment replacement, so two modern editors cannot
 		// interleave their CAS check and attachment selection. A body + attachment
 		// edit is one visible mutation and therefore bumps revision exactly once.
-		tx, beginErr := h.TxStarter.Begin(r.Context())
+		tx, beginErr := h.beginWakeupWrite(r.Context())
 		if beginErr != nil {
 			writeError(w, http.StatusInternalServerError, "failed to prepare comment edit")
 			return
@@ -3448,7 +3590,7 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 			issueRevision = updated.IssueRevision
 		}
 		if err == nil && oldContent != req.Content && strictContentEdit {
-			cancelled, err = qtx.CancelAgentTasksByTriggerComment(r.Context(), existing.ID)
+			cancelled, err = qtx.CancelAgentTasksByEditedComment(r.Context(), existing.ID)
 			if err == nil {
 				err = service.SettleDeliveredDelegatedFailureRecoveries(r.Context(), qtx, cancelled...)
 			}
@@ -3475,7 +3617,9 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		var updated db.UpdateCommentRow
-		updated, err = h.Queries.UpdateComment(r.Context(), updateParams)
+		updated, err = wakeupWrite(h, r, func(q *db.Queries) (db.UpdateCommentRow, error) {
+			return q.UpdateComment(r.Context(), updateParams)
+		})
 		if err == nil {
 			comment = updated.Comment()
 			issueRevision = updated.IssueRevision
@@ -3545,6 +3689,7 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
+	r = h.withWakeupActor(r)
 	commentId := chi.URLParam(r, "commentId")
 
 	userID, ok := requireUserID(w, r)
@@ -3710,7 +3855,7 @@ func lockCommentAttachments(ctx context.Context, qtx *db.Queries, workspaceID, i
 // when the delete commits while this waits. Returns pgx.ErrNoRows when the
 // comment is gone or deleted.
 func (h *Handler) withLiveCommentLock(ctx context.Context, commentID, workspaceID pgtype.UUID, write func(*db.Queries) error) error {
-	tx, err := h.TxStarter.Begin(ctx)
+	tx, err := h.beginWakeupWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -3738,7 +3883,7 @@ const commentTombstonePruneDepth = 256
 // Returns pgx.ErrNoRows when the comment is already gone or already deleted.
 func (h *Handler) deleteComment(ctx context.Context, commentID, workspaceID pgtype.UUID) (commentDeletion, error) {
 	var out commentDeletion
-	tx, err := h.TxStarter.Begin(ctx)
+	tx, err := h.beginWakeupWrite(ctx)
 	if err != nil {
 		return out, err
 	}
@@ -3970,6 +4115,7 @@ func (h *Handler) loadCommentForActor(w http.ResponseWriter, r *http.Request) (d
 }
 
 func (h *Handler) ResolveComment(w http.ResponseWriter, r *http.Request) {
+	r = h.withWakeupActor(r)
 	comment, workspaceID, actorType, actorID, ok := h.loadCommentForActor(w, r)
 	if !ok {
 		return
@@ -3986,7 +4132,7 @@ func (h *Handler) ResolveComment(w http.ResponseWriter, r *http.Request) {
 	// resolving this one must clear any other resolution in the same thread. Both
 	// writes run in one tx — clearing the old resolution and setting the new one
 	// is atomic, so a crash can never leave two resolutions (or none) visible.
-	tx, err := h.TxStarter.Begin(r.Context())
+	tx, err := h.beginWakeupWrite(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to resolve comment")
 		return
@@ -4056,13 +4202,16 @@ func (h *Handler) ResolveComment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UnresolveComment(w http.ResponseWriter, r *http.Request) {
+	r = h.withWakeupActor(r)
 	comment, workspaceID, actorType, actorID, ok := h.loadCommentForActor(w, r)
 	if !ok {
 		return
 	}
 	wasResolved := comment.ResolvedAt.Valid
 
-	updated, err := h.Queries.UnresolveComment(r.Context(), comment.ID)
+	updated, err := wakeupWrite(h, r, func(q *db.Queries) (db.Comment, error) {
+		return q.UnresolveComment(r.Context(), comment.ID)
+	})
 	if err != nil {
 		slog.Warn("unresolve comment failed", append(logger.RequestAttrs(r), "error", err, "comment_id", uuidToString(comment.ID))...)
 		writeError(w, http.StatusInternalServerError, "failed to unresolve comment")

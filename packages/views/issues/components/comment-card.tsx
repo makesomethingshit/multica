@@ -60,6 +60,27 @@ const highlightedCommentBackgroundClass =
 const stickyHeaderFadeClass =
   "after:pointer-events-none after:absolute after:inset-x-0 after:top-full after:h-1 after:bg-[inherit] after:[mask-image:linear-gradient(to_bottom,#000,transparent)] after:[-webkit-mask-image:linear-gradient(to_bottom,#000,transparent)]";
 
+export function CommentDeliveryReceipts({ entry, className }: { entry: TimelineEntry; className?: string }) {
+  const { t } = useT("issues");
+  const timeAgo = useTimeAgo();
+  if (!entry.agent_deliveries?.length) return null;
+  return (
+    <div className={cn("mt-1.5 flex flex-col gap-0.5 text-micro text-muted-foreground", className)}>
+      {entry.agent_deliveries.map((delivery) => {
+        const text = delivery.status === "delivered"
+          ? t(($) => $.comment.delivery_delivered, {
+              name: delivery.agent_name,
+              time: delivery.delivered_at ? timeAgo(delivery.delivered_at) : "",
+            })
+          : delivery.status === "pending"
+            ? t(($) => $.comment.delivery_pending, { name: delivery.agent_name })
+            : t(($) => $.comment.delivery_follow_up, { name: delivery.agent_name });
+        return <div key={delivery.agent_id}>{text}</div>;
+      })}
+    </div>
+  );
+}
+
 function StickyHeaderShell({
   className,
   sticky = true,
@@ -870,6 +891,7 @@ function CommentRow({
             <ReadonlyContent content={entry.content ?? ""} attachments={entry.attachments} />
           </div>
           <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-12 pr-4 max-md:pl-3 max-md:pr-3" />
+          <CommentDeliveryReceipts entry={entry} className="pl-12 pr-4 max-md:pl-3 max-md:pr-3" />
           {retryableAgentFailureComment(entry) && (
             <TaskCommentRetryButton
               issueId={issueId}
@@ -1321,6 +1343,7 @@ function CommentCardImpl({
                   <ReadonlyContent content={entry.content ?? ""} attachments={entry.attachments} />
                 </div>
                 <AttachmentList attachments={entry.attachments} content={entry.content} className="mt-1.5 pl-8 max-md:pl-0" />
+                <CommentDeliveryReceipts entry={entry} className="pl-8 max-md:pl-0" />
                 {retryableAgentFailureComment(entry) && (
                   <TaskCommentRetryButton
                     issueId={issueId}
