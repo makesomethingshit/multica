@@ -915,12 +915,6 @@ const TimelineEntrySchema = z.object({
   reactions: z.array(ReactionSchema).optional(),
   attachments: z.array(AttachmentSchema).optional(),
   source_task_id: z.string().nullable().optional(),
-  agent_deliveries: z.array(z.object({
-    agent_id: z.string(),
-    agent_name: z.string(),
-    status: z.string(),
-    delivered_at: z.string().nullable().optional(),
-  }).loose()).optional().catch(undefined),
   // Tombstone marker (#8296). Lenient: a malformed value reads as a live
   // comment instead of failing the whole timeline.
   deleted_at: z.string().nullable().optional().catch(undefined),
@@ -1063,12 +1057,6 @@ export const CommentSchema = z.object({
   updated_at: z.string(),
   revision: z.number().int().positive().optional(),
   source_task_id: z.string().nullable().optional(),
-  agent_deliveries: z.array(z.object({
-    agent_id: z.string(),
-    agent_name: z.string(),
-    status: z.string(),
-    delivered_at: z.string().nullable().optional(),
-  }).loose()).optional().catch(undefined),
   // Set only on comments a quick action produced (MUL-5465). Server-only.
   quick_action_id: z.string().nullable().optional(),
   deleted_at: z.string().nullable().optional().catch(undefined),
@@ -1102,7 +1090,6 @@ const CommentTriggerPreviewAgentSchema = z.object({
   avatar_url: z.string().optional(),
   source: z.string().default(""),
   reason: z.string().default(""),
-  delivery: z.string().default("follow_up"),
 }).loose();
 
 // Per-target outcome of an explicit @agent / @squad mention (MUL-4525 §2).

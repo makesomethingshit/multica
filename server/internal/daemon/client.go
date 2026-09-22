@@ -244,7 +244,6 @@ func daemonCommonCapabilities() []string {
 		protocol.DaemonCapabilityRPCV1,
 		protocol.DaemonCapabilityPlatformSkillV1,
 		protocol.DaemonCapabilityCheckoutKeepsWorkV1,
-		protocol.DaemonCapabilityTaskSteerV1,
 	}
 }
 
@@ -470,34 +469,6 @@ func (c *Client) ExtendTaskPrepareLease(ctx context.Context, runtimeID, taskID s
 
 func (c *Client) StartTask(ctx context.Context, taskID string) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/start", taskID), map[string]any{}, nil)
-}
-
-type CommentSteer struct {
-	CommentID  string `json:"comment_id"`
-	AuthorName string `json:"author_name"`
-	Content    string `json:"content"`
-}
-
-func (c *Client) ClaimCommentSteer(ctx context.Context, taskID string) (*CommentSteer, error) {
-	var steer CommentSteer
-	if err := c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/steers/claim", taskID), map[string]any{}, &steer); err != nil {
-		return nil, err
-	}
-	if steer.CommentID == "" {
-		return nil, nil
-	}
-	return &steer, nil
-}
-
-func (c *Client) AckCommentSteer(ctx context.Context, taskID, commentID string, delivered bool, errText string) (string, error) {
-	var response struct {
-		Status string `json:"status"`
-	}
-	err := c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/steers/%s/ack", taskID, commentID), map[string]any{
-		"delivered": delivered,
-		"error":     errText,
-	}, &response, []time.Duration{0, 100 * time.Millisecond, 300 * time.Millisecond})
-	return response.Status, err
 }
 
 // MarkTaskWaitingLocalDirectory parks a freshly-dispatched task in the

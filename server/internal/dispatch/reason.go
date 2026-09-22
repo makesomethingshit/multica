@@ -15,11 +15,10 @@ package dispatch
 type ReasonCode string
 
 const (
-	// ReasonQueued / ReasonCoalesced / ReasonDeferred / ReasonSteering are the success-path codes.
+	// ReasonQueued / ReasonCoalesced / ReasonDeferred are the success-path codes.
 	ReasonQueued    ReasonCode = "queued"
 	ReasonCoalesced ReasonCode = "coalesced"
 	ReasonDeferred  ReasonCode = "deferred"
-	ReasonSteering  ReasonCode = "steering"
 
 	// ReasonInvocationNotAllowed: the acting principal may not trigger this
 	// target under the invocation-permission model. Deliberately generic — it

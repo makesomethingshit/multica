@@ -174,6 +174,23 @@ func wakeupIssueActive(ctx context.Context, q *db.Queries, i db.Issue) (bool, er
 	return category != "done" && category != "closed", nil
 }
 
+// StopClosedIssueWakeups applies the close rule after a status write: once an
+// issue is done or closed, every wakeup on it is disabled and wakeup runs that
+// have not started are cancelled. Running work keeps its ordinary Stop
+// control. Call it in the transaction that wrote the status, after that write
+// locked the issue row, so the close and this cleanup commit together. The
+// returned runs are for the caller's post-commit broadcast.
+func StopClosedIssueWakeups(ctx context.Context, q *db.Queries, issue db.Issue) ([]db.AgentTaskQueue, error) {
+	active, err := wakeupIssueActive(ctx, q, issue)
+	if err != nil || active {
+		return nil, err
+	}
+	if err = q.DisableIssueWakeups(ctx, issue.ID); err != nil {
+		return nil, err
+	}
+	return q.CancelUnstartedIssueWakeupTasks(ctx, issue.ID)
+}
+
 func (s *IssueWakeupService) Create(ctx context.Context, issueID, member, source pgtype.UUID, in WakeupInput) (db.IssueWakeup, error) {
 	return s.Save(ctx, issueID, member, source, pgtype.UUID{}, in)
 }

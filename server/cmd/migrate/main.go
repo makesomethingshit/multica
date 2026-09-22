@@ -154,7 +154,6 @@ var concurrentIndexCleanups = map[string]string{
 	"526_wakeup_terminal_runs":                                  "agent_task_wakeup_terminal_idx",
 	"527_wakeup_receipt_expiry":                                 "issue_wakeup_receipt_expiry_idx",
 	"529_wakeup_pending_event":                                  "issue_wakeup_pending_event_idx",
-	"508_comment_agent_delivery_pending_index":                  "idx_comment_agent_delivery_task_pending",
 	"503_channel_reply_delivery_turn_index":                     "idx_channel_reply_delivery_turn",
 	"504_channel_reply_delivery_installation_index":             "idx_channel_reply_delivery_installation",
 	"505_channel_reply_delivery_binding_index":                  "idx_channel_reply_delivery_binding",

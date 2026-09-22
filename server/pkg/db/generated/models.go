@@ -585,19 +585,6 @@ type Comment struct {
 	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
 }
 
-type CommentAgentDelivery struct {
-	CommentID     pgtype.UUID        `json:"comment_id"`
-	AgentID       pgtype.UUID        `json:"agent_id"`
-	TaskID        pgtype.UUID        `json:"task_id"`
-	RuntimeID     pgtype.UUID        `json:"runtime_id"`
-	Status        string             `json:"status"`
-	FailureReason pgtype.Text        `json:"failure_reason"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
-	ClaimedAt     pgtype.Timestamptz `json:"claimed_at"`
-	DeliveredAt   pgtype.Timestamptz `json:"delivered_at"`
-}
-
 type CommentReaction struct {
 	ID          pgtype.UUID        `json:"id"`
 	CommentID   pgtype.UUID        `json:"comment_id"`

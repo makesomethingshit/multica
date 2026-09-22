@@ -937,24 +937,8 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
-	var sessionMu sync.RWMutex
-	currentSession := firstSession
-	steer := func(steerCtx context.Context, instruction string) error {
-		sessionMu.RLock()
-		session := currentSession
-		sessionMu.RUnlock()
-		if session == nil || session.Steer == nil {
-			return errors.New("codex turn is not steerable")
-		}
-		return session.Steer(steerCtx, instruction)
-	}
 
 	go func() {
-		defer func() {
-			sessionMu.Lock()
-			currentSession = nil
-			sessionMu.Unlock()
-		}()
 		defer close(msgCh)
 		defer close(resCh)
 		session := firstSession
@@ -967,9 +951,6 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					resCh <- Result{Status: "failed", Error: err.Error()}
 					return
 				}
-				sessionMu.Lock()
-				currentSession = session
-				sessionMu.Unlock()
 			}
 			// Hold back the leading session-pin status messages until this
 			// attempt proves it made real progress. A retry never continues the
@@ -1047,7 +1028,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 	}()
 
-	return &Session{Steer: steer, Messages: msgCh, Result: resCh}, nil
+	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
 func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts ExecOptions, attempt int) (*Session, error) {
@@ -1925,24 +1906,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 	}()
 
-	steer := func(steerCtx context.Context, instruction string) error {
-		return steerCodexTurn(steerCtx, c, instruction)
-	}
-	return &Session{Steer: steer, Messages: msgCh, Result: resCh}, nil
-}
-
-func steerCodexTurn(ctx context.Context, c *codexClient, instruction string) error {
-	threadID := c.getThreadID()
-	turnID := c.activeTurnID()
-	if threadID == "" || turnID == "" {
-		return errors.New("codex turn has not started")
-	}
-	_, err := c.request(ctx, "turn/steer", map[string]any{
-		"threadId":       threadID,
-		"expectedTurnId": turnID,
-		"input":          []map[string]any{{"type": "text", "text": instruction}},
-	})
-	return err
+	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
 func resolveCodexHandshakeTimeouts(opts ExecOptions) (time.Duration, time.Duration) {

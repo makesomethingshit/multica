@@ -530,18 +530,7 @@ deleted_channel_installations AS (
 DELETE FROM lark_installation WHERE lark_installation.workspace_id = $1;
 
 -- name: DeleteWorkspaceComments :exec
--- Steering receipts intentionally have no foreign key so terminal task cleanup
--- cannot cascade through issue history. Remove them explicitly through their
--- canonical owner (the comment) before deleting the workspace's comments.
-WITH
-ws_comments AS MATERIALIZED (
-    SELECT id FROM comment WHERE comment.workspace_id = $1
-),
-deleted_comment_agent_deliveries AS (
-    DELETE FROM comment_agent_delivery
-    WHERE comment_id IN (SELECT id FROM ws_comments)
-)
-DELETE FROM comment WHERE id IN (SELECT id FROM ws_comments);
+DELETE FROM comment WHERE comment.workspace_id = $1;
 
 -- name: DeleteWorkspaceIssueRoots :exec
 WITH deleted_wakeup_receipts AS (

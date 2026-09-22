@@ -182,20 +182,9 @@ func (q *Queries) DeleteWorkspaceChatMessages(ctx context.Context, workspaceID p
 }
 
 const deleteWorkspaceComments = `-- name: DeleteWorkspaceComments :exec
-WITH
-ws_comments AS MATERIALIZED (
-    SELECT id FROM comment WHERE comment.workspace_id = $1
-),
-deleted_comment_agent_deliveries AS (
-    DELETE FROM comment_agent_delivery
-    WHERE comment_id IN (SELECT id FROM ws_comments)
-)
-DELETE FROM comment WHERE id IN (SELECT id FROM ws_comments)
+DELETE FROM comment WHERE comment.workspace_id = $1
 `
 
-// Steering receipts intentionally have no foreign key so terminal task cleanup
-// cannot cascade through issue history. Remove them explicitly through their
-// canonical owner (the comment) before deleting the workspace's comments.
 func (q *Queries) DeleteWorkspaceComments(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteWorkspaceComments, workspaceID)
 	return err

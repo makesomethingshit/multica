@@ -1,1 +1,0 @@
-DROP INDEX CONCURRENTLY IF EXISTS idx_comment_agent_delivery_task_pending;

@@ -90,12 +90,6 @@ function useTriggerPresenceLine(agentId: string, t: IssuesT): string | null {
     : t(($) => $.comment.trigger_starts_when_online);
 }
 
-function deliveryLabel(agent: CommentTriggerPreviewAgent, t: IssuesT): string {
-  return agent.delivery === "current_run"
-    ? t(($) => $.comment.trigger_current_work_short)
-    : t(($) => $.comment.trigger_follow_up_short);
-}
-
 // One tooltip body for every trigger surface (single chip, popover rows):
 // who · why it fires (+ presence) · what a click does.
 function TriggerAgentTooltipBody({
@@ -121,10 +115,7 @@ function TriggerAgentTooltipBody({
           {(() => {
             // Reason (when present) and presence share one line; either may be
             // absent, so join only the parts that exist to avoid a stray space.
-            const destination = agent.delivery === "current_run"
-              ? t(($) => $.comment.trigger_current_safe_point)
-              : presenceLine;
-            const line = [sourceReason(agent, t), destination].filter(Boolean).join(" ");
+            const line = [sourceReason(agent, t), presenceLine].filter(Boolean).join(" ");
             return line ? <div>{line}</div> : null;
           })()}
           <div className="text-muted-foreground">{t(($) => $.comment.trigger_click_to_skip)}</div>
@@ -255,9 +246,7 @@ function SingleTriggerChip({
   // so it stays fixed-width and never truncates on long agent names.
   const sentence = suppressed
     ? t(($) => $.comment.trigger_wont_trigger)
-    : agent.delivery === "current_run"
-      ? t(($) => $.comment.trigger_will_update_current)
-      : t(($) => $.comment.trigger_will_start);
+    : t(($) => $.comment.trigger_will_start);
 
   return (
     <Tooltip>
@@ -311,7 +300,7 @@ function MultiTriggerChip({
   const sentence =
     activeCount === 0
       ? t(($) => $.comment.trigger_none_will_trigger)
-      : t(($) => $.comment.trigger_will_receive_count, { count: activeCount });
+      : t(($) => $.comment.trigger_will_start_count, { count: activeCount });
 
   const popoverTrigger = (
     <PopoverTrigger
@@ -375,7 +364,7 @@ function MultiTriggerChip({
             const suppressed = suppressedAgentIds.has(agent.id);
             const state = suppressed
               ? t(($) => $.comment.trigger_skipped_label)
-              : deliveryLabel(agent, t);
+              : sourceLabel(agent.source, t);
             return (
               <Tooltip key={agent.id}>
                 <TooltipTrigger

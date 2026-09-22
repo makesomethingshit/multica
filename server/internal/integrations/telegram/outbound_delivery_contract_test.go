@@ -91,6 +91,17 @@ func (a *auditBot) wantOne(t *testing.T) {
 	}
 }
 
+// Lease expiry is database time, which auditClock cannot move, so cases that
+// exercise a takeover shorten the lease and really wait it out. The lease also
+// sizes every provider call's budget (a third of it, see callContext), and that
+// budget covers real Postgres writes: the 33ms a 100ms lease left timed out a
+// send claim on a slow -race CI runner and failed the case (MUL-7547).
+const (
+	testLeaseTTL = 600 * time.Millisecond
+	// testLeaseLapse outlasts testLeaseTTL, so any lease taken before it has expired.
+	testLeaseLapse = testLeaseTTL + 150*time.Millisecond
+)
+
 type auditClock struct{ nanos atomic.Int64 }
 
 func (c *auditClock) now() time.Time          { return time.Unix(0, c.nanos.Load()) }
@@ -389,7 +400,7 @@ func TestAuditReplayAfterInterruptionBetweenChunks(t *testing.T) {
 	// The interrupted process never releases its lease — it stops existing.
 	// Expiry is what frees the turn, and expiry is database time, so the test
 	// shortens the lease and really waits for it.
-	a.leaseTTL = 100 * time.Millisecond
+	a.leaseTTL = testLeaseTTL
 	e := telegramTestEventFor(3, 2, strings.Repeat("A", maxMessageUnits)+"tail")
 	a.enqueueTerminalReply(e)
 	reply := a.terminalSessions[e.ChatSessionID].queue[0]
@@ -407,10 +418,10 @@ func TestAuditReplayAfterInterruptionBetweenChunks(t *testing.T) {
 	}
 	// Simulate losing process memory before the next chunk. A replay-capable
 	// caller delivers the same completion against the same durable database.
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(testLeaseLapse)
 	b := NewOutbound(q, nil, srv.URL, srv.Client(), nil)
 	b.now = c.now
-	b.leaseTTL = 100 * time.Millisecond
+	b.leaseTTL = testLeaseTTL
 	b.enqueueTerminalReply(e)
 	auditDrain(t, b, c, e.ChatSessionID)
 	bot.mu.Lock()

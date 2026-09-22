@@ -55,6 +55,13 @@ SELECT * FROM agent_task_queue WHERE id= @id AND issue_id= @issue_id FOR UPDATE 
 -- name: CancelUnstartedWakeupTasks :many
 UPDATE agent_task_queue SET status='cancelled',completed_at=now(),error='Wakeup disabled or updated'
 WHERE context->>'wakeup_id'= @wakeup_id::text AND status IN ('queued','deferred') AND started_at IS NULL RETURNING *;
+-- name: DisableIssueWakeups :exec
+-- Closing wins over every subscription on the issue; reopening does not rearm.
+UPDATE issue_wakeup SET enabled=false,disabled_at=clock_timestamp(),updated_at=clock_timestamp()
+WHERE issue_id= @issue_id AND disabled_at IS NULL;
+-- name: CancelUnstartedIssueWakeupTasks :many
+UPDATE agent_task_queue SET status='cancelled',completed_at=now(),error='Issue closed; wakeup disabled'
+WHERE issue_id= @issue_id AND context->>'wakeup_id' IS NOT NULL AND status IN ('queued','deferred') AND started_at IS NULL RETURNING *;
 -- name: ListReadyWakeups :many
 WITH candidates AS (
  SELECT id FROM issue_wakeup WHERE enabled AND kind<>'event' AND next_fire_at<=now()
@@ -68,10 +75,14 @@ SELECT * FROM issue_wakeup_receipt WHERE wakeup_id= @wakeup_id AND revision= @re
 
 -- name: DeleteExpiredWakeupReceipts :execrows
 -- Pending inputs are never expired. Bound work and avoid waiting on dispatch.
-DELETE FROM issue_wakeup_receipt WHERE id IN (
+-- MATERIALIZED evaluates the batch once. As an IN subquery, a nested-loop plan
+-- rescans it per outer row, skips the rows this DELETE already removed, and
+-- slides the LIMIT window until every expired row is gone.
+WITH batch AS MATERIALIZED (
  SELECT expired.id FROM issue_wakeup_receipt expired WHERE expired.processed_at < @cutoff
  ORDER BY expired.processed_at,expired.id LIMIT 1000 FOR UPDATE SKIP LOCKED
-);
+)
+DELETE FROM issue_wakeup_receipt r USING batch WHERE r.id=batch.id;
 -- name: RecordWakeupReceipt :one
 INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload)
 VALUES(@id,@wakeup_id,@revision,@event_key,@event_type,@payload)

@@ -687,28 +687,6 @@ WHERE (trigger_comment_id = $1 OR $1 = ANY(coalesced_comment_ids))
   AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
--- name: CancelAgentTasksByEditedComment :many
--- Content edits normally invalidate tasks whose prompt may contain the old
--- body. A task with a durable steer receipt is the exception: pending claims
--- read the current body, while claimed/delivered rows must not be retriggered
--- because doing so executes both the old and edited instruction. Deletion keeps
--- using CancelAgentTasksByTriggerComment and cancels every matching task.
-UPDATE agent_task_queue t
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
-    cancelled_by_type = 'system', cancelled_by_id = NULL, cancelled_by_name = NULL,
-    context = COALESCE(t.context, '{}'::jsonb) || jsonb_build_object('comment_change_cancelled_task_id', t.id::text)
-WHERE (t.trigger_comment_id = @comment_id OR @comment_id = ANY(t.coalesced_comment_ids))
-  AND t.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
-  AND NOT EXISTS (
-      SELECT 1
-      FROM comment_agent_delivery d
-      WHERE d.comment_id = @comment_id
-        AND d.agent_id = t.agent_id
-        AND d.task_id = t.id
-        AND d.status IN ('pending', 'steering', 'delivered')
-  )
-RETURNING t.*;
-
 -- name: CancelAgentTasksByChatSession :many
 -- Cancels active tasks belonging to a chat session. Called from
 -- DeleteChatSession so the daemon doesn't keep running work whose result

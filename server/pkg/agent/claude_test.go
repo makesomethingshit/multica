@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -593,29 +592,6 @@ func TestBuildClaudeInputEncodesUserMessage(t *testing.T) {
 	}
 	if block["type"] != "text" || block["text"] != "say pong" {
 		t.Fatalf("unexpected content block: %v", block)
-	}
-}
-
-func TestBuildClaudeInputPreservesSteerFraming(t *testing.T) {
-	t.Parallel()
-
-	instruction := "[STEER] preserve ORIGINAL and merge STEERED into one final response"
-	data, err := buildClaudeInput(instruction)
-	if err != nil {
-		t.Fatalf("buildClaudeInput: %v", err)
-	}
-	var payload struct {
-		Message struct {
-			Content []struct {
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"message"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(data), &payload); err != nil {
-		t.Fatalf("unmarshal payload: %v", err)
-	}
-	if len(payload.Message.Content) != 1 || payload.Message.Content[0].Text != instruction {
-		t.Fatalf("Claude steer payload = %+v, want exact framed instruction", payload.Message.Content)
 	}
 }
 
@@ -1343,84 +1319,5 @@ func TestBuildClaudeArgsManagedSkillSettingsWins(t *testing.T) {
 	}
 	if !strings.Contains(joined, "--max-turns 7") {
 		t.Fatalf("unrelated custom arg was dropped: %v", args)
-	}
-}
-
-func TestClaudeInputStreamCloseUnblocksWriteAndRejectsLaterFrames(t *testing.T) {
-	reader, writer := io.Pipe()
-	defer reader.Close()
-	stream := &claudeInputStream{writer: writer, closer: writer}
-	written := make(chan error, 1)
-	go func() {
-		_, err := stream.Write([]byte("blocked"))
-		written <- err
-	}()
-	time.Sleep(10 * time.Millisecond)
-	if err := stream.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	select {
-	case <-written:
-	case <-time.After(time.Second):
-		t.Fatal("close did not unblock the active stdin write")
-	}
-	if _, err := stream.Write([]byte("late")); err == nil {
-		t.Fatal("write after terminal close succeeded")
-	}
-}
-
-func TestClaudeSteerRejectsAfterTerminalResultBeforeProcessExit(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell-script fixture is POSIX-only")
-	}
-
-	// Keep the process alive after its authoritative result so the test covers
-	// the exact window where the task row can still be running even though
-	// Claude will never consume another stdin frame.
-	fakePath := filepath.Join(t.TempDir(), "claude")
-	script := "#!/bin/sh\n" +
-		"IFS= read -r _\n" +
-		`echo '{"type":"result","subtype":"success","is_error":false,"session_id":"sess-terminal","result":"done"}'` + "\n" +
-		"sleep 1\n"
-	writeTestExecutable(t, fakePath, []byte(script))
-
-	backend, err := New("claude", Config{
-		ExecutablePath: fakePath,
-		Env:            map[string]string{"IS_SANDBOX": "1"},
-		Logger:         slog.Default(),
-	})
-	if err != nil {
-		t.Fatalf("new claude backend: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	session, err := backend.Execute(ctx, "initial prompt", ExecOptions{Timeout: 4 * time.Second})
-	if err != nil {
-		t.Fatalf("execute: %v", err)
-	}
-	go func() {
-		for range session.Messages {
-		}
-	}()
-	if session.TerminalObserved == nil {
-		t.Fatal("Claude session did not expose its terminal boundary")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for !session.TerminalObserved() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if !session.TerminalObserved() {
-		t.Fatal("Claude terminal result was not observed")
-	}
-	if err := session.Steer(context.Background(), "late instruction"); err == nil {
-		t.Fatal("steer succeeded after Claude's terminal result")
-	}
-	select {
-	case result := <-session.Result:
-		if result.Status != "completed" {
-			t.Fatalf("terminal fixture status = %q, want completed", result.Status)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for Claude process cleanup")
 	}
 }

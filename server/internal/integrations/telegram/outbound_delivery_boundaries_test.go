@@ -139,7 +139,7 @@ func TestReview8545PostgresAbandonedInFlightDoesNotBlockForever(t *testing.T) {
 	o, q, c, e := review8545Setup(t, bot)
 	// Expiry is decided by database time, which the test clock cannot move, so
 	// the lease is shortened and really waited out.
-	o.leaseTTL = 100 * time.Millisecond
+	o.leaseTTL = testLeaseTTL
 	ctx := context.Background()
 	target, err := o.resolveTarget(ctx, e, false)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestReview8545PostgresAbandonedInFlightDoesNotBlockForever(t *testing.T) {
 	}
 	// The owner process dies after claiming: it never records an outcome and
 	// never releases the turn. Only the lease expiring can free it.
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(testLeaseLapse)
 	c.advance(24 * time.Hour)
 	_ = q
 	reply := &terminalReply{event: e}
@@ -310,16 +310,16 @@ func TestReview8545PostgresStaleStreamCannotOverwriteSettledAnswer(t *testing.T)
 	q := &review8545PauseStreamRead{review8545Queries: base, entered: make(chan struct{}), release: make(chan struct{})}
 	q.pause.Store(true)
 	a.q = q
-	a.leaseTTL = 100 * time.Millisecond
+	a.leaseTTL = testLeaseTTL
 	b := review8545Second(a)
-	b.leaseTTL = 100 * time.Millisecond
+	b.leaseTTL = testLeaseTTL
 	done := make(chan struct{})
 	go func() { defer close(done); a.handleTaskMessage(telegramPartialEvent(e.TaskID, " stale tail")) }()
 	defer func() { close(q.release); <-done }()
 	<-q.entered
 	// The paused frame still owns the turn; the final answer takes over only
 	// once that lease expires.
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(testLeaseLapse)
 	b.enqueueTerminalReply(e)
 	auditDrain(t, b, c, e.ChatSessionID)
 	q.release <- struct{}{}
@@ -445,7 +445,7 @@ func TestReview8545PostgresSettledElsewhereReleasesLocalState(t *testing.T) {
 func TestReview8545PostgresFailureNoticeWaitsForALiveLease(t *testing.T) {
 	bot := &auditBot{}
 	a, _, c, e := review8545Setup(t, bot)
-	a.leaseTTL = 100 * time.Millisecond
+	a.leaseTTL = testLeaseTTL
 	a.handleTaskMessage(telegramPartialEvent(e.TaskID, "streamed reply"))
 
 	ctx := context.Background()
@@ -463,10 +463,10 @@ func TestReview8545PostgresFailureNoticeWaitsForALiveLease(t *testing.T) {
 	}
 
 	b := review8545Second(a)
-	b.leaseTTL = 100 * time.Millisecond
+	b.leaseTTL = testLeaseTTL
 	b.handleTaskFailed(events.Event{TaskID: e.TaskID, ChatSessionID: e.ChatSessionID,
 		Payload: map[string]any{"retry_pending": false}})
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(testLeaseLapse)
 	auditDrain(t, b, c, e.ChatSessionID)
 
 	review8545MessageCount(t, bot, 1)
@@ -517,7 +517,7 @@ func TestReview8545PostgresSupersededAttemptCannotCloseTheTurn(t *testing.T) {
 func TestReview8545PostgresFailureNoticeStopsAfterLosingTheLease(t *testing.T) {
 	bot := &auditBot{failFirstEdit: true}
 	o, _, c, e := review8545Setup(t, bot)
-	o.leaseTTL = 100 * time.Millisecond
+	o.leaseTTL = testLeaseTTL
 	o.handleTaskMessage(telegramPartialEvent(e.TaskID, "streamed reply"))
 	o.handleTaskFailed(events.Event{TaskID: e.TaskID, ChatSessionID: e.ChatSessionID,
 		Payload: map[string]any{"retry_pending": false}})
@@ -544,8 +544,8 @@ func TestReview8545PostgresFailureNoticeStopsAfterLosingTheLease(t *testing.T) {
 
 	// Another replica takes the turn over while this one waits.
 	other := review8545Second(o)
-	other.leaseTTL = 100 * time.Millisecond
-	time.Sleep(150 * time.Millisecond)
+	other.leaseTTL = testLeaseTTL
+	time.Sleep(testLeaseLapse)
 	target, err := other.resolveTarget(context.Background(), e, false)
 	if err != nil {
 		t.Fatal(err)

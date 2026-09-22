@@ -2778,33 +2778,6 @@ func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID
 	return cancelled, nil
 }
 
-// CancelTasksByEditedComment is the edit-specific counterpart to
-// CancelTasksByTriggerComment. It preserves a task that already owns a durable
-// steer receipt for the edited comment so the edit cannot inject the old body
-// and enqueue the new body as a second run.
-func (s *TaskService) CancelTasksByEditedComment(ctx context.Context, commentID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	var cancelled []db.AgentTaskQueue
-	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
-		var err error
-		cancelled, err = qtx.CancelAgentTasksByEditedComment(ctx, commentID)
-		if err != nil {
-			return err
-		}
-		return SettleDeliveredDelegatedFailureRecoveries(ctx, qtx, cancelled...)
-	}); err != nil {
-		return nil, err
-	}
-	for _, t := range cancelled {
-		s.captureTaskCancelled(ctx, t)
-		s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, t)
-	}
-	for _, agentID := range distinctAgentIDs(cancelled) {
-		s.ReconcileAgentStatus(ctx, agentID)
-	}
-	s.notifyTasksFinished(cancelled)
-	return cancelled, nil
-}
-
 // BroadcastCancelledTasks reconciles each affected agent's status and emits
 // task:cancelled for every row. Callers must invoke this AFTER committing the
 // cancellation so subscribers don't observe a "cancelled" event for a row

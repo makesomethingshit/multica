@@ -396,7 +396,7 @@ func writeIssueBodyFormatting(b *strings.Builder) {
 // shell is a wrong comment), while the receipt mode only decides how much of
 // an already-correct comment is echoed back, so it must not displace the
 // guardrail from the section lede.
-const commentReceiptRule = "For final-result comments, use `--output table` to confirm success without echoing the body. Use `--output json` instead when you need the returned comment ID, attachment details, or other response fields. Gate the cleanup on the post succeeding (`&&`, or an `$LASTEXITCODE` check on Windows): a cleanup command run unconditionally succeeds after a failed post and makes the whole shell call exit 0, and under `--output table` empty stdout alone does not prove success.\n\n"
+const commentReceiptRule = "For final-result comments, use `--output table` to confirm success without echoing the body. Use `--output json` instead when you need the returned comment ID, attachment details, or other response fields. Gate the cleanup on the post succeeding (`&&` in bash or Git Bash, an `$LASTEXITCODE` check in PowerShell): a cleanup command run unconditionally succeeds after a failed post and makes the whole shell call exit 0, and under `--output table` empty stdout alone does not prove success.\n\n"
 
 // writeCommentFormatting emits the cross-platform file-first guardrail.
 // The Windows branch carries the `$OutputEncoding` rationale: Windows
@@ -407,7 +407,7 @@ const commentReceiptRule = "For final-result comments, use `--output table` to c
 func writeCommentFormatting(b *strings.Builder) {
 	b.WriteString("## Comment Formatting\n\n")
 	if runtimeGOOS == "windows" {
-		b.WriteString("On Windows, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`** — do NOT pipe via `--content-stdin` (Windows PowerShell 5.1's `$OutputEncoding` may replace non-ASCII characters with `?`). Never use inline `--content` for agent-authored comments. Write the file inside your working directory, never `/tmp` or shared paths (MUL-4252). Keep the same `--parent` value from the trigger comment when replying. Delete the temp file (`Remove-Item ./reply.md`) only after the post succeeded; do not rely on `\\n` escapes.\n\n")
+		b.WriteString("On Windows, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`** — do NOT pipe via `--content-stdin` (Windows PowerShell 5.1's `$OutputEncoding` may replace non-ASCII characters with `?`). Never use inline `--content` for agent-authored comments. Write the file inside your working directory, never `/tmp` or shared paths (MUL-4252). Keep the same `--parent` value from the trigger comment when replying. Delete the temp file (`Remove-Item ./reply.md` in PowerShell, `rm ./reply.md` in Git Bash) only after the post succeeded; do not rely on `\\n` escapes.\n\n")
 		b.WriteString(commentReceiptRule)
 		return
 	}
@@ -768,7 +768,6 @@ func writeWorkflowAutopilot(b *strings.Builder) {
 // worker the next. Owner-accepted tradeoff; decision recorded in MUL-5811.
 func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 	b.WriteString("**Every issue turn runs the same workflow.** The per-turn user message carries what triggered this run — an assignment handoff, or a triggering comment with its id and your `--parent` value — plus this issue's real id and ready-to-run context-read commands; assemble other calls from `## Available Commands`.\n\n")
-	b.WriteString("A `[STEER]` message is a human comment delivered while this turn is active. Apply it at the next safe boundary as additional guidance for the current task, preserving the original objective unless the message explicitly changes it.\n\n")
 
 	b.WriteString("1. Read the issue (`multica issue get`) to understand the context.\n")
 	b.WriteString("   The per-turn message may report that the server compared the issue against your last run; when it says the issue is unchanged, that report is this step's answer and you continue from your resumed context. Only that explicit report waives the read — a message that says nothing about the issue record has not compared it.\n")

@@ -147,11 +147,6 @@ func runContext(ctx context.Context, timeout time.Duration) (context.Context, co
 
 // Session represents a running agent execution.
 type Session struct {
-	// Steer delivers an additional human instruction to the currently active
-	// provider turn. Implementations must serialize writes with the provider's
-	// control protocol and fail once the authoritative terminal boundary has
-	// been observed. Nil means this backend cannot steer an active turn.
-	Steer func(context.Context, string) error
 	// ToolActivity optionally reports backend-owned tool accounting and its last
 	// transition time, independent of the best-effort transcript. Nil uses the
 	// daemon's message-based accounting. The timestamp gives completed tools a
