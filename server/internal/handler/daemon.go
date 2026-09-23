@@ -4467,15 +4467,19 @@ func (h *Handler) routeCompletionFallbackComment(ctx context.Context, task *db.A
 	}
 	var parentComment *db.Comment
 	if comment.ParentID.Valid {
-		// Scope to the issue's workspace; a comment's parent is always in the
-		// same workspace, so this only fails closed against a stray foreign
-		// UUID rather than changing behavior (MUL-4252).
-		if parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
+		// The parent is routing authority, not display metadata: the guest
+		// squad path restores the delegation chain through it, and without it
+		// the comment would fall through to the unrelated assigned-squad
+		// fallback. A reply whose parent cannot be resolved in the issue
+		// workspace is not routed at all (fail closed, MUL-4252).
+		parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
 			ID:          comment.ParentID,
 			WorkspaceID: issue.WorkspaceID,
-		}); err == nil {
-			parentComment = &parent
+		})
+		if err != nil {
+			return
 		}
+		parentComment = &parent
 	}
 	// Same originator resolution as the completion reconcile: the human at the
 	// top of this run's trigger chain, so the A2A permission check sees the

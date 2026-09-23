@@ -87,6 +87,85 @@ func TestCompletionFallbackWakesSquadLeader(t *testing.T) {
 	}
 }
 
+
+// A silent guest-squad member run wakes its own coordinator, not the issue's
+// assigned squad (GH #8719). The fallback carries no mentions, so only the
+// parent delegation chain proves the guest squad's routing authority.
+func TestCompletionFallbackWakesGuestSquadLeader(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	assignedLeaderID := dbfx.Agent(t, "Fallback guest assigned leader", testRuntimeID)
+	assignedSquadID := dbfx.Squad(t, "Fallback guest assigned squad", assignedLeaderID)
+	guestLeaderID := dbfx.Agent(t, "Fallback guest squad leader", testRuntimeID)
+	guestSquadID := dbfx.Squad(t, "Fallback guest squad", guestLeaderID)
+	workerID := dbfx.Agent(t, "Fallback guest worker", testRuntimeID)
+	issueID := dbfx.Issue(t, "Fallback guest delegation keeps its authority", testutil.Cols{
+		"assignee_type": "squad", "assignee_id": assignedSquadID,
+	})
+	guestLeaderTaskID := dbfx.Task(t, guestLeaderID, testutil.Cols{
+		"runtime_id": testRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": guestSquadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	delegationID := dbfx.Comment(t, issueID, "delegate to guest worker", testutil.Cols{
+		"author_type": "agent", "author_id": guestLeaderID, "source_task_id": guestLeaderTaskID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": testRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": delegationID, "squad_id": guestSquadID,
+		"delegated_from_task_id": guestLeaderTaskID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + delegationID + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, workerTaskID)
+	var fallbackID string
+	dbfx.QueryRow(t, "SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2", workerTaskID, workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("completion fallback comment was not synthesized")
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND is_leader_task = TRUE AND squad_id = $3", issueID, guestLeaderID, guestSquadID); got != 1 {
+		t.Fatalf("guest squad leader received %d task(s), want 1", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, assignedLeaderID); got != 0 {
+		t.Fatalf("assigned squad leader received %d task(s), want 0", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, workerID); got != 0 {
+		t.Fatalf("worker received %d task(s), want 0", got)
+	}
+}
+
+
+// A synthesized reply whose parent cannot be resolved in the issue workspace
+// is not routed at all. Without the parent the guest delegation chain is
+// unprovable, and falling through to the assigned-squad fallback would change
+// routing authority on a transient lookup (GH #8719 fail-closed).
+func TestCompletionFallbackUnresolvedParentDoesNotRoute(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	foreignWS := dbfx.Workspace(t, "Fallback foreign workspace", "fb-8719-foreign")
+	foreignIssue := dbfx.Issue(t, "Fallback foreign issue", testutil.Cols{"workspace_id": foreignWS})
+	foreignComment := dbfx.Comment(t, foreignIssue, "foreign delegation", testutil.Cols{"workspace_id": foreignWS})
+	workerID := dbfx.Agent(t, "Fallback foreign-parent worker", testRuntimeID)
+	issueID := dbfx.Issue(t, "Fallback with unresolvable parent is not routed")
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": testRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": foreignComment,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + foreignComment + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, workerTaskID)
+	var parentID string
+	dbfx.QueryRow(t, "SELECT parent_id FROM comment WHERE source_task_id = $1 AND author_id = $2", workerTaskID, workerID).Scan(&parentID)
+	if parentID != foreignComment {
+		t.Fatal("completion fallback was not synthesized under the foreign parent")
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status = 'queued'", issueID); n != 0 {
+		t.Fatalf("unroutable fallback enqueued %d task(s), want 0", n)
+	}
+}
+
 // A worker progress comment wakes the leader; its final reply must also reach a
 // leader run even if the first wake was claimed before the reply arrived.
 func TestWorkerReplyDelivery(t *testing.T) {
