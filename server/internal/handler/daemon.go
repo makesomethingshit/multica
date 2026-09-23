@@ -4319,7 +4319,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// transaction (force session_id NULL + flag the row), so an auto-retry the
 	// same commit creates and wakes can never observe the withheld pointer or a
 	// missing continuity-gap flag.
-	task, transitioned, err := h.TaskService.CompleteTaskWithTransition(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
+	task, transitioned, fallbackCommentID, err := h.TaskService.CompleteTaskWithTransition(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.BranchName, req.SessionRolloutMissing, req.RetiredSessionID, req.DurableWorkDir)
 	if err != nil {
 		// A CompleteTask error is an infrastructure failure (transaction /
 		// assistant-outcome write), not a bad request: an already-finalized
@@ -4336,6 +4336,15 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.emitIssueExecutedOnFirstCompletion(r, task)
+
+	// GH #8719: a delegated member run that posts nothing still leaves a reply
+	// in the thread — CompleteTask synthesizes it above — but that comment
+	// bypasses CreateComment, so it never reaches the worker-reply routing that
+	// wakes the assigned squad leader. Route it here, through the same trigger
+	// path an explicit reply takes. The completion reconcile below only replays
+	// comments for the agent that just ran, and its timestamp-only replay filter
+	// drops this unplanned comment before it can reach the coordinator.
+	h.routeCompletionFallbackComment(r.Context(), task, fallbackCommentID)
 
 	// MUL-4195: guarantee at-least-once processing. If a member posted a
 	// deliberate comment while this run was executing (or one was merged into
@@ -4444,6 +4453,37 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 //     run, and terminating: the follow-up's own created_at is later than all of
 //     these comments and its delivered set will contain them, so its completion
 //     finds nothing to re-schedule.
+func (h *Handler) routeCompletionFallbackComment(ctx context.Context, task *db.AgentTaskQueue, fallbackCommentID pgtype.UUID) {
+	if task == nil || !fallbackCommentID.Valid || !task.IssueID.Valid || !task.AgentID.Valid {
+		return
+	}
+	issue, err := h.Queries.GetIssue(ctx, task.IssueID)
+	if err != nil {
+		return
+	}
+	comment, err := h.Queries.GetComment(ctx, fallbackCommentID)
+	if err != nil {
+		return
+	}
+	var parentComment *db.Comment
+	if comment.ParentID.Valid {
+		// Scope to the issue's workspace; a comment's parent is always in the
+		// same workspace, so this only fails closed against a stray foreign
+		// UUID rather than changing behavior (MUL-4252).
+		if parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
+			ID:          comment.ParentID,
+			WorkspaceID: issue.WorkspaceID,
+		}); err == nil {
+			parentComment = &parent
+		}
+	}
+	// Same originator resolution as the completion reconcile: the human at the
+	// top of this run's trigger chain, so the A2A permission check sees the
+	// same principal an explicit reply would have carried (MUL-3963).
+	originatorUserID := uuidToString(h.TaskService.ResolveOriginatorFromTriggerComment(ctx, issue.WorkspaceID, comment.ID))
+	h.triggerTasksForComment(ctx, issue, comment, parentComment, comment.AuthorType, uuidToString(comment.AuthorID), originatorUserID, nil)
+}
+
 func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.AgentTaskQueue) {
 	if task == nil || !task.IssueID.Valid || !task.AgentID.Valid || !task.CreatedAt.Valid {
 		return

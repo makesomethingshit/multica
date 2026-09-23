@@ -35,6 +35,58 @@ func completeWorkerReplyRun(t *testing.T, taskID string) {
 	testutil.Call(t, testHandler.CompleteTask, req).Want(http.StatusOK)
 }
 
+// A delegated member run that posts nothing still wakes its coordinator (GH
+// #8719). CompleteTask synthesizes the fallback comment from the final output;
+// the completion path must route it like an explicit worker reply so the
+// leader->worker->leader loop does not stall on the platform-generated comment.
+func TestCompletionFallbackWakesSquadLeader(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback handoff leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback handoff leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback handoff worker runtime")
+	workerID := dbfx.Agent(t, "Fallback handoff worker", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback handoff squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Fallback results must reach the coordinator", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) verify the implementation", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		// Production claim receipt: the delegation comment reached this run,
+		// so completion reconcile must not replay the trigger back at the worker.
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	// The member posts nothing: completing synthesizes the fallback comment.
+	completeWorkerReplyRun(t, workerTaskID)
+	var fallbackID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("completion fallback comment was not synthesized")
+	}
+	next := claimWorkerReplyRun(t, leaderRuntimeID)
+	if next == nil {
+		t.Fatal("completion fallback did not wake the squad leader")
+	}
+	if !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, fallbackID) {
+		t.Fatal("follow-up must deliver the fallback in the squad leader role")
+	}
+	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, workerID); n != 0 {
+		t.Fatalf("completion must not re-enqueue the worker run, got %d queued worker task(s)", n)
+	}
+}
+
 // A worker progress comment wakes the leader; its final reply must also reach a
 // leader run even if the first wake was claimed before the reply arrived.
 func TestWorkerReplyDelivery(t *testing.T) {

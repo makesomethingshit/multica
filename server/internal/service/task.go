@@ -4362,7 +4362,7 @@ func startsWithAbsolutePath(s string) bool {
 // durableWorkDir is terminal delivery metadata, not a resume pointer: it is
 // populated only after the daemon confirms a disposable worktree is gone.
 func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, error) {
-	task, _, err := s.CompleteTaskWithTransition(ctx, taskID, result, sessionID, workDir, branchName, sessionRolloutMissing, retiredSessionID, durableWorkDir)
+	task, _, _, err := s.CompleteTaskWithTransition(ctx, taskID, result, sessionID, workDir, branchName, sessionRolloutMissing, retiredSessionID, durableWorkDir)
 	return task, err
 }
 
@@ -4370,8 +4370,15 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 // completed compare-and-swap. Callers with transaction-external side effects
 // must only run them when transitioned is true; a replay against an already
 // terminal task is still an idempotent success but must not emit them again.
-func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, bool, error) {
+//
+// The third return is the synthesized completion-fallback comment, valid only
+// when this call created one (the run posted no agent comment and left a
+// non-empty, non-trivial final output). Callers that route comments (the
+// completion handler) use it to wake the coordinator exactly as an explicit
+// worker reply would; every other caller ignores it.
+func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, bool, pgtype.UUID, error) {
 	var task db.AgentTaskQueue
+	var fallbackCommentID pgtype.UUID
 	// chatAssistantMsg is the single assistant outcome row written for a chat
 	// task inside the completion transaction below. It is broadcast (chat:done)
 	// only after the transaction commits.
@@ -4462,7 +4469,7 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 					"current_status", existing.Status,
 					"agent_id", util.UUIDToString(existing.AgentID),
 				)
-				return &existing, false, nil
+				return &existing, false, pgtype.UUID{}, nil
 			}
 			slog.Warn("complete task failed",
 				"task_id", util.UUIDToString(taskID),
@@ -4478,7 +4485,7 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 				"lookup_error", lookupErr,
 			)
 		}
-		return nil, false, fmt.Errorf("complete task: %w", err)
+		return nil, false, pgtype.UUID{}, fmt.Errorf("complete task: %w", err)
 	}
 
 	slog.Info("task completed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
@@ -4526,7 +4533,7 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 						// Redact first, then bound: a runaway raw-stream Output (GH #5455)
 						// must never reach the issue thread, even as a clipped excerpt.
 						content := truncateFallbackCommentBody(redact.Text(body), maxSynthesizedFallbackCommentRunes)
-						s.createAgentComment(ctx, task.IssueID, task.AgentID, content, "comment", task.TriggerCommentID, task.ID)
+						fallbackCommentID = s.createAgentComment(ctx, task.IssueID, task.AgentID, content, "comment", task.TriggerCommentID, task.ID)
 					}
 				}
 			}
@@ -4573,7 +4580,7 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 	// Broadcast
 	s.broadcastTaskEvent(ctx, protocol.EventTaskCompleted, task)
 
-	return &task, true, nil
+	return &task, true, fallbackCommentID, nil
 }
 
 // chatNoResponseFallback is the non-empty English body stored on a no_response
@@ -7472,14 +7479,14 @@ func commentEventFields(c db.Comment) map[string]any {
 	}
 }
 
-func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID pgtype.UUID, content, commentType string, parentID, sourceTaskID pgtype.UUID) {
+func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID pgtype.UUID, content, commentType string, parentID, sourceTaskID pgtype.UUID) pgtype.UUID {
 	if content == "" {
-		return
+		return pgtype.UUID{}
 	}
 	// Look up issue to get workspace ID for mention expansion and broadcasting.
 	issue, err := s.Queries.GetIssue(ctx, issueID)
 	if err != nil {
-		return
+		return pgtype.UUID{}
 	}
 	// Resolve the thread root for thread-level side effects without overwriting
 	// parentID. The stored parent_id must remain the exact comment being replied
@@ -7505,7 +7512,7 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		SourceTaskID: sourceTaskID,
 	})
 	if err != nil {
-		return
+		return pgtype.UUID{}
 	}
 	comment := created.Comment()
 	commentFields := commentEventFields(comment)
@@ -7523,6 +7530,7 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID), sourceTaskID)
+	return comment.ID
 }
 
 // AutoUnresolveThreadOnReply clears resolved_at on the thread root when a
