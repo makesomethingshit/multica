@@ -87,7 +87,6 @@ func TestCompletionFallbackWakesSquadLeader(t *testing.T) {
 	}
 }
 
-
 // A silent guest-squad member run wakes its own coordinator, not the issue's
 // assigned squad (GH #8719). The fallback carries no mentions, so only the
 // parent delegation chain proves the guest squad's routing authority.
@@ -135,7 +134,6 @@ func TestCompletionFallbackWakesGuestSquadLeader(t *testing.T) {
 	}
 }
 
-
 // A synthesized reply whose parent cannot be resolved in the issue workspace
 // is not routed at all. Without the parent the guest delegation chain is
 // unprovable, and falling through to the assigned-squad fallback would change
@@ -148,7 +146,11 @@ func TestCompletionFallbackUnresolvedParentDoesNotRoute(t *testing.T) {
 	foreignIssue := dbfx.Issue(t, "Fallback foreign issue", testutil.Cols{"workspace_id": foreignWS})
 	foreignComment := dbfx.Comment(t, foreignIssue, "foreign delegation", testutil.Cols{"workspace_id": foreignWS})
 	workerID := dbfx.Agent(t, "Fallback foreign-parent worker", testRuntimeID)
-	issueID := dbfx.Issue(t, "Fallback with unresolvable parent is not routed")
+	assignedLeaderID := dbfx.Agent(t, "Fallback unresolved assigned leader", testRuntimeID)
+	assignedSquadID := dbfx.Squad(t, "Fallback unresolved assigned squad", assignedLeaderID)
+	issueID := dbfx.Issue(t, "Fallback with unresolvable parent is not routed", testutil.Cols{
+		"assignee_type": "squad", "assignee_id": assignedSquadID,
+	})
 	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
 		"runtime_id": testRuntimeID, "issue_id": issueID, "status": "running",
 		"trigger_comment_id": foreignComment,
@@ -160,6 +162,9 @@ func TestCompletionFallbackUnresolvedParentDoesNotRoute(t *testing.T) {
 	dbfx.QueryRow(t, "SELECT parent_id FROM comment WHERE source_task_id = $1 AND author_id = $2", workerTaskID, workerID).Scan(&parentID)
 	if parentID != foreignComment {
 		t.Fatal("completion fallback was not synthesized under the foreign parent")
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, assignedLeaderID); got != 0 {
+		t.Fatalf("unresolved parent woke assigned squad leader: got %d task(s), want 0", got)
 	}
 	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status = 'queued'", issueID); n != 0 {
 		t.Fatalf("unroutable fallback enqueued %d task(s), want 0", n)
