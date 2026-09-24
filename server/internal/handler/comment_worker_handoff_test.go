@@ -262,7 +262,11 @@ func TestCompletionFallbackTerminalOriginatorNotReused(t *testing.T) {
 	invocableID := dbfx.Agent(t, "Fallback originator invocable", workerRuntimeID, testutil.Cols{
 		"visibility": "workspace", "permission_mode": "public_to",
 	})
-	dbfx.Exec(t, `INSERT INTO agent_invocation_target (agent_id, target_type, target_id) VALUES ($1, 'workspace', $2) ON CONFLICT DO NOTHING`, invocableID, testWorkspaceID)
+	dbfx.InsertNoID(t, "agent_invocation_target", testutil.Cols{
+		"agent_id":    invocableID,
+		"target_type": "workspace",
+		"target_id":   testWorkspaceID,
+	}, "agent_id = $1 AND target_type = 'workspace' AND target_id = $2", invocableID, testWorkspaceID)
 	squadID := dbfx.Squad(t, "Fallback originator squad", leaderID)
 	dbfx.SquadMember(t, squadID, "agent", workerID)
 	issueID := dbfx.Issue(t, "Terminal originator must not re-authorize", testutil.Cols{
