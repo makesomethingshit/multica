@@ -209,31 +209,29 @@ func TestClaudeExecuteResumedEmptyUsageKeepsAssistantFallback(t *testing.T) {
 	}
 }
 
-func TestClaudeExecuteResumedCustomEndpointKeepsModelUsage(t *testing.T) {
+func TestClaudeExecuteResumedProxyUsesTurnLocalUsage(t *testing.T) {
 	t.Parallel()
-	const mainModel = "claude-sonnet-4-6"
-	const subagentModel = "claude-haiku-4-5"
-	mainTurn := TokenUsage{InputTokens: 40, OutputTokens: 6, CacheReadTokens: 8, CacheWriteTokens: 12}
-	subagentTurn := TokenUsage{InputTokens: 30, OutputTokens: 9, CacheReadTokens: 5, CacheWriteTokens: 3}
+	const model = "claude-sonnet-4-6"
+	previousTurn := TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40}
+	currentTurn := TokenUsage{InputTokens: 40, OutputTokens: 6, CacheReadTokens: 8, CacheWriteTokens: 12}
 	resultEvent := mustMarshal(t, map[string]any{
-		"type": "result", "subtype": "success", "is_error": false, "session_id": "session-1", "model": mainModel,
-		"usage": map[string]int64{"input_tokens": 999, "output_tokens": 999},
-		"modelUsage": map[string]any{
-			mainModel: map[string]int64{
-				"inputTokens": mainTurn.InputTokens, "outputTokens": mainTurn.OutputTokens,
-				"cacheReadInputTokens": mainTurn.CacheReadTokens, "cacheCreationInputTokens": mainTurn.CacheWriteTokens,
-			},
-			subagentModel: map[string]int64{
-				"inputTokens": subagentTurn.InputTokens, "outputTokens": subagentTurn.OutputTokens,
-				"cacheReadInputTokens": subagentTurn.CacheReadTokens, "cacheCreationInputTokens": subagentTurn.CacheWriteTokens,
-			},
+		"type": "result", "subtype": "success", "is_error": false, "session_id": "session-1", "model": model,
+		"usage": map[string]int64{
+			"input_tokens": currentTurn.InputTokens, "output_tokens": currentTurn.OutputTokens,
+			"cache_read_input_tokens": currentTurn.CacheReadTokens, "cache_creation_input_tokens": currentTurn.CacheWriteTokens,
 		},
+		"modelUsage": map[string]any{model: map[string]int64{
+			"inputTokens":              previousTurn.InputTokens + currentTurn.InputTokens,
+			"outputTokens":             previousTurn.OutputTokens + currentTurn.OutputTokens,
+			"cacheReadInputTokens":     previousTurn.CacheReadTokens + currentTurn.CacheReadTokens,
+			"cacheCreationInputTokens": previousTurn.CacheWriteTokens + currentTurn.CacheWriteTokens,
+		}},
 	})
 	backend := claudeUsageFixtureBackend(t, nil, resultEvent, false, "http://127.0.0.1:4318")
 	result := executeClaudeUsageFixture(t, backend, 0, "session-1")
-	want := map[string]TokenUsage{mainModel: mainTurn, subagentModel: subagentTurn}
+	want := map[string]TokenUsage{model: currentTurn}
 	if !reflect.DeepEqual(result.Usage, want) {
-		t.Fatalf("custom-endpoint usage = %#v, want modelUsage %#v", result.Usage, want)
+		t.Fatalf("proxy resumed usage = %#v, want current invocation usage %#v", result.Usage, want)
 	}
 }
 

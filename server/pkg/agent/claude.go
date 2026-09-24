@@ -250,17 +250,17 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				terminalReasonError = claudeTerminalReasonFailure(msg.TerminalReason, msg.ResultText)
 				sessionID = msg.SessionID
 				var resultUsage map[string]TokenUsage
-				if opts.ResumeSessionID != "" && !envHasNonEmpty(cmd.Env, "ANTHROPIC_BASE_URL") {
-					// On the built-in Claude endpoint, resumed modelUsage is
-					// session-cumulative while usage covers this main-loop turn.
-					// ponytail: resumed subagent totals are unavailable; custom URLs keep
-					// legacy handling until a per-provider usage-scope signal exists.
+				if opts.ResumeSessionID != "" {
+					// Resumed modelUsage is session-cumulative while usage covers
+					// this main-loop turn, including through custom API endpoints.
+					// ponytail: resumed subagent totals are unavailable; use a
+					// turn-local protocol source if the SDK exposes one.
 					resultUsage = claudeTurnUsage(msg, opts.Model)
 				} else {
 					resultUsage = claudeResultUsage(msg, opts.Model)
 				}
-				// On built-in resumes, empty turn usage keeps the task-local
-				// assistant-event fallback; never use cumulative modelUsage instead.
+				// On resumes, empty turn usage keeps the task-local assistant-event
+				// fallback; never use cumulative modelUsage instead.
 				if len(resultUsage) > 0 {
 					usage = resultUsage
 				}
