@@ -418,6 +418,75 @@ func TestCompletionFallbackReplayIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestCompletionFallbackTransientHandoffFailureIsRecoverable pins §10 Test C
+// (GH #8719): a failed first route leaves the persisted fallback replayable,
+// and completion reconciliation eventually delivers it to one coordinator.
+func TestCompletionFallbackTransientHandoffFailureIsRecoverable(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback recovery leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback recovery leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback recovery worker runtime")
+	workerID := dbfx.Agent(t, "Fallback recovery worker", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback recovery squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Transient fallback handoff failure is recoverable", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) do the work", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	completed, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("complete worker task: transitioned=%v fallback_valid=%v err=%v", transitioned, fallbackID.Valid, err)
+	}
+
+	// Cancel only the first routing attempt after completion committed. This is
+	// an injected transient DB error; the fallback row must remain the durable
+	// obligation and the retryable error must not be classified as invalid.
+	failedCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, provenInvalid, err := testHandler.dispatchCompletionFallback(failedCtx, completed, fallbackID); err == nil || provenInvalid {
+		t.Fatalf("first route attempt = (invalid=%v, err=%v), want transient error", provenInvalid, err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM comment WHERE id = $1", uuidToString(fallbackID)); got != 1 {
+		t.Fatalf("fallback comment after failed route: got %d rows, want 1", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
+		t.Fatalf("failed route created %d coordinator task(s), want 0", got)
+	}
+
+	testHandler.reconcileCommentsOnCompletion(ctx, completed)
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("reconciliation left %d runnable coordinator task(s), want exactly 1", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM comment WHERE id = $1", uuidToString(fallbackID)); got != 1 {
+		t.Fatalf("fallback comment after recovery: got %d rows, want 1", got)
+	}
+
+	next := claimWorkerReplyRun(t, leaderRuntimeID)
+	if next == nil || !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, uuidToString(fallbackID)) {
+		t.Fatalf("recovery did not deliver the fallback to the coordinator: task=%+v", next)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("recovery created %d runnable coordinator task(s), want exactly 1", got)
+	}
+}
+
 // TestCompletionFallbackExplicitReplyUnchanged pins §10 Test F (GH #8719): the
 // explicit worker reply path keeps its normal routing and still wakes the
 // leader exactly once.
@@ -444,6 +513,7 @@ func TestCompletionFallbackExplicitReplyUnchanged(t *testing.T) {
 	})
 	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
 		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"started_at":         testutil.Raw("now()"),
 		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
 		"originator_user_id": testUserID, "accountable_user_id": testUserID,
 		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
@@ -466,8 +536,8 @@ func TestCompletionFallbackExplicitReplyUnchanged(t *testing.T) {
 	if !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, response.ID) {
 		t.Fatal("follow-up must deliver the explicit reply in the squad leader role")
 	}
-	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running')", issueID, leaderID); got != 0 {
-		t.Fatalf("leader woke %d extra time(s), want exactly one wake", got)
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("leader has %d runnable task(s) after claim, want exactly one wake", got)
 	}
 }
 
