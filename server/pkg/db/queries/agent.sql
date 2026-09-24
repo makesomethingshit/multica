@@ -2098,9 +2098,11 @@ RETURNING *;
 -- whose source task is a completed, non-leader worker run — never by body
 -- text or a creation-time window. Ordered oldest-first and bounded so one
 -- sweep tick cannot monopolise the runtime loop.
+-- Exact match on the worker run's recorded fallback id: an explicit worker
+-- reply (possibly suppressed) from the same run must never be reclassified.
 SELECT fallback.id AS fallback_id, worker.id AS worker_task_id
 FROM comment AS fallback
-JOIN agent_task_queue AS worker ON worker.id = fallback.source_task_id
+JOIN agent_task_queue AS worker ON worker.completion_fallback_comment_id = fallback.id
 WHERE fallback.author_type = 'agent'
   AND fallback.source_task_id IS NOT NULL
   AND fallback.deleted_at IS NULL
@@ -2116,6 +2118,14 @@ WHERE fallback.author_type = 'agent'
   )
 ORDER BY fallback.created_at ASC, fallback.id ASC
 LIMIT @max_per_tick::int;
+
+-- name: RecordCompletionFallbackComment :exec
+-- Records the synthesized completion fallback (GH #8719) on its worker run so
+-- completion reconcile and the sweeper replay identify it exactly instead of
+-- shape-matching every agent comment the run authored.
+UPDATE agent_task_queue
+SET completion_fallback_comment_id = @fallback_id::uuid
+WHERE id = @task_id::uuid;
 
 -- name: HasTaskCoveringDelegatedFailureComment :one
 -- Durable idempotency check for a recovery comment. The completion reconciler

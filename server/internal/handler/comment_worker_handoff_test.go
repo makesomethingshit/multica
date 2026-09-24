@@ -668,6 +668,83 @@ func TestCompletionFallbackExplicitReplyUnchanged(t *testing.T) {
 	}
 }
 
+// TestCompletionFallbackSuppressedReplyNotReclassified pins the suppression
+// counterexample (GH #8719): an explicit worker reply that suppresses the
+// coordinator at creation must not be reclassified as a synthesized
+// completion fallback when the worker completes — neither by completion
+// reconcile nor by the sweeper replay. The mention resolves (Test F proves
+// the unsuppressed twin wakes the leader), so suppression is the only
+// reason no task exists at creation.
+func TestCompletionFallbackSuppressedReplyNotReclassified(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback suppressed leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback suppressed leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback suppressed worker runtime")
+	workerID := dbfx.Agent(t, "Fallback suppressed worker", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback suppressed squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Suppressed worker reply stays suppressed", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) verify the implementation", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	// Explicit worker reply mentioning the leader, suppressed for the leader.
+	req := withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{
+		"content":            fmt.Sprintf("Done. [@Leader](mention://agent/%s) reviewed, no follow-up needed", leaderID),
+		"parent_id":          rootID,
+		"suppress_agent_ids": []string{leaderID},
+	}), "id", issueID)
+	req.Header.Set("X-Agent-ID", workerID)
+	req.Header.Set("X-Task-ID", workerTaskID)
+	var response CommentResponse
+	testutil.Call(t, testHandler.CreateComment, req).Want(http.StatusCreated).JSON(&response)
+	replyID := response.ID
+	// Suppression honored at creation: no coordinator task.
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
+		t.Fatalf("suppressed reply created %d leader task(s), want 0", got)
+	}
+	completeWorkerReplyRun(t, workerTaskID)
+	// No synthesis: the run posted its explicit reply.
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID); got != 1 {
+		t.Fatalf("worker completion left %d worker comment(s), want exactly the explicit reply", got)
+	}
+	// The suppressed reply must not wake the leader via fallback reclassification.
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
+		t.Fatalf("suppressed reply reclassified as fallback: got %d leader task(s), want 0", got)
+	}
+	// Nor may the sweeper replay resurrect it.
+	pending, err := testHandler.Queries.ListPendingCompletionFallbacks(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range pending {
+		if uuidToString(row.FallbackID) == replyID {
+			t.Fatal("suppressed reply listed as pending completion fallback")
+		}
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper replay failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
+		t.Fatalf("sweeper replayed suppressed reply: got %d leader task(s), want 0", got)
+	}
+}
+
 // A worker progress comment wakes the leader; its final reply must also reach a
 // leader run even if the first wake was claimed before the reply arrived.
 func TestWorkerReplyDelivery(t *testing.T) {

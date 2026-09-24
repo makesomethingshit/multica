@@ -4840,6 +4840,24 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 						// must never reach the issue thread, even as a clipped excerpt.
 						content := truncateFallbackCommentBody(redact.Text(body), maxSynthesizedFallbackCommentRunes)
 						fallbackCommentID = s.createAgentComment(ctx, task.IssueID, task.AgentID, content, "comment", task.TriggerCommentID, task.ID)
+						if fallbackCommentID.Valid {
+							// Record the synthesis on the run so completion
+							// reconcile and the sweeper replay identify this
+							// exact comment instead of shape-matching every
+							// agent comment the run authored (GH #8719): an
+							// explicit, possibly suppressed worker reply must
+							// never be reclassified as a fallback.
+							if err := s.Queries.RecordCompletionFallbackComment(ctx, db.RecordCompletionFallbackCommentParams{
+								TaskID:     task.ID,
+								FallbackID: fallbackCommentID,
+							}); err != nil {
+								slog.Warn("recording completion fallback comment failed",
+									"task_id", util.UUIDToString(task.ID),
+									"issue_id", util.UUIDToString(task.IssueID),
+									"error", err,
+								)
+							}
+						}
 					}
 				}
 			}
