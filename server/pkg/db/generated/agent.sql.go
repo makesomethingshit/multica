@@ -5848,6 +5848,43 @@ func (q *Queries) ListChatFinalizeDeferredExpired(ctx context.Context, arg ListC
 	return items, nil
 }
 
+const listCompletionFallbackOwedRuns = `-- name: ListCompletionFallbackOwedRuns :many
+SELECT id FROM agent_task_queue
+WHERE status = 'completed'
+  AND NOT is_leader_task
+  AND issue_id IS NOT NULL
+  AND completion_fallback_comment_id IS NULL
+ORDER BY completed_at DESC NULLS LAST, id DESC
+LIMIT $1::int
+`
+
+// Completed non-leader issue runs that never recorded a synthesized fallback
+// (GH #8719): the atomic synthesis transaction failed before persisting
+// anything, so no comment exists and no exact id was recorded. Newest first
+// so a recent failure is retried promptly; bounded per tick like the rest of
+// the sweep. Runs that legitimately need no fallback (explicit reply,
+// trivial output, suppressed) are skipped per-row by the same decision the
+// completion path uses.
+func (q *Queries) ListCompletionFallbackOwedRuns(ctx context.Context, maxPerTick int32) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listCompletionFallbackOwedRuns, maxPerTick)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingCompletionFallbacks = `-- name: ListPendingCompletionFallbacks :many
 SELECT fallback.id AS fallback_id, worker.id AS worker_task_id
 FROM comment AS fallback

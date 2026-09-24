@@ -4836,27 +4836,19 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 							"agent_id", util.UUIDToString(task.AgentID),
 						)
 					} else {
-						// Redact first, then bound: a runaway raw-stream Output (GH #5455)
-						// must never reach the issue thread, even as a clipped excerpt.
-						content := truncateFallbackCommentBody(redact.Text(body), maxSynthesizedFallbackCommentRunes)
-						fallbackCommentID = s.createAgentComment(ctx, task.IssueID, task.AgentID, content, "comment", task.TriggerCommentID, task.ID)
-						if fallbackCommentID.Valid {
-							// Record the synthesis on the run so completion
-							// reconcile and the sweeper replay identify this
-							// exact comment instead of shape-matching every
-							// agent comment the run authored (GH #8719): an
-							// explicit, possibly suppressed worker reply must
-							// never be reclassified as a fallback.
-							if err := s.Queries.RecordCompletionFallbackComment(ctx, db.RecordCompletionFallbackCommentParams{
-								TaskID:     task.ID,
-								FallbackID: fallbackCommentID,
-							}); err != nil {
-								slog.Warn("recording completion fallback comment failed",
-									"task_id", util.UUIDToString(task.ID),
-									"issue_id", util.UUIDToString(task.IssueID),
-									"error", err,
-								)
-							}
+						// Synthesize and record atomically; on failure warn
+						// and leave recovery to the sweeper late synthesis,
+						// which replays the same decision below (GH #8719).
+						id, err := s.synthesizeCompletionFallbackComment(ctx, task, body)
+						if err != nil {
+							slog.Warn("synthesizing completion fallback failed",
+								"task_id", util.UUIDToString(task.ID),
+								"issue_id", util.UUIDToString(task.IssueID),
+								"agent_id", util.UUIDToString(task.AgentID),
+								"error", err,
+							)
+						} else {
+							fallbackCommentID = id
 						}
 					}
 				}
@@ -7071,6 +7063,22 @@ func (s *TaskService) RecoverPendingDelegatedFailures(ctx context.Context, maxPe
 		}
 		result.Replayed++
 	}
+	// Completion fallbacks the completion path never persisted (GH #8719):
+	// the atomic synthesis transaction failed before anything committed, so
+	// no comment exists and no exact id was recorded. Late synthesis replays
+	// the creation-time decision and routes through the same replay row path.
+	owedRuns, err := s.Queries.ListCompletionFallbackOwedRuns(ctx, maxPerTick)
+	if err != nil {
+		return result, errors.Join(append(errs, fmt.Errorf("list owed completion fallbacks: %w", err))...)
+	}
+	result.Scanned += len(owedRuns)
+	for _, owedID := range owedRuns {
+		if err := s.replayCompletionFallbackOwedRun(ctx, owedID); err != nil {
+			errs = append(errs, fmt.Errorf("synthesize owed completion fallback %s: %w", util.UUIDToString(owedID), err))
+			continue
+		}
+		result.Replayed++
+	}
 	return result, errors.Join(errs...)
 }
 
@@ -7126,6 +7134,89 @@ func (s *TaskService) replayCompletionFallbackRow(ctx context.Context, row db.Li
 		parentComment = &parent
 	}
 	return s.DispatchCompletionFallbackByLineage(ctx, issue, workerTask, fallback, parentComment)
+}
+
+// synthesizeCompletionFallbackComment persists the synthesized completion
+// fallback and records its exact id on the worker run in ONE transaction
+// (GH #8719): either both commit or neither does, so a record failure can
+// never orphan a comment that reconcile and the sweeper can no longer
+// identify. Redact-then-bound matches the completion path contract (GH
+// #5455). Creation side effects (broadcast, thread reopen) run after the
+// commit; their failure never loses the obligation.
+func (s *TaskService) synthesizeCompletionFallbackComment(ctx context.Context, task db.AgentTaskQueue, body string) (pgtype.UUID, error) {
+	content := truncateFallbackCommentBody(redact.Text(body), maxSynthesizedFallbackCommentRunes)
+	var created db.CreateCommentRow
+	var issue db.Issue
+	var rootComment *db.Comment
+	if err := s.runInTx(ctx, func(q *db.Queries) error {
+		var err error
+		created, issue, rootComment, err = insertAgentCommentRow(ctx, q, task.IssueID, task.AgentID, content, "comment", task.TriggerCommentID, task.ID)
+		if err != nil {
+			return err
+		}
+		return q.RecordCompletionFallbackComment(ctx, db.RecordCompletionFallbackCommentParams{
+			TaskID:     task.ID,
+			FallbackID: created.Comment().ID,
+		})
+	}); err != nil {
+		return pgtype.UUID{}, err
+	}
+	s.publishAgentComment(ctx, issue, created, rootComment, task.AgentID, task.ID)
+	return created.Comment().ID, nil
+}
+
+// replayCompletionFallbackOwedRun synthesizes a fallback the completion path
+// never persisted (GH #8719) and routes it through the same replay row path
+// the sweeper uses for recorded fallbacks. The owed decision mirrors the
+// creation-time checks exactly: runs that legitimately need no fallback
+// (explicit reply, trivial output, suppressed) are skipped every tick.
+func (s *TaskService) replayCompletionFallbackOwedRun(ctx context.Context, taskID pgtype.UUID) error {
+	task, err := s.Queries.GetAgentTask(ctx, taskID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("load owed fallback run: %w", err)
+	}
+	if !task.IssueID.Valid || task.CompletionFallbackCommentID.Valid {
+		return nil
+	}
+	suppressNoActionComment, err := HasSquadLeaderNoActionEvaluationForTask(ctx, s.Queries, task)
+	if err != nil {
+		slog.Warn("checking squad leader no_action evaluation failed",
+			"task_id", util.UUIDToString(task.ID),
+			"issue_id", util.UUIDToString(task.IssueID),
+			"agent_id", util.UUIDToString(task.AgentID),
+			"error", err,
+		)
+	}
+	agentCommented, err := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
+		IssueID:  task.IssueID,
+		AuthorID: task.AgentID,
+		Since:    coalesceTaskCommentAnchor(task),
+	})
+	if err != nil {
+		return fmt.Errorf("check owed run comments: %w", err)
+	}
+	if suppressNoActionComment || agentCommented {
+		return nil
+	}
+	var payload protocol.TaskCompletedPayload
+	if err := json.Unmarshal(task.Result, &payload); err != nil || payload.Output == "" {
+		return nil
+	}
+	body := util.UnescapeBackslashEscapes(payload.Output)
+	if task.TriggerCommentID.Valid && isTrivialDoneOutput(body) {
+		return nil
+	}
+	id, err := s.synthesizeCompletionFallbackComment(ctx, task, body)
+	if err != nil {
+		return fmt.Errorf("synthesize owed fallback: %w", err)
+	}
+	return s.replayCompletionFallbackRow(ctx, db.ListPendingCompletionFallbacksRow{
+		WorkerTaskID: task.ID,
+		FallbackID:   id,
+	})
 }
 
 // HasTaskCoveringCompletionFallback reports whether a synthesized completion
@@ -7883,27 +7974,40 @@ func commentEventFields(c db.Comment) map[string]any {
 }
 
 func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID pgtype.UUID, content, commentType string, parentID, sourceTaskID pgtype.UUID) pgtype.UUID {
-	if content == "" {
-		return pgtype.UUID{}
-	}
-	// Look up issue to get workspace ID for mention expansion and broadcasting.
-	issue, err := s.Queries.GetIssue(ctx, issueID)
+	created, issue, rootComment, err := insertAgentCommentRow(ctx, s.Queries, issueID, agentID, content, commentType, parentID, sourceTaskID)
 	if err != nil {
 		return pgtype.UUID{}
+	}
+	s.publishAgentComment(ctx, issue, created, rootComment, agentID, sourceTaskID)
+	return created.Comment().ID
+}
+
+// insertAgentCommentRow persists an agent comment and resolves its thread root
+// without side effects, so callers that must atomically link the new row
+// (GH #8719) can run it inside their own transaction.
+func insertAgentCommentRow(ctx context.Context, q *db.Queries, issueID, agentID pgtype.UUID, content, commentType string, parentID, sourceTaskID pgtype.UUID) (db.CreateCommentRow, db.Issue, *db.Comment, error) {
+	var empty db.CreateCommentRow
+	if content == "" {
+		return empty, db.Issue{}, nil, fmt.Errorf("insert agent comment: empty content")
+	}
+	// Look up issue to get workspace ID for mention expansion and broadcasting.
+	issue, err := q.GetIssue(ctx, issueID)
+	if err != nil {
+		return empty, db.Issue{}, nil, err
 	}
 	// Resolve the thread root for thread-level side effects without overwriting
 	// parentID. The stored parent_id must remain the exact comment being replied
 	// to; recursive thread reads recover the root when needed.
 	var rootComment *db.Comment
 	if parentID.Valid {
-		if root, err := s.Queries.GetThreadRoot(ctx, db.GetThreadRootParams{
+		if root, err := q.GetThreadRoot(ctx, db.GetThreadRootParams{
 			CommentID:   parentID,
 			WorkspaceID: issue.WorkspaceID,
 		}); err == nil {
 			rootComment = &root
 		}
 	}
-	created, err := s.Queries.CreateComment(ctx, db.CreateCommentParams{
+	created, err := q.CreateComment(ctx, db.CreateCommentParams{
 		ID:           dbid.NewV7(),
 		IssueID:      issueID,
 		WorkspaceID:  issue.WorkspaceID,
@@ -7915,8 +8019,15 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		SourceTaskID: sourceTaskID,
 	})
 	if err != nil {
-		return pgtype.UUID{}
+		return empty, db.Issue{}, nil, err
 	}
+	return created, issue, rootComment, nil
+}
+
+// publishAgentComment emits the side effects of a persisted agent comment: the
+// creation broadcast and the resolved-thread reopen. It runs after the owning
+// transaction commits; its failure never loses the row.
+func (s *TaskService) publishAgentComment(ctx context.Context, issue db.Issue, created db.CreateCommentRow, rootComment *db.Comment, agentID, sourceTaskID pgtype.UUID) {
 	comment := created.Comment()
 	commentFields := commentEventFields(comment)
 	commentFields["revision"] = comment.Revision
@@ -7933,7 +8044,6 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 		},
 	})
 	s.AutoUnresolveThreadOnReply(ctx, rootComment, util.UUIDToString(issue.WorkspaceID), "agent", util.UUIDToString(agentID), sourceTaskID)
-	return comment.ID
 }
 
 // AutoUnresolveThreadOnReply clears resolved_at on the thread root when a

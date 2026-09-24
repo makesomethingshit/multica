@@ -2127,6 +2127,22 @@ UPDATE agent_task_queue
 SET completion_fallback_comment_id = @fallback_id::uuid
 WHERE id = @task_id::uuid;
 
+-- name: ListCompletionFallbackOwedRuns :many
+-- Completed non-leader issue runs that never recorded a synthesized fallback
+-- (GH #8719): the atomic synthesis transaction failed before persisting
+-- anything, so no comment exists and no exact id was recorded. Newest first
+-- so a recent failure is retried promptly; bounded per tick like the rest of
+-- the sweep. Runs that legitimately need no fallback (explicit reply,
+-- trivial output, suppressed) are skipped per-row by the same decision the
+-- completion path uses.
+SELECT id FROM agent_task_queue
+WHERE status = 'completed'
+  AND NOT is_leader_task
+  AND issue_id IS NOT NULL
+  AND completion_fallback_comment_id IS NULL
+ORDER BY completed_at DESC NULLS LAST, id DESC
+LIMIT @max_per_tick::int;
+
 -- name: HasTaskCoveringDelegatedFailureComment :one
 -- Durable idempotency check for a recovery comment. The completion reconciler
 -- excludes its own just-completed task when replaying a planned-but-undelivered

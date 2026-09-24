@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -742,6 +744,111 @@ func TestCompletionFallbackSuppressedReplyNotReclassified(t *testing.T) {
 	}
 	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
 		t.Fatalf("sweeper replayed suppressed reply: got %d leader task(s), want 0", got)
+	}
+}
+
+// failRecordCompletionTxStarter begins real transactions whose
+// RecordCompletionFallbackComment statement fails, standing in for any
+// failure between synthesizing the fallback comment and recording its id.
+type failRecordCompletionTxStarter struct {
+	delegate *pgxpool.Pool
+}
+
+type failRecordCompletionTx struct {
+	pgx.Tx
+}
+
+func (s *failRecordCompletionTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.delegate.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return failRecordCompletionTx{Tx: tx}, nil
+}
+
+func (t failRecordCompletionTx) Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
+	if strings.Contains(query, "-- name: RecordCompletionFallbackComment") {
+		return pgconn.CommandTag{}, errors.New("injected fallback record failure")
+	}
+	return t.Tx.Exec(ctx, query, args...)
+}
+
+// TestCompletionFallbackAtomicBoundary pins the record-failure hole (GH
+// #8719): when recording the exact id fails, the synthesis transaction rolls
+// back atomically (no orphan comment, no record, no wake), and the sweeper
+// late synthesis recovers exactly one covered coordinator run. It does not
+// depend on completion-callback replay, which early-returns on
+// transitioned=false.
+func TestCompletionFallbackAtomicBoundary(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback atomic leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback atomic leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback atomic worker runtime")
+	workerID := dbfx.Agent(t, "Fallback atomic worker", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback atomic squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Atomic fallback boundary", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) do the work", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	originalTxStarter := testHandler.TaskService.TxStarter
+	testHandler.TaskService.TxStarter = &failRecordCompletionTxStarter{delegate: testPool}
+	completed, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte("{\"output\":\"The delegated work is complete.\"}"), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || fallbackID.Valid {
+		t.Fatalf("atomic boundary = (transitioned=%v fallback_valid=%v err=%v), want completed run with no fallback id", transitioned, fallbackID.Valid, err)
+	}
+	_ = completed
+	// (a) atomic rollback: no orphan comment, no record, no wake.
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID); got != 0 {
+		t.Fatalf("failed record left %d orphan comment(s), want 0 (rollback)", got)
+	}
+	stored, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(workerTaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CompletionFallbackCommentID.Valid {
+		t.Fatal("failed record left an exact id behind")
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
+		t.Fatalf("failed record created %d leader task(s), want 0", got)
+	}
+	testHandler.TaskService.TxStarter = originalTxStarter
+	// (b) sweeper late synthesis recovers exactly one covered coordinator run.
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper recovery failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("sweeper recovery left %d runnable coordinator task(s), want exactly 1", got)
+	}
+	var recoveredID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID).Scan(&recoveredID)
+	if recoveredID == "" {
+		t.Fatal("late synthesis did not persist a fallback comment")
+	}
+	next := claimWorkerReplyRun(t, leaderRuntimeID)
+	if next == nil || !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, recoveredID) {
+		t.Fatalf("recovery did not deliver the fallback to the coordinator: task=%+v", next)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("recovery created %d runnable coordinator task(s), want exactly 1", got)
 	}
 }
 
