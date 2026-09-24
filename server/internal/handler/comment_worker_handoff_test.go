@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -396,6 +397,16 @@ func TestCompletionFallbackCrossTaskReparseBlocked(t *testing.T) {
 		"originator_user_id": testUserID, "accountable_user_id": testUserID,
 		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
 	})
+	// B already runs on the same thread BEFORE W completes, so W's fallback
+	// lands inside B's reconciliation window (created after B, same thread).
+	// Creating B after W completes would exclude the fallback on the time
+	// filter and let this test pass vacuously, even without the guard.
+	otherTaskID := dbfx.Task(t, otherID, testutil.Cols{
+		"runtime_id": otherRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
 	completeWorkerReplyRun(t, workerTaskID)
 	var fallbackID string
 	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID).Scan(&fallbackID)
@@ -405,23 +416,45 @@ func TestCompletionFallbackCrossTaskReparseBlocked(t *testing.T) {
 	// Rewrite the fallback body to mention an unrelated agent B explicitly.
 	dbfx.Exec(t, `UPDATE comment SET content = $2 WHERE id = $1`, fallbackID,
 		fmt.Sprintf("Done. [@B](mention://agent/%s) please take over", otherID))
-	// B runs later on the same thread and completes: B's reconcile pass must
-	// not re-parse W's fallback body into a fresh invocation of B (or Other).
-	otherTaskID := dbfx.Task(t, otherID, testutil.Cols{
-		"runtime_id": otherRuntimeID, "issue_id": issueID, "status": "running",
-		"trigger_comment_id": rootID,
-		"originator_user_id": testUserID, "accountable_user_id": testUserID,
-		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	// Prove the test is not vacuous: W's fallback must be in B's
+	// reconcilable set, so B's reconcile pass actually sees it.
+	bTask, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(otherTaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bPlanned := append([]pgtype.UUID{}, bTask.CoalescedCommentIds...)
+	if bTask.TriggerCommentID.Valid {
+		bPlanned = append(bPlanned, bTask.TriggerCommentID)
+	}
+	bReconcilable, err := testHandler.Queries.ListReconcilableCommentsForIssueSince(ctx, db.ListReconcilableCommentsForIssueSinceParams{
+		CommentThreadID:   bTask.CommentThreadID,
+		IssueID:           bTask.IssueID,
+		Since:             bTask.CreatedAt,
+		PlannedCommentIds: bPlanned,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bSeesFallback := false
+	for _, rc := range bReconcilable {
+		if uuidToString(rc.ID) == fallbackID {
+			bSeesFallback = true
+			break
+		}
+	}
+	if !bSeesFallback {
+		t.Fatal("W fallback is not in B's reconcilable set: cross-task guard would pass vacuously")
+	}
+	// B completes: its reconcile pass must not re-parse W's fallback body
+	// into a fresh invocation of B.
 	completeWorkerReplyRun(t, otherTaskID)
-	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, otherID); got != 0 {
-		t.Fatalf("cross-task reconcile re-parsed fallback mention: got %d queued B task(s), want 0", got)
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, otherID); got != 0 {
+		t.Fatalf("cross-task reconcile re-parsed fallback mention: got %d runnable B task(s), want 0", got)
 	}
 	// The fallback still belongs to W's coordinator handoff, not to B.
 	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory') AND is_leader_task = TRUE", issueID, leaderID); got != 1 {
 		t.Fatalf("coordinator handoff lost during cross-task completion: got %d, want 1", got)
 	}
-	_ = ctx
 }
 
 // TestCompletionFallbackReplayIsIdempotent pins §10 Test E (GH #8719):

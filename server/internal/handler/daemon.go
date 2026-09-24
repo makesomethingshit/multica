@@ -4640,13 +4640,19 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		// bodies through mention fan-out here would resurrect the terminal
 		// originator authority §1/§4 forbids. Skip them here; the sweeper's
 		// ListPendingCompletionFallbacks replay owns their durable delivery.
-		if c.AuthorType == "agent" && c.SourceTaskID.Valid {
-			if srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID); err == nil {
+			if c.AuthorType == "agent" && c.SourceTaskID.Valid {
+				srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID)
+				if err != nil {
+					// Fail closed: an unverifiable lineage claim must never
+					// fall through to generic mention parsing. Transient
+					// lookup failures stay pending for the sweeper replay;
+					// they are not proven-invalid lineage.
+					continue
+				}
 				if !srcTask.IsLeaderTask && srcTask.Status == "completed" {
 					continue
 				}
 			}
-		}
 		var parentComment *db.Comment
 		if c.ParentID.Valid {
 			// Scope to the issue's workspace; a comment's parent is always in the

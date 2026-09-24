@@ -4652,6 +4652,16 @@ func startsWithAbsolutePath(s string) bool {
 // causing the new task to resume against a stale (or NULL) session.
 // durableWorkDir is terminal delivery metadata, not a resume pointer: it is
 // populated only after the daemon confirms a disposable worktree is gone.
+// coalesceTaskCommentAnchor returns the StartedAt anchor for the
+// HasAgentCommentedSince fallback-synthesis check, falling back to CreatedAt
+// for fixture/legacy rows with NULL started_at.
+func coalesceTaskCommentAnchor(task db.AgentTaskQueue) pgtype.Timestamptz {
+	if task.StartedAt.Valid {
+		return task.StartedAt
+	}
+	return task.CreatedAt
+}
+
 func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, error) {
 	task, _, _, err := s.CompleteTaskWithTransition(ctx, taskID, result, sessionID, workDir, branchName, sessionRolloutMissing, retiredSessionID, durableWorkDir)
 	return task, err
@@ -4800,15 +4810,16 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 				"error", err,
 			)
 		}
-		agentCommented, _ := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
-			IssueID:  task.IssueID,
-			AuthorID: task.AgentID,
-			// Anchor on creation, not start: fixture/legacy rows may carry
-			// an invalid started_at (NULL), which would make `created_at >=
-			// -infinity` true for every row and suppress synthesis even when
-			// the agent posted nothing during this run.
-			Since: task.CreatedAt,
-		})
+			agentCommented, _ := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
+				IssueID:  task.IssueID,
+				AuthorID: task.AgentID,
+				// Anchor on start when known: the query matches on
+				// issue/agent/time only, so anchoring on creation would let
+				// another run's comment posted while this task waited in the
+				// queue suppress this run's fallback synthesis. Fall back to
+				// creation only for fixture/legacy rows with NULL started_at.
+				Since: coalesceTaskCommentAnchor(task),
+			})
 		if !suppressNoActionComment && !agentCommented {
 			var payload protocol.TaskCompletedPayload
 			if err := json.Unmarshal(result, &payload); err == nil {
