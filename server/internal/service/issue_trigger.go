@@ -17,7 +17,7 @@ const (
 	// is being handed to an agent/squad. Parks silently on backlog.
 	RunSourceAssign RunEnqueueSource = "assign"
 	// RunSourceStatus covers promoting an already-assigned issue out of
-	// backlog into an active status.
+	// backlog into an active status, plus resuming a blocked issue to todo.
 	RunSourceStatus RunEnqueueSource = "status"
 )
 
@@ -131,9 +131,13 @@ func (s *IssueService) WillEnqueueRun(ctx context.Context, in IssueTriggerInput,
 			return IssueRunTrigger{}, false
 		}
 		source = RunSourceAssign
-	case in.StatusChanged && prevStatus == "backlog" &&
+	// Status resumes an assigned run when leaving backlog for a runnable
+	// status, or on an explicit blocked->todo resume (Effective keeps
+	// custom keys raw except terminal, so this is built-in blocked->todo).
+	case in.StatusChanged && ((prevStatus == "backlog" &&
 		currentStatus != "backlog" &&
-		currentStatus != "done" && currentStatus != "cancelled":
+		currentStatus != "done" && currentStatus != "cancelled") ||
+		(prevStatus == "blocked" && currentStatus == "todo")):
 		if probe.IsSelfLoop != nil && probe.IsSelfLoop() {
 			return IssueRunTrigger{}, false
 		}
