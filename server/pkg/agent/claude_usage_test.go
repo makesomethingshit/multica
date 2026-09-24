@@ -99,7 +99,7 @@ func TestClaudeExecuteFallbackUsage(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			backend := claudeUsageFixtureBackend(t, tt.events, tt.result, !tt.success)
+			backend := claudeUsageFixtureBackend(t, tt.events, tt.result, !tt.success, "")
 			result := executeClaudeUsageFixture(t, backend, len(tt.events), "")
 			wantStatus := "failed"
 			if tt.success {
@@ -145,7 +145,7 @@ func TestClaudeExecuteKeepsResumedUsageTaskLocal(t *testing.T) {
 					"cacheReadInputTokens": tc.cumulative.CacheReadTokens, "cacheCreationInputTokens": tc.cumulative.CacheWriteTokens,
 				}},
 			})
-			backend := claudeUsageFixtureBackend(t, nil, resultEvent, false)
+			backend := claudeUsageFixtureBackend(t, nil, resultEvent, false, "")
 			result := executeClaudeUsageFixture(t, backend, 0, tc.resumeSessionID)
 			if want := map[string]TokenUsage{model: tc.current}; !reflect.DeepEqual(result.Usage, want) {
 				t.Fatalf("usage = %#v, want current invocation usage %#v", result.Usage, want)
@@ -154,10 +154,93 @@ func TestClaudeExecuteKeepsResumedUsageTaskLocal(t *testing.T) {
 	}
 }
 
+func TestClaudeExecuteResumedSubagentUsageGap(t *testing.T) {
+	t.Parallel()
+	const mainModel = "claude-sonnet-4-6"
+	const subagentModel = "claude-haiku-4-5"
+	mainTurn := TokenUsage{InputTokens: 40, OutputTokens: 6, CacheReadTokens: 8, CacheWriteTokens: 12}
+	resultEvent := mustMarshal(t, map[string]any{
+		"type": "result", "subtype": "success", "is_error": false, "session_id": "session-1", "model": mainModel,
+		"usage": map[string]int64{
+			"input_tokens": mainTurn.InputTokens, "output_tokens": mainTurn.OutputTokens,
+			"cache_read_input_tokens": mainTurn.CacheReadTokens, "cache_creation_input_tokens": mainTurn.CacheWriteTokens,
+		},
+		"modelUsage": map[string]any{
+			mainModel:     map[string]int64{"inputTokens": 140, "outputTokens": 26, "cacheReadInputTokens": 38, "cacheCreationInputTokens": 52},
+			subagentModel: map[string]int64{"inputTokens": 50, "outputTokens": 18, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 4},
+		},
+	})
+	backend := claudeUsageFixtureBackend(t, nil, resultEvent, false, "")
+	result := executeClaudeUsageFixture(t, backend, 0, "session-1")
+	// Document the current protocol limit: result.usage excludes subagents,
+	// while modelUsage carries their session-cumulative totals.
+	if want := map[string]TokenUsage{mainModel: mainTurn}; !reflect.DeepEqual(result.Usage, want) {
+		t.Fatalf("usage = %#v, want documented main-loop-only usage %#v", result.Usage, want)
+	}
+}
+
+func TestClaudeExecuteResumedEmptyUsageKeepsAssistantFallback(t *testing.T) {
+	t.Parallel()
+	const model = "claude-sonnet-4-6"
+	event := json.RawMessage(`{"type":"assistant","message":{"id":"msg_current","role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":40,"output_tokens":1,"cache_read_input_tokens":8,"cache_creation_input_tokens":12},"content":[{"type":"text","text":"visible text"},{"type":"tool_use","id":"tool_current","name":"Read","input":{"file_path":"fixture.txt"}}]}}`)
+	resultEvent := mustMarshal(t, map[string]any{
+		"type": "result", "subtype": "success", "is_error": false, "session_id": "session-1",
+		"modelUsage": map[string]any{
+			model:              map[string]int64{"inputTokens": 140, "outputTokens": 26, "cacheReadInputTokens": 38, "cacheCreationInputTokens": 52},
+			"claude-haiku-4-5": map[string]int64{"inputTokens": 50, "outputTokens": 18, "cacheReadInputTokens": 9, "cacheCreationInputTokens": 4},
+		},
+	})
+	for _, tc := range []struct {
+		name   string
+		events []json.RawMessage
+		want   map[string]TokenUsage
+	}{
+		{name: "assistant_fallback", events: []json.RawMessage{event}, want: map[string]TokenUsage{model: {InputTokens: 40, CacheReadTokens: 8, CacheWriteTokens: 12}}},
+		{name: "no_local_fallback", want: map[string]TokenUsage{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			backend := claudeUsageFixtureBackend(t, tc.events, resultEvent, false, "")
+			result := executeClaudeUsageFixture(t, backend, len(tc.events), "session-1")
+			if !reflect.DeepEqual(result.Usage, tc.want) {
+				t.Fatalf("usage = %#v, want task-local fallback %#v", result.Usage, tc.want)
+			}
+		})
+	}
+}
+
+func TestClaudeExecuteResumedCustomEndpointKeepsModelUsage(t *testing.T) {
+	t.Parallel()
+	const mainModel = "claude-sonnet-4-6"
+	const subagentModel = "claude-haiku-4-5"
+	mainTurn := TokenUsage{InputTokens: 40, OutputTokens: 6, CacheReadTokens: 8, CacheWriteTokens: 12}
+	subagentTurn := TokenUsage{InputTokens: 30, OutputTokens: 9, CacheReadTokens: 5, CacheWriteTokens: 3}
+	resultEvent := mustMarshal(t, map[string]any{
+		"type": "result", "subtype": "success", "is_error": false, "session_id": "session-1", "model": mainModel,
+		"usage": map[string]int64{"input_tokens": 999, "output_tokens": 999},
+		"modelUsage": map[string]any{
+			mainModel: map[string]int64{
+				"inputTokens": mainTurn.InputTokens, "outputTokens": mainTurn.OutputTokens,
+				"cacheReadInputTokens": mainTurn.CacheReadTokens, "cacheCreationInputTokens": mainTurn.CacheWriteTokens,
+			},
+			subagentModel: map[string]int64{
+				"inputTokens": subagentTurn.InputTokens, "outputTokens": subagentTurn.OutputTokens,
+				"cacheReadInputTokens": subagentTurn.CacheReadTokens, "cacheCreationInputTokens": subagentTurn.CacheWriteTokens,
+			},
+		},
+	})
+	backend := claudeUsageFixtureBackend(t, nil, resultEvent, false, "http://127.0.0.1:4318")
+	result := executeClaudeUsageFixture(t, backend, 0, "session-1")
+	want := map[string]TokenUsage{mainModel: mainTurn, subagentModel: subagentTurn}
+	if !reflect.DeepEqual(result.Usage, want) {
+		t.Fatalf("custom-endpoint usage = %#v, want modelUsage %#v", result.Usage, want)
+	}
+}
+
 func TestClaudeFallbackUsageIsScopedToExecution(t *testing.T) {
 	t.Parallel()
 	event := json.RawMessage(`{"type":"assistant","message":{"id":"msg_reused","role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":200,"cache_creation_input_tokens":10},"content":[{"type":"text","text":"visible text"},{"type":"tool_use","id":"tool_reused","name":"Read","input":{"file_path":"fixture.txt"}}]}}`)
-	backend := claudeUsageFixtureBackend(t, []json.RawMessage{event, event}, nil, true)
+	backend := claudeUsageFixtureBackend(t, []json.RawMessage{event, event}, nil, true, "")
 	for i := 0; i < 2; i++ {
 		t.Run(fmt.Sprintf("execution_%d", i), func(t *testing.T) {
 			t.Parallel()
@@ -170,7 +253,7 @@ func TestClaudeFallbackUsageIsScopedToExecution(t *testing.T) {
 	}
 }
 
-func claudeUsageFixtureBackend(t *testing.T, events []json.RawMessage, result json.RawMessage, fail bool) Backend {
+func claudeUsageFixtureBackend(t *testing.T, events []json.RawMessage, result json.RawMessage, fail bool, anthropicBaseURL string) Backend {
 	t.Helper()
 	var stream strings.Builder
 	for _, event := range events {
@@ -193,9 +276,13 @@ func claudeUsageFixtureBackend(t *testing.T, events []json.RawMessage, result js
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend, err := New("claude", Config{ExecutablePath: executable, Logger: slog.Default(), Env: map[string]string{
+	env := map[string]string{
 		"IS_SANDBOX": "1", "CLAUDE_FAKE_MODE": "usage_fixture", "CLAUDE_USAGE_FIXTURE": fixture, "CLAUDE_USAGE_FIXTURE_FAIL": failEnv,
-	}})
+	}
+	if anthropicBaseURL != "" {
+		env["ANTHROPIC_BASE_URL"] = anthropicBaseURL
+	}
+	backend, err := New("claude", Config{ExecutablePath: executable, Logger: slog.Default(), Env: env})
 	if err != nil {
 		t.Fatal(err)
 	}
