@@ -8,6 +8,9 @@ const mockState = vi.hoisted(() => ({
   summaries: [] as unknown[],
 }));
 
+vi.mock("../../common/use-viewing-timezone", () => ({
+  useViewingTimezone: () => "UTC",
+}));
 vi.mock("@multica/core/hooks", () => ({
   useWorkspaceId: () => "ws-1",
 }));
@@ -147,7 +150,7 @@ describe("IssueAgentActivityIndicator", () => {
     expect(screen.queryByTestId("hover-card-trigger")).toBeNull();
     // The cue itself survives — only the popup behind it is dropped.
     expect(screen.getByTestId("agent-avatar-stack")).not.toBeNull();
-    expect(screen.getByText("Working")).not.toBeNull();
+    expect(screen.getByText("Working", { ignore: '[aria-hidden="true"] *' })).not.toBeNull();
   });
 
   it("renders nothing when no agent is on the issue", () => {
@@ -188,7 +191,7 @@ it("prioritizes active runs, marking wakeup origin separately from future count"
   ];
   mockState.summaries = [eventSummary];
   render(<IssueAgentActivityIndicator issueId="issue-1" hoverCard={false} />);
-  expect(screen.getByText("Working")).toBeInTheDocument();
+  expect(screen.getByText("Working", { ignore: '[aria-hidden="true"] *' })).toBeInTheDocument();
   expect(screen.getByLabelText("Triggered by wakeup")).toBeInTheDocument();
   expect(screen.getByText("+2")).toBeInTheDocument();
   expect(screen.queryByText("Waiting for trigger")).toBeNull();

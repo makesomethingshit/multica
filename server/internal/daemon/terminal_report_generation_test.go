@@ -311,24 +311,25 @@ func TestClaimGenerationComesOnlyFromTheClaimPayload(t *testing.T) {
 	tests := []struct {
 		name           string
 		fenced         bool
-		raw            *string
+		raw            string
 		want           time.Time
 		wantUnreadable bool
 	}{
-		{name: "advertised nano precision", fenced: true, raw: &formatted, want: generation},
-		{name: "advertised second precision", fenced: true, raw: &secondPrecision, want: generation.Truncate(time.Second)},
+		{name: "advertised nano precision", fenced: true, raw: formatted, want: generation},
+		{name: "advertised second precision", fenced: true, raw: secondPrecision, want: generation.Truncate(time.Second)},
 		// No capability is a property of the SERVER (it never promised to compare
 		// the generation), and it keeps the legacy unfenced callback working —
 		// whatever the timestamp looks like.
-		{name: "not advertised, valid timestamp", raw: &formatted},
-		{name: "not advertised, absent", raw: nil},
-		{name: "not advertised, malformed", raw: ptrTo("not a timestamp")},
+		{name: "not advertised, valid timestamp", raw: formatted},
+		{name: "not advertised, absent"},
+		{name: "not advertised, malformed", raw: "not a timestamp"},
 		// An advertised contract with no readable generation is a protocol error,
 		// never an old server: it must not be reported as an absent generation.
 		{name: "advertised but missing", fenced: true, wantUnreadable: true},
-		{name: "advertised but empty", fenced: true, raw: new(string), wantUnreadable: true},
-		{name: "advertised but unparseable", fenced: true, raw: ptrTo("not a timestamp"), wantUnreadable: true},
-		{name: "advertised but zero instant", fenced: true, raw: ptrTo("0001-01-01T00:00:00Z"), wantUnreadable: true},
+		{name: "advertised but empty", fenced: true, raw: "", wantUnreadable: true},
+		{name: "advertised but whitespace", fenced: true, raw: "  ", wantUnreadable: true},
+		{name: "advertised but unparseable", fenced: true, raw: "not a timestamp", wantUnreadable: true},
+		{name: "advertised but zero instant", fenced: true, raw: "0001-01-01T00:00:00Z", wantUnreadable: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -342,8 +343,6 @@ func TestClaimGenerationComesOnlyFromTheClaimPayload(t *testing.T) {
 		})
 	}
 }
-
-func ptrTo(value string) *string { return &value }
 
 // TestTerminalReportRefusesAnUnreadableClaimGeneration pins the third case of
 // the parser: a claim that ships a dispatched_at we cannot read is a protocol
@@ -366,7 +365,7 @@ func TestTerminalReportRefusesAnUnreadableClaimGeneration(t *testing.T) {
 		kind:            terminalTaskReportComplete,
 		taskID:          "task-unreadable",
 		output:          "must never be delivered unfenced",
-		claimGeneration: claimGenerationForTask(Task{DispatchedAt: ptrTo("yesterday"), TerminalReportGenerationFenceV1: true}),
+		claimGeneration: claimGenerationForTask(Task{DispatchedAt: "yesterday", TerminalReportGenerationFenceV1: true}),
 	}
 	if err := d.reportTerminalTask(context.Background(), report); err == nil {
 		t.Fatal("unreadable claim generation was reported as delivered")

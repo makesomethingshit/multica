@@ -19,7 +19,27 @@
     "full_log": "Ouvrir le journal complet",
     "message": "Message de l'agent",
     "error": "Erreur",
-    "waiting_result": "En attente du résultat de l'outil..."
+    "waiting_result": "En attente du résultat de l'outil...",
+    "supplement_action": "Ajouter un message",
+    "supplement_placeholder": "Ajouter une consigne à cette exécution",
+    "supplement_send": "Envoyer",
+    "supplement_notice": "L'agent poursuit l'objectif initial.",
+    "supplement_unsupported": "Cette exécution ne prend pas en charge les messages supplémentaires.",
+    "supplement_forbidden": "Vous n'êtes pas autorisé à exécuter cet agent.",
+    "supplement_ended": "Cette exécution est terminée. Votre texte est conservé ; lancez explicitement une autre exécution pour l'envoyer.",
+    "supplement_failed": "Impossible d'envoyer le message. Votre texte est conservé.",
+    "supplement_waiting_delivery": "En attente de livraison",
+    "supplement_not_delivered": "Non livré · {{reason}}",
+    "supplement_failure_turn_ended": "l'exécution s'est terminée avant la livraison",
+    "supplement_failure_turn_not_started": "l’agent n’était pas prêt",
+    "supplement_failure_provider_rejected": "l’agent a refusé le message",
+    "supplement_failure_timeout": "la livraison a expiré",
+    "supplement_failure_unknown": "raison inconnue",
+    "supplement_move_to_new": "Déplacer vers un nouveau message",
+    "supplement_discard": "Abandonner",
+    "supplement_moved": "Déplacé vers la zone de nouveau message.",
+    "supplement_retry": "Réessayer",
+    "supplement_retry_failed": "Impossible de réessayer la livraison."
   },
   "status_catalog_error": {
     "title": "Impossible de charger la liste des états",
@@ -442,6 +462,7 @@
     "unpin_tooltip": "Détacher de la barre latérale",
     "thread_nav_label": "Aller au fil de commentaires",
     "thread_nav_resolved_label": "{{title}} (résolu)",
+    "thread_nav_reply_label": "{{author}} : {{title}}",
     "sidebar_tooltip": "Afficher ou masquer la barre latérale droite",
     "find": {
       "placeholder": "Rechercher dans la tâche...",
@@ -493,7 +514,16 @@
     "activity_count_one": "{{count}} activité",
     "activity_count_other": "{{count}} activités",
     "show_more_activities_one": "Afficher {{count}} activité de plus",
-    "show_more_activities_other": "Afficher {{count}} activités de plus"
+    "show_more_activities_other": "Afficher {{count}} activités de plus",
+    "duplicate_marked": "a marqué cette tâche comme doublon de {{identifier}}",
+    "duplicate_unmarked": "a retiré la marque de doublon de {{identifier}} sur cette tâche",
+    "duplicate_unmarked_to": "a retiré la marque de doublon de {{identifier}} sur cette tâche et l'a passée en {{status}}",
+    "duplicate_unmarked_original_deleted": "a retiré la marque de doublon, {{identifier}} a été supprimée",
+    "duplicate_added": "a marqué {{identifier}} comme doublon de cette tâche",
+    "duplicate_removed": "a retiré la marque de doublon de {{identifier}}",
+    "status_changed_pr": "a changé le statut de {{from}} à {{to}} après la fusion de toutes les PR liées ({{prs}})",
+    "pr_auto_complete_disabled": "a désactivé la fin automatique par PR pour cette tâche",
+    "pr_auto_complete_enabled": "a réactivé la fin automatique par PR pour cette tâche"
   },
   "comment": {
     "add_reaction": "Ajouter une réaction",
@@ -542,6 +572,7 @@
     "delete_failed": "Échec de la suppression du commentaire",
     "reply_count_one": "{{count}} réponse",
     "reply_count_other": "{{count}} réponses",
+    "replying_to": "En réponse à {{name}} : {{preview}}",
     "leave_comment_placeholder": "Laisser un commentaire...",
     "send_tooltip": "Envoyer",
     "trigger_source_issue_assignee": "assigné",
@@ -769,7 +800,8 @@
     "remove_parent_issue": "Retirer la tâche parente",
     "remove_parent_issue_success": "Tâche parente retirée",
     "add_sub_issue": "Ajouter une sous-tâche...",
-    "delete_issue": "Supprimer la tâche"
+    "delete_issue": "Supprimer la tâche",
+    "mark_duplicate": "Marquer comme doublon..."
   },
   "pickers": {
     "custom_property": {
@@ -817,6 +849,10 @@
       "manage_dialog_title": "Gérer les étiquettes",
       "create_action": "Créer",
       "create_failed": "Échec de la création de l'étiquette"
+    },
+    "status": {
+      "mark_duplicate": "Marquer comme doublon",
+      "change_original": "Changer la tâche d'origine"
     }
   },
   "labels_panel": {
@@ -1069,5 +1105,44 @@
     },
     "hourly": "Réveil chaque heure",
     "today_time": "Aujourd’hui {{time}}"
+  },
+  "duplicates": {
+    "banner_prefix": "Doublon de",
+    "unmark": "Pas un doublon",
+    "section_title": "Doublons",
+    "unmark_toast": "Rouverte en À faire"
+  },
+  "pr_automation": {
+    "link_action": "Lier une pull request",
+    "link_placeholder": "Collez l’URL de la pull request",
+    "link_hint": "Les PR dont le titre ou la branche contient {{identifier}} sont liées automatiquement.",
+    "link_submit": "Lier",
+    "link_not_found": "Multica n’a pas encore reçu cette PR. Vérifiez que son dépôt est connecté.",
+    "link_failed": "Impossible de lier la pull request.",
+    "row_menu": "Actions de la pull request",
+    "section_menu": "Automatisation des pull requests",
+    "source_title": "Liée par {{identifier}} dans le titre",
+    "source_branch": "Liée par le nom de branche",
+    "source_manual": "Liée manuellement",
+    "source_auto": "Liée automatiquement",
+    "unlink": "Retirer de la tâche",
+    "unlinked": "{{pr}} retirée",
+    "unlinked_completed": "{{pr}} retirée. Les autres PR sont fusionnées, la tâche est terminée.",
+    "unlink_failed": "Impossible de retirer la pull request.",
+    "undo": "Annuler",
+    "disable": "Désactiver la fin automatique",
+    "enable": "Réactiver la fin automatique",
+    "settings": "Réglages de fin automatique",
+    "update_failed": "Impossible de modifier la fin automatique.",
+    "waiting_one": "Se termine quand {{prs}} est fusionnée",
+    "waiting_other": "Se termine quand {{prs}} sont fusionnées",
+    "not_merged": "{{prs}} fermée sans fusion",
+    "not_merged_action": "Retirer",
+    "no_close_intent": "Ne se termine pas : pas de « Closes {{identifier}} »",
+    "all_merged": "Toutes les PR sont fusionnées. La prochaine PR fusionnée terminera la tâche.",
+    "issue_disabled": "Fin automatique désactivée pour cette tâche",
+    "issue_disabled_action": "Réactiver",
+    "workspace_disabled": "La fin automatique par PR est désactivée pour cet espace",
+    "workspace_disabled_action": "Réglages"
   }
 }

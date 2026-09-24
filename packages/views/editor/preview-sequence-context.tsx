@@ -1,30 +1,32 @@
 "use client";
 
 /**
- * ImageSequenceProvider — prev / next for the images of ONE surface (MUL-5752).
+ * PreviewSequenceProvider — prev / next for the attachments of ONE surface
+ * (MUL-5752, MUL-7642).
  *
- * A surface that can hold several images (an issue: description + every
+ * A surface that can hold several attachments (an issue: description + every
  * comment; a chat session: every message) mounts this once with the ordered
- * sequence built by `collectImageSequence`. Clicking any image inside opens
- * the shared preview modal at that image's real position and lets the reader
- * page through the rest.
+ * sequence built by `collectPreviewSequence`. Opening any previewable
+ * attachment inside — an image, a PDF, a Markdown report, an HTML file —
+ * opens the shared viewer at its real position so the reader can page through
+ * the rest of the surface's files.
  *
- * Why one provider instead of per-image state: `<Attachment>` owns a private
- * `useAttachmentPreview()` modal, which is right for a lone image but cannot
- * know what comes next. The provider hosts a single modal above every image,
- * so navigation state has exactly one owner.
+ * Why one provider instead of per-attachment state: `<Attachment>` owns a
+ * private `useAttachmentPreview()` modal, which is right for a lone file but
+ * cannot know what comes next. The provider hosts a single modal above every
+ * attachment, so navigation state has exactly one owner.
  *
  * Two behaviours worth stating up front, both from the product brief:
  *
  *   - The sequence is FROZEN when the modal opens. New comments and streaming
  *     agent output keep arriving while a preview is open; recomputing live
  *     would shift "3 / 7" under the reader mid-look.
- *   - Boundaries DISABLE, they don't wrap. First image: no previous. Last
- *     image: no next.
+ *   - Boundaries DISABLE, they don't wrap. First file: no previous. Last
+ *     file: no next.
  *
- * Images outside the sequence (an in-flight upload in a composer, an image in
- * a surface with no provider) are not an error: `openAt` reports false and the
- * caller falls back to its own single-image preview.
+ * Attachments outside the sequence (an in-flight upload in a composer, a file
+ * in a surface with no provider) are not an error: `openAt` reports false and
+ * the caller falls back to its own single-file preview.
  */
 
 import {
@@ -38,7 +40,9 @@ import {
 } from "react";
 import { toast } from "sonner";
 import {
+  collectAttachmentSequence,
   indexOfImageKey,
+  type ImageSequenceBlock,
   type ImageSequenceItem,
 } from "@multica/core/attachments/image-sequence";
 import { useT } from "../i18n";
@@ -47,46 +51,61 @@ import {
   PreviewImagePrefetch,
   type PreviewSource,
 } from "./attachment-preview-modal";
+import { canOpenPreview, getPreviewKind } from "./utils/preview";
 
-interface ImageSequenceApi {
+/**
+ * The sequence a web / desktop surface pages through: every attachment the
+ * viewer can open, in render order.
+ */
+export function collectPreviewSequence(
+  blocks: ReadonlyArray<ImageSequenceBlock | null | undefined>,
+): ImageSequenceItem[] {
+  return collectAttachmentSequence(blocks, ({ contentType, filename, hasRecord }) =>
+    canOpenPreview(getPreviewKind(contentType, filename), hasRecord),
+  );
+}
+
+interface PreviewSequenceApi {
   /**
    * Open the shared viewer at `key` — the attachment id, or the URL as written
    * in the body for references that don't resolve to a record.
    *
    * Returns false when no provider is mounted or the key is not part of this
-   * surface's sequence, so callers can fall back to a single-image preview.
+   * surface's sequence, so callers can fall back to a single-file preview.
    */
   openAt: (key: string) => boolean;
 }
 
-const NO_SEQUENCE: ImageSequenceApi = { openAt: () => false };
+const NO_SEQUENCE: PreviewSequenceApi = { openAt: () => false };
 
-const ImageSequenceContext = createContext<ImageSequenceApi>(NO_SEQUENCE);
+const PreviewSequenceContext = createContext<PreviewSequenceApi>(NO_SEQUENCE);
 
 /**
- * Returns the surrounding surface's image viewer, or a no-op handle when
- * there is no provider. Always safe to call — `openAt` reporting false is the
+ * Returns the surrounding surface's viewer, or a no-op handle when there is
+ * no provider. Always safe to call — `openAt` reporting false is the
  * documented "not part of a sequence" answer, not a failure.
  */
-export function useImageSequencePreview(): ImageSequenceApi {
-  return use(ImageSequenceContext);
+export function usePreviewSequence(): PreviewSequenceApi {
+  return use(PreviewSequenceContext);
 }
 
 function toPreviewSource(item: ImageSequenceItem): PreviewSource {
-  return item.attachment
-    ? { kind: "full", attachment: item.attachment }
-    : // Everything in a sequence is an image by construction —
-      // `collectImageSequence` admits nothing else — so the viewer says so
-      // rather than letting the modal re-derive it from `filename`. For an
-      // item with no attachment record that field holds the markdown caption
-      // (`![报告图表](…)`), which is prose and has no extension to read
-      // (MUL-7518).
-      {
-        kind: "url",
-        url: item.url,
-        filename: item.filename,
-        forceKind: "image",
-      };
+  if (item.attachment) return { kind: "full", attachment: item.attachment };
+  return {
+    kind: "url",
+    url: item.url,
+    filename: item.filename,
+    // A body image's `filename` is its markdown caption — prose with no
+    // extension to read — so say what it is instead of letting the modal
+    // re-derive it (MUL-7518). A file card's name is a real filename.
+    forceKind: item.imageByConstruction ? "image" : undefined,
+  };
+}
+
+function isImageItem(item: ImageSequenceItem): boolean {
+  if (item.imageByConstruction) return true;
+  const contentType = item.attachment?.content_type ?? "";
+  return getPreviewKind(contentType, item.filename || item.url) === "image";
 }
 
 interface Session {
@@ -95,7 +114,7 @@ interface Session {
   index: number;
 }
 
-export function ImageSequenceProvider({
+export function PreviewSequenceProvider({
   items,
   children,
 }: {
@@ -111,7 +130,7 @@ export function ImageSequenceProvider({
   const [session, setSession] = useState<Session | null>(null);
   const [open, setOpen] = useState(false);
   // Images that failed to load this session. Kept out of navigation so a
-  // deleted attachment can't trap the reader on a broken frame, and so the
+  // deleted image can't trap the reader on a broken frame, and so the
   // auto-skip below can't bounce between two dead images forever. The ref is
   // the synchronous truth (an <img> can report failure more than once before
   // React re-renders); the state copy exists to drive that re-render.
@@ -121,7 +140,7 @@ export function ImageSequenceProvider({
   // reader was already going.
   const directionRef = useRef<1 | -1>(1);
 
-  const api = useMemo<ImageSequenceApi>(
+  const api = useMemo<PreviewSequenceApi>(
     () => ({
       openAt: (key: string) => {
         const snapshot = [...itemsRef.current];
@@ -207,24 +226,26 @@ export function ImageSequenceProvider({
     ) : null;
 
   return (
-    <ImageSequenceContext.Provider value={api}>
+    <PreviewSequenceContext.Provider value={api}>
       {children}
       {modal}
-      {/* Warm the immediate neighbours while a preview is open, so paging
-          swaps from cache instead of waiting a network round-trip. Keyed
-          mounts: moving re-targets the prefetch to the new neighbours. */}
-      {open && session && prevIndex >= 0 && (
+      {/* Warm the immediate image neighbours while a preview is open, so
+          paging swaps from cache instead of waiting a network round-trip.
+          Other kinds load on arrival — a PDF or a video is not worth
+          fetching speculatively. Keyed mounts: moving re-targets the
+          prefetch to the new neighbours. */}
+      {open && session && prevIndex >= 0 && isImageItem(session.items[prevIndex]!) && (
         <PreviewImagePrefetch
           key={session.items[prevIndex]!.key}
           source={toPreviewSource(session.items[prevIndex]!)}
         />
       )}
-      {open && session && nextIndex >= 0 && (
+      {open && session && nextIndex >= 0 && isImageItem(session.items[nextIndex]!) && (
         <PreviewImagePrefetch
           key={session.items[nextIndex]!.key}
           source={toPreviewSource(session.items[nextIndex]!)}
         />
       )}
-    </ImageSequenceContext.Provider>
+    </PreviewSequenceContext.Provider>
   );
 }

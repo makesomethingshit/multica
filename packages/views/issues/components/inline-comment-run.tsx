@@ -1,17 +1,19 @@
 "use client";
 
-import { useEffect, useId, useMemo, useState } from "react";
-import { AlertCircle, Brain, ChevronRight, CirclePause, Clock3, ExternalLink, Loader2, MessageSquare, RotateCcw, ScrollText, Square, Terminal } from "lucide-react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { AlertCircle, Brain, ChevronRight, CirclePause, Clock3, ExternalLink, Loader2, MessageSquare, MessageSquarePlus, RotateCcw, ScrollText, Send, Square, Terminal } from "lucide-react";
 import { toast } from "sonner";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useTraceIssueLabels } from "../../common/task-transcript/use-trace-issue-labels";
 import { useActorName } from "@multica/core/workspace/hooks";
 import { useTaskMessages } from "@multica/core/chat/queries";
-import { useCancelIssueRun, useRetryIssueRun } from "@multica/core/issues/mutations";
+import { useCancelIssueRun, useCreateTaskSupplement, useRetryIssueRun } from "@multica/core/issues/mutations";
+import { useCommentDraftStore, useTaskSupplementDraftStore } from "@multica/core/issues/stores";
 import { dispatchReasonCode } from "@multica/core/api";
 import type { AgentTask } from "@multica/core/types";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { Button } from "@multica/ui/components/ui/button";
+import { Textarea } from "@multica/ui/components/ui/textarea";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/ui/tooltip";
 import { cn } from "@multica/ui/lib/utils";
 import { AgentTranscriptDialog, StepBody } from "../../common/task-transcript/agent-transcript-dialog";
@@ -20,9 +22,9 @@ import { buildSteps, groupSteps, isCallStep, isGroupRow, type TraceRow } from ".
 import { traceEventSummary, traceToolArgSummary } from "../../common/task-transcript/trace-event-presenter";
 import { redactSecrets } from "../../common/task-transcript/redact";
 import { ReadonlyContent } from "../../editor";
-import { useT } from "../../i18n";
+import { useLocale, useT, useTimeAgo } from "../../i18n";
 import { formatDuration } from "../../agents/components/agent-activity-hover-content";
-import { cancellationActorLabel, cancelReasonLabel, failureReasonLabel } from "../../agents/components/tabs/task-failure";
+import { failureNeedsAction, isCancelledOutcome, runOutcomeLabel } from "../../agents/components/tabs/task-failure";
 import { TerminateTaskConfirmDialog } from "./terminate-task-confirm-dialog";
 import { TaskStatusIcon } from "./task-status-icon";
 import { useStatusLabel } from "./task-run-labels";
@@ -52,20 +54,44 @@ export function useInlineCommentRunState() {
 
 export type InlineCommentRunState = ReturnType<typeof useInlineCommentRunState>;
 
-export function InlineCommentRun({ run, className, viewState, showIdentity = false, presentation = "inline" }: {
+export function PlacedInlineCommentRun({ presentation = "inline", ...props }: Parameters<typeof InlineCommentRun>[0]) {
+  const draft = useTaskSupplementDraftStore((store) => store.drafts[props.run.task.id]);
+  // A live reply normally compacts its run into the comment header. Once the
+  // user opens a task draft, keep the full run mounted at its timeline slot so
+  // reply arrival and supplement-driven re-anchoring cannot discard the text.
+  const inHeader = showCommentRunInHeader(props.run) && !draft?.open;
+  if ((presentation === "header") !== inHeader) return null;
+  return <InlineCommentRun {...props} presentation={presentation} />;
+}
+
+export function InlineCommentRun({ run, className, viewState, showIdentity = false, presentation = "inline", replyTo, replacesFailureNotice = false }: {
   run: CommentRun;
   className?: string;
   viewState?: InlineCommentRunState;
   showIdentity?: boolean;
   presentation?: "inline" | "header";
+  /** The input this run answers, under its identity like a reply's. */
+  replyTo?: ReactNode;
+  /** The run's reply is only its failure notice, which this block stands in for. */
+  replacesFailureNotice?: boolean;
 }) {
   const { task, hasReply } = run;
   const { t } = useT("issues");
   const { t: tAgents } = useT("agents");
   const { getActorName } = useActorName();
+  const locale = useLocale();
+  const timeAgo = useTimeAgo();
   const name = getActorName("agent", task.agent_id);
   const status = useStatusLabel(task.status);
-  const statusText = cancellationActorLabel(task, tAgents) ?? status;
+  const ended = task.status === "failed" || task.status === "cancelled";
+  const cancelled = isCancelledOutcome(task);
+  // One label says how the run ended (MUL-7692). The raw error stays
+  // reachable: on hover, or in view when someone has to fix a setting.
+  const statusText = (ended ? runOutcomeLabel(task, tAgents) : null) ?? status;
+  const rawError = ended && task.error?.trim() ? redactSecrets(task.error.trim()) : "";
+  const needsAction = failureNeedsAction(task);
+  // Without a reply, how the run ended is the block's content, not metadata.
+  const outcomeIsContent = showIdentity && ended;
   const active = isActiveCommentRun(task);
   const localViewState = useInlineCommentRunState();
   const state = viewState ?? localViewState;
@@ -73,9 +99,11 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
   const [confirmStop, setConfirmStop] = useState(false);
   const [now, setNow] = useState(Date.now);
   const [visibleCount, setVisibleCount] = useState(12);
+  const supplementDraft = useTaskSupplementDraftStore((store) => store.drafts[task.id]);
   const animationVisibility = useRunAnimationVisibility<HTMLDivElement>();
   const cancel = useCancelIssueRun(task.issue_id);
   const retry = useRetryIssueRun(task.issue_id);
+  const supplement = useCreateTaskSupplement(task.issue_id);
   const regionId = useId();
   // Keep one disclosure button mounted across queued, live, and historical states.
   // Historical, collapsed runs still don't fetch transcripts.
@@ -94,9 +122,6 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
   const end = active ? now : task.completed_at ? Date.parse(task.completed_at) : undefined;
   const elapsed = end !== undefined && Number.isFinite(Date.parse(start)) && Number.isFinite(end)
     ? formatDuration(start, end) : "";
-  const failure = task.status === "failed"
-    ? failureReasonLabel(task.failure_reason, tAgents)
-    : cancelReasonLabel(task, tAgents);
   const output = !hasReply ? commentRunOutput(task) : null;
   const latest = steps.findLast((step) => step.kind !== "text" || step.item.content?.trim());
   const pendingCall = steps.findLast((step) => isCallStep(step) && !step.result);
@@ -116,6 +141,42 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
   const activityLabel = t(($) => $.inline_run.view_activity);
   const stepLabel = steps.length > 0 ? t(($) => $.inline_run.steps, { count: steps.length }) : "";
   const stopLabel = cancel.isPending || cancel.isSuccess ? t(($) => $.inline_run.stopping) : t(($) => $.inline_run.stop);
+  const canSupplement = task.status === "running"
+    && task.supplement_capability === "task-supplement-v1"
+    && task.can_supplement === true
+    && !supplementDraft?.ended;
+  const supplementDisabledReason = supplementDraft?.ended
+    ? t(($) => $.inline_run.supplement_ended)
+    : t(($) => $.inline_run.supplement_forbidden);
+  useEffect(() => {
+    if (supplementDraft && task.status !== "running" && !active) {
+      useTaskSupplementDraftStore.getState().markEnded(task.id);
+    }
+  }, [active, supplementDraft, task.id, task.status]);
+  const closeSupplement = () => {
+    if (!supplement.isPending) useTaskSupplementDraftStore.getState().clear(task.id);
+  };
+  const submitSupplement = () => {
+    const content = supplementDraft?.content.trim() ?? "";
+    if (!content || !canSupplement || supplement.isPending) return;
+    const clientRequestId = supplementDraft?.clientRequestId ?? crypto.randomUUID();
+    useTaskSupplementDraftStore.getState().setRequestId(task.id, clientRequestId);
+    supplement.mutate({ taskId: task.id, content, clientRequestId }, {
+      onError: (error) => {
+        const code = dispatchReasonCode(error);
+        if (code === "task_supplement_turn_ended") {
+          useTaskSupplementDraftStore.getState().markEnded(task.id);
+        }
+        toast.error(code === "task_supplement_turn_ended"
+          ? t(($) => $.inline_run.supplement_ended)
+          : code === "task_supplement_unsupported"
+            ? t(($) => $.inline_run.supplement_unsupported)
+            : code === "invocation_not_allowed"
+              ? t(($) => $.inline_run.supplement_forbidden)
+              : t(($) => $.inline_run.supplement_failed));
+      },
+    });
+  };
   const transcript = fullLogOpen && <AgentTranscriptDialog open onOpenChange={setFullLogOpen}
     task={task} items={items} agentName={name} isLive={active} finalFocus={logFromKeyboard}
     contentState={isPending ? <p role="status" className="text-body text-muted-foreground">{t(($) => $.inline_run.loading)}</p>
@@ -127,6 +188,21 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
     onClick={() => setConfirmStop(true)}>
     {cancel.isPending || cancel.isSuccess ? <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" /> : <Square className="size-3.5" />}
   </Button>;
+  const supplementButton = active
+    && task.supplement_capability === "task-supplement-v1"
+    && <Tooltip>
+    <TooltipTrigger render={<span className="inline-flex">
+      <Button type="button" size="sm" variant="ghost" className="text-muted-foreground"
+        aria-label={t(($) => $.inline_run.supplement_action)}
+        aria-expanded={!!supplementDraft?.open}
+        disabled={supplement.isPending || (!supplementDraft?.open && !canSupplement)}
+        onClick={() => supplementDraft?.open ? closeSupplement() : useTaskSupplementDraftStore.getState().open(task.id, task.issue_id)}>
+        <MessageSquarePlus className="size-3.5" />
+        <span className="@max-[32rem]/run:sr-only">{t(($) => $.inline_run.supplement_action)}</span>
+      </Button>
+    </span>} />
+    <TooltipContent>{canSupplement ? t(($) => $.inline_run.supplement_action) : supplementDisabledReason}</TooltipContent>
+  </Tooltip>;
   const stopDialog = <TerminateTaskConfirmDialog open={confirmStop} onOpenChange={setConfirmStop}
     showRunningNote={task.status !== "queued"}
     onConfirm={() => cancel.mutate(task.id, { onError: () => toast.error(t(($) => $.execution_log.cancel_failed)) })} />;
@@ -149,16 +225,31 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
       className={cn("@container/run min-w-0 py-2", className)} data-run-id={task.id}>
       <div ref={animationVisibility.ref} className="flex min-h-7 min-w-0 items-center gap-2" data-run-summary-row>
         {showIdentity && <>
-          <ActorAvatar actorType="agent" actorId={task.agent_id} size="md" enableHoverCard />
+          <ActorAvatar actorType="agent" actorId={task.agent_id} size="md" enableHoverCard showStatusDot />
           <span className="max-w-[30%] shrink-0 truncate text-body font-medium" title={name}>{name}</span>
+          {!active && task.completed_at && <Tooltip>
+            <TooltipTrigger render={<span className="shrink-0 cursor-default text-caption text-muted-foreground @max-[32rem]/run:hidden">
+              {timeAgo(task.completed_at)}
+            </span>} />
+            <TooltipContent side="top">{new Date(task.completed_at).toLocaleString(locale)}</TooltipContent>
+          </Tooltip>}
         </>}
-        <span className={cn("flex min-w-0 max-w-[50%] shrink-0 items-center gap-1.5 whitespace-nowrap text-caption text-muted-foreground", showProgress && "sr-only")}
+        <span className={cn("flex min-w-0 items-center gap-1.5 whitespace-nowrap",
+          outcomeIsContent ? "text-body text-foreground" : "max-w-[50%] shrink-0 text-caption text-muted-foreground",
+          showProgress && "sr-only")}
           role="status" data-run-status>
-          <TaskStatusIcon status={task.status} /><span className="truncate" title={statusText}>{statusText}</span>
+          <TaskStatusIcon status={cancelled ? "cancelled" : task.status} />
+          {rawError && rawError !== statusText && !needsAction ? <Tooltip>
+            <TooltipTrigger render={<span className="truncate">{statusText}</span>} />
+            <TooltipContent side="top" className="flex-col items-start">
+              <span>{statusText}</span>
+              <span className="break-all font-mono text-muted-foreground">{rawError}</span>
+            </TooltipContent>
+          </Tooltip> : <span className="truncate" title={statusText}>{statusText}</span>}
         </span>
         <button type="button"
           className={cn("flex min-w-0 items-center gap-1.5 rounded-xs py-1 text-left text-caption text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-            showProgress ? "flex-1 text-body" : "order-last ml-auto shrink-0",
+            showProgress ? "flex-1 text-body" : "ml-auto shrink-0",
             showIdentity && !showProgress && "@max-[32rem]/run:min-w-7 @max-[32rem]/run:justify-center")}
           aria-label={stepLabel ? `${activityLabel} · ${stepLabel}` : activityLabel}
           aria-expanded={expanded} aria-controls={expanded ? regionId : undefined}
@@ -171,18 +262,68 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
           <ChevronRight ref={state.disclosure.chevronRef} aria-hidden className={cn("size-3.5 shrink-0", expanded && "rotate-90")} />
         </button>
         <span className={cn("shrink-0 whitespace-nowrap text-caption tabular-nums text-muted-foreground", showIdentity && !active && "@max-[32rem]/run:hidden")}>{elapsed}</span>
+        {supplementButton}
         {stopButton}
-        {!hasReply && (task.status === "failed" || task.status === "cancelled") && <Button
-          size="sm" variant="ghost" className={cn("text-muted-foreground", showIdentity && "@max-[32rem]/run:size-7 @max-[32rem]/run:p-0")} disabled={retry.isPending || retry.isSuccess}
+        {(!hasReply || replacesFailureNotice) && ended && <Button
+          size="xs" variant="outline" className={cn(showIdentity && "@max-[32rem]/run:size-6 @max-[32rem]/run:p-0")} disabled={retry.isPending || retry.isSuccess}
           onClick={() => retry.mutate(task.id, { onError: (error) => toast.error(
             dispatchReasonCode(error) === "invocation_not_allowed" ? t(($) => $.execution_log.retry_blocked) : t(($) => $.execution_log.retry_failed),
           ) })}>
-          <RotateCcw className="size-3.5" /><span className={cn(showIdentity && "@max-[32rem]/run:sr-only")}>{t(($) => $.execution_log.retry_task_tooltip)}</span>
+          <RotateCcw /><span className={cn(showIdentity && "@max-[32rem]/run:sr-only")}>{t(($) => $.execution_log.retry_task_tooltip)}</span>
         </Button>}
       </div>
       <div className={cn(showIdentity && "pl-8")}>
+        {replyTo}
+        {supplementDraft?.open && <div className="mt-2 space-y-2 rounded-md border bg-muted/20 p-2"
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              closeSupplement();
+            }
+          }}>
+          <Textarea value={supplementDraft.content} autoFocus rows={3}
+            placeholder={t(($) => $.inline_run.supplement_placeholder)}
+            disabled={supplement.isPending}
+            onChange={(event) => {
+              useTaskSupplementDraftStore.getState().setContent(task.id, task.issue_id, event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                event.preventDefault();
+                submitSupplement();
+              }
+            }} />
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-micro text-muted-foreground">{canSupplement
+              ? t(($) => $.inline_run.supplement_notice)
+              : supplementDraft.ended || task.status !== "running" ? t(($) => $.inline_run.supplement_ended) : supplementDisabledReason}</p>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button type="button" size="sm" variant="outline" disabled={supplement.isPending} onClick={closeSupplement}>
+                {supplementDraft.ended ? t(($) => $.inline_run.supplement_discard) : t(($) => $.comment.cancel_action)}
+              </Button>
+              {supplementDraft.ended && supplementDraft.content.trim() && <Button type="button" size="sm" variant="outline"
+                disabled={supplement.isPending}
+                onClick={() => {
+                  useCommentDraftStore.getState().appendToDraftContent(`new:${task.issue_id}`, supplementDraft.content);
+                  useTaskSupplementDraftStore.getState().clear(task.id);
+                  toast.success(t(($) => $.inline_run.supplement_moved));
+                }}>
+                {t(($) => $.inline_run.supplement_move_to_new)}
+              </Button>}
+              {!supplementDraft.ended && <Button type="button" size="sm" disabled={!supplementDraft.content.trim() || supplement.isPending || !canSupplement}
+                onClick={submitSupplement}>
+                {supplement.isPending ? <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" /> : <Send className="size-3.5" />}
+                {t(($) => $.inline_run.supplement_send)}
+              </Button>}
+            </div>
+          </div>
+        </div>}
         {output && <div className="mt-2 text-body"><ReadonlyContent content={redactSecrets(output)} /></div>}
-        {failure && <p className="mt-1 text-caption text-destructive">{failure}</p>}
+        {needsAction && rawError && <p title={rawError}
+          className="mt-1.5 line-clamp-4 whitespace-pre-wrap break-words rounded-md border bg-muted/50 px-2.5 py-1.5 font-mono text-caption text-muted-foreground">
+          {rawError}
+        </p>}
         {expanded && <div id={regionId} className="mt-2 min-w-0 space-y-1">
           {isPending && <p className="text-caption text-muted-foreground">{t(($) => $.inline_run.loading)}</p>}
           {isError && <div role="alert" className="text-caption text-destructive">{t(($) => $.inline_run.load_failed)}

@@ -68,6 +68,11 @@ type IssueStatusData struct {
 // Task represents a claimed task from the server.
 // Agent data (name, skills) is populated by the claim endpoint.
 type Task struct {
+	// StartClaimSupported gates retries when talking to older servers.
+	StartClaimSupported bool `json:"start_claim_supported,omitempty"`
+	// DispatchedAt is the server-issued claim generation used by StartTask and,
+	// when the claim advertises TerminalReportGenerationFenceV1, terminal reports.
+	DispatchedAt         string                 `json:"dispatched_at,omitempty"`
 	ID                   string                 `json:"id"`
 	AgentID              string                 `json:"agent_id"`
 	RuntimeID            string                 `json:"runtime_id"`
@@ -158,17 +163,11 @@ type Task struct {
 	// when description is empty so the agent doesn't see a useless heading.
 	RequestingUserName               string `json:"requesting_user_name,omitempty"`
 	RequestingUserProfileDescription string `json:"requesting_user_profile_description,omitempty"`
-	// Initiator* identify the actor who triggered THIS task (the real
-	// requester behind the current comment/mention or chat message) as
-	// distinct from the runtime owner whose credentials the agent runs with.
-	// Comment-triggered tasks resolve to the triggering comment's author;
-	// chat tasks resolve to the chat session creator. Empty for task kinds
-	// with no attributable human initiator (on-assign, autopilot,
-	// quick-create). InitiatorEmail is set only for member initiators. The
-	// daemon emits these into the brief under `## Task Initiator` so a
-	// workspace-visible agent can attribute the request per person. The
-	// agent's effective credentials stay owner-scoped — this is an attested
-	// identity, not a credential. See MUL-2645.
+	// Initiator* are the existing claim fields for the human whose authority
+	// this run uses (originator_user_id). The direct comment trigger author is
+	// carried separately in trigger_author_*. Empty when no originator exists.
+	// The daemon renders ## On Behalf Of per turn; its effective credentials
+	// remain scoped to the runtime owner. See MUL-2645, GH-8674.
 	InitiatorType  string `json:"initiator_type,omitempty"`
 	InitiatorID    string `json:"initiator_id,omitempty"`
 	InitiatorName  string `json:"initiator_name,omitempty"`
@@ -179,21 +178,9 @@ type Task struct {
 	// Empty or non-task-scoped values are fatal for writable agent tasks; the
 	// daemon must not fall back to its own token. See MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
-	// DispatchedAt is the claim generation: the server-issued timestamp of the
-	// claim delivery that produced this Task. The server refreshes it on every
-	// reclaim of the same task id and compares it inside the terminal UPDATE, so
-	// the daemon echoes it verbatim on /complete and /fail instead of re-deriving
-	// it later. It only means anything together with
-	// TerminalReportGenerationFenceV1: older servers send this timestamp and
-	// still ignore the terminal callback's fence, so presence alone never makes a
-	// claim generation-aware.
-	DispatchedAt *string `json:"dispatched_at,omitempty"`
 	// TerminalReportGenerationFenceV1 is the claim-only capability that says this
-	// server enforces the terminal-report generation fence. It — not the presence
-	// of DispatchedAt — is what makes a claim generation-aware: older servers send
-	// dispatched_at and still ignore expected_dispatched_at on /complete and
-	// /fail. Absent (false) means the claim keeps the legacy live callback and is
-	// never persisted as a replayable report.
+	// server enforces the terminal-report generation fence. Older servers may
+	// send dispatched_at without enforcing it; their reports remain durable v1.
 	TerminalReportGenerationFenceV1 bool `json:"terminal_report_generation_fence_v1,omitempty"`
 }
 
