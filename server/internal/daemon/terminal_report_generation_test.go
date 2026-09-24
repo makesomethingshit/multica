@@ -90,7 +90,12 @@ func TestTerminalReportQueuePersistsClaimGeneration(t *testing.T) {
 
 }
 
-func TestTerminalReportLegacyRecordWithoutGenerationIsNeverReplayed(t *testing.T) {
+// TestTerminalReportLegacyRecordReplaysViaLegacyEndpoint pins the #8533
+// compatibility contract: a version-1 record written before the fence keeps
+// the legacy replay behavior — it is delivered through the unfenced legacy
+// terminal endpoint, not retained forever. The generation fence applies only
+// to version-2 records from fence-capable claims.
+func TestTerminalReportLegacyRecordReplaysViaLegacyEndpoint(t *testing.T) {
 	cfg := Config{
 		ServerBaseURL:  "https://api.example.test",
 		WorkspacesRoot: t.TempDir(),
@@ -100,7 +105,7 @@ func TestTerminalReportLegacyRecordWithoutGenerationIsNeverReplayed(t *testing.T
 	d := New(cfg, logger)
 
 	// A version-1 record written by a daemon that predates the fence: keyed by
-	// task id alone, no claim generation, and therefore no provable owner.
+	// task id alone, no claim generation, replayed with legacy semantics.
 	legacy := persistedTerminalTaskReport{
 		Version:   legacyTerminalReportRecordVersion,
 		CreatedAt: time.Now().UTC(),
@@ -115,31 +120,25 @@ func TestTerminalReportLegacyRecordWithoutGenerationIsNeverReplayed(t *testing.T
 	if err := writeTerminalReportRecord(d.terminalReports.dir, name, legacy); err != nil {
 		t.Fatalf("write legacy record: %v", err)
 	}
-	path := filepath.Join(d.terminalReports.dir, name)
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read legacy record: %v", err)
-	}
 
 	var delivered atomic.Int32
-	d.terminalReportSend = func(context.Context, terminalTaskReport, []time.Duration) error {
+	d.terminalReportSend = func(_ context.Context, report terminalTaskReport, _ []time.Duration) error {
+		if !report.claimGeneration.dispatchedAt.IsZero() || report.claimGeneration.unreadable {
+			return errors.New("legacy replay must carry no claim generation")
+		}
 		delivered.Add(1)
 		return nil
 	}
 	pending, sent := d.replayPendingTerminalReports(context.Background())
-	if sent != 0 || delivered.Load() != 0 {
-		t.Fatalf("legacy record was delivered: delay=%d delivered=%d", sent, delivered.Load())
+	if sent != 1 || delivered.Load() != 1 {
+		t.Fatalf("legacy replay: sent=%d delivered=%d, want 1/1 via the legacy endpoint", sent, delivered.Load())
 	}
-	if pending != 1 {
-		t.Fatalf("pending = %d, want 1 so the record keeps surfacing to operators", pending)
+	if pending != 0 {
+		t.Fatalf("pending = %d, want 0 after the legacy replay was acknowledged", pending)
 	}
 
-	after, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("legacy record disappeared: %v", err)
-	}
-	if string(before) != string(after) {
-		t.Fatalf("legacy record changed:\nbefore %s\nafter  %s", before, after)
+	if _, err := os.Stat(filepath.Join(d.terminalReports.dir, name)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy record still pending: %v", err)
 	}
 }
 
@@ -513,8 +512,41 @@ func TestOldServerClaimWithDispatchedAtStaysLegacy(t *testing.T) {
 			if got := sentPaths(); len(got) != 1 || got[0] != "/api/daemon/tasks/task-old-server/complete" {
 				t.Fatalf("legacy callback paths = %v, want the legacy terminal route", got)
 			}
+			// The live callback succeeded, so its durable copy was acknowledged.
 			if items, err := d.terminalReports.list(); err != nil || len(items) != 0 {
-				t.Fatalf("durable queue = %d records (%v), want none for an old-server claim", len(items), err)
+				t.Fatalf("durable queue = %d records (%v), want 0 after the acked live callback", len(items), err)
+			}
+			// Durability: a failed live callback must leave a version-1 record
+			// that replays through the legacy endpoint (#8533 contract).
+			d.terminalReportSend = func(context.Context, terminalTaskReport, []time.Duration) error {
+				return errors.New("network unavailable")
+			}
+			if err := d.reportTerminalTask(context.Background(), report); err == nil {
+				t.Fatal("failed live callback unexpectedly reported success")
+			}
+			items, err := d.terminalReports.list()
+			if err != nil || len(items) != 1 {
+				t.Fatalf("durable queue = %d records (%v), want 1 version-1 record for the failed old-server report", len(items), err)
+			}
+			if !items[0].report.claimGeneration.dispatchedAt.IsZero() {
+				t.Fatalf("old-server record carries a generation: %+v", items[0].report)
+			}
+			if want := legacyTerminalReportFileName(task.ID); items[0].fileName != want {
+				t.Fatalf("old-server record file = %q, want legacy identity %q", items[0].fileName, want)
+			}
+			var replayed atomic.Int32
+			d.terminalReportSend = func(_ context.Context, rereport terminalTaskReport, _ []time.Duration) error {
+				if !rereport.claimGeneration.dispatchedAt.IsZero() {
+					return errors.New("legacy replay must carry no claim generation")
+				}
+				replayed.Add(1)
+				return nil
+			}
+			if pending, delivered := d.replayPendingTerminalReports(context.Background()); pending != 0 || delivered != 1 {
+				t.Fatalf("legacy replay pending=%d delivered=%d, want 0/1", pending, delivered)
+			}
+			if replayed.Load() != 1 {
+				t.Fatalf("legacy replay deliveries = %d, want 1", replayed.Load())
 			}
 		})
 	}

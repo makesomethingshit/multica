@@ -6384,7 +6384,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 		// reclaim owns recovery from here.
 		return fmt.Errorf("terminal task report for %s: %w", report.taskID, errTerminalReportGenerationUnreadable)
 	}
-	if _, err := persistedTerminalReport(report, time.Now()); err != nil && !errors.Is(err, errTerminalReportNotPersistable) {
+	if _, err := persistedTerminalReport(report, time.Now()); err != nil {
 		return err
 	}
 	release, ok := d.beginTerminalReportDelivery(report.identity())
@@ -6396,25 +6396,16 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	persisted := false
 	if d.terminalReports != nil {
 		if err := d.terminalReports.enqueue(report); err != nil {
-			if errors.Is(err, errTerminalReportNotPersistable) {
-				// The claim did not advertise the generation fence — an older
-				// server, so its dispatched_at carries no fence semantics. There is
-				// nothing that could be replayed safely later, so the report is
-				// delivered now and deliberately not stored.
-				d.logger.Info("claim did not advertise the terminal-report generation fence; delivering without a durable copy",
-					"task", report.taskID,
-					"kind", report.kind,
-				)
-			} else {
-				// Durability is an availability improvement, not a prerequisite for
-				// the online callback. A read-only/full disk must not turn a request
-				// that the server could accept right now into a stuck task.
-				d.logger.Error("persist terminal task report; continuing with direct delivery",
-					"task", report.taskID,
-					"kind", report.kind,
-					"error", err,
-				)
-			}
+			// Durability is an availability improvement, not a prerequisite for
+			// the online callback. A read-only/full disk must not turn a request
+			// that the server could accept right now into a stuck task. Legacy
+			// claims persist as version-1 records with the same #8533 replay
+			// contract; fenced claims persist as version-2 records.
+			d.logger.Error("persist terminal task report; continuing with direct delivery",
+				"task", report.taskID,
+				"kind", report.kind,
+				"error", err,
+			)
 		} else {
 			persisted = true
 		}

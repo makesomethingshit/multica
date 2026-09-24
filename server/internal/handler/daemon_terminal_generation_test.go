@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -97,17 +99,37 @@ func pathTaskID(path string) string {
 	return parts[len(parts)-2]
 }
 
-// reclaimTask moves the row to a fresh claim generation, the way the stale
-// reclaim sweep does, without touching the status.
-func reclaimTask(t *testing.T, taskID string) time.Time {
+// reclaimDispatchedTask issues a fresh claim generation through the production
+// stale-dispatch reclaim query — the only reclaim path for a row that never
+// reached StartTask (status dispatched, started_at NULL). The row is aged into
+// the stale window first; the generation comes back from the real UPDATE, it
+// is never rewritten by test SQL.
+func reclaimDispatchedTask(t *testing.T, taskID string) time.Time {
 	t.Helper()
-	if _, err := testPool.Exec(context.Background(),
-		`UPDATE agent_task_queue SET dispatched_at = now() + interval '1 second' WHERE id = $1`, taskID); err != nil {
-		t.Fatalf("reclaim task: %v", err)
+	ctx := context.Background()
+	var runtimeID string
+	dbfx.QueryRow(t, `SELECT runtime_id FROM agent_task_queue WHERE id = $1`, taskID).Scan(&runtimeID)
+	if _, err := testPool.Exec(ctx,
+		`UPDATE agent_runtime SET status = 'online', last_seen_at = now() WHERE id = $1`, runtimeID); err != nil {
+		t.Fatalf("refresh runtime for reclaim: %v", err)
 	}
-	var generation time.Time
-	dbfx.QueryRow(t, `SELECT dispatched_at FROM agent_task_queue WHERE id = $1`, taskID).Scan(&generation)
-	return generation
+	if _, err := testPool.Exec(ctx,
+		`UPDATE agent_task_queue SET dispatched_at = now() - interval '10 minutes', prepare_lease_expires_at = now() - interval '1 minute' WHERE id = $1`, taskID); err != nil {
+		t.Fatalf("age dispatch for reclaim: %v", err)
+	}
+	reclaimed, err := testHandler.Queries.ReclaimStaleDispatchedTaskForRuntime(ctx, db.ReclaimStaleDispatchedTaskForRuntimeParams{
+		RuntimeID:         parseUUID(runtimeID),
+		ClaimRecoverySecs: 30,
+		PrepareLeaseSecs:  60,
+		RuntimeStaleSecs:  service.RuntimeClaimFreshnessSeconds,
+	})
+	if err != nil {
+		t.Fatalf("reclaim stale dispatch: %v", err)
+	}
+	if uuidToString(reclaimed.ID) != taskID {
+		t.Fatalf("reclaimed task = %s, want %s", uuidToString(reclaimed.ID), taskID)
+	}
+	return reclaimed.DispatchedAt.Time
 }
 
 func taskRowState(t *testing.T, taskID string) (status string, generation time.Time, result []byte, completedAt *time.Time) {
@@ -131,32 +153,38 @@ func responseCode(t *testing.T, w *httptest.ResponseRecorder) string {
 // shape: the generation the callback carries was read from the row before the
 // reclaim, so any "GET the row, compare, then POST" implementation would have
 // seen a live row and let the stale report through. Only the comparison inside
-// the terminal UPDATE rejects it.
+// the terminal UPDATE rejects it. It runs the primary regression on the real
+// lifecycle: dispatched (G1), still before StartTask, then a production
+// stale-dispatch reclaim issues G2, and the persisted G1 failure replays
+// against a row G2 owns.
 func TestTerminalCallbackFenceIsTheUpdateAndNotAPriorLookup(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
 
-	taskID, generation := fencedTerminalTask(t, "running", nil)
+	taskID, generation := fencedTerminalTask(t, "dispatched", nil)
 	// The reclaim lands after the daemon has its generation in hand and before
 	// its callback reaches the terminal UPDATE.
-	reclaimed := reclaimTask(t, taskID)
+	reclaimed := reclaimDispatchedTask(t, taskID)
 
-	w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
-		"output":                 "hard-fought result",
+	w := postFencedTerminalCallback(t, taskID, "fail", map[string]any{
+		"error":                  "runtime went offline before the run started",
 		"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
 	})
 	if w.Code != http.StatusConflict {
 		t.Fatalf("reclaim race: got %d: %s, want 409", w.Code, w.Body.String())
 	}
+	if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
+		t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
+	}
 	status, current, result, _ := taskRowState(t, taskID)
-	if status != "running" || !current.Equal(reclaimed) || result != nil {
+	if status != "dispatched" || !current.Equal(reclaimed) || result != nil {
 		t.Fatalf("row changed under the race: status=%s generation=%s result=%s", status, current, result)
 	}
 
 	// The reclaim that owns the row can still settle it with its own generation.
-	if w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
-		"output":                 "result of the new claim",
+	if w := postFencedTerminalCallback(t, taskID, "fail", map[string]any{
+		"error":                  "failure of the new claim",
 		"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
 	}); w.Code != http.StatusOK {
 		t.Fatalf("new claim could not settle its own row: got %d: %s", w.Code, w.Body.String())
@@ -193,8 +221,12 @@ func TestFencedTerminalEndpointContract(t *testing.T) {
 		})
 
 		t.Run("stale generation conflicts and leaves the reclaim alone", func(t *testing.T) {
-			taskID, generation := fencedTerminalTask(t, "running", nil)
-			reclaimTask(t, taskID)
+			taskID, generation := fencedTerminalTask(t, "dispatched", nil)
+			reclaimed := reclaimDispatchedTask(t, taskID)
+			// The reclaim owns the row now and reaches running through StartTask.
+			if _, err := testHandler.TaskService.StartTask(context.Background(), parseUUID(taskID)); err != nil {
+				t.Fatalf("start reclaimed task: %v", err)
+			}
 			w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
 				"output":                 "old claim result",
 				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
@@ -205,8 +237,9 @@ func TestFencedTerminalEndpointContract(t *testing.T) {
 			if code := responseCode(t, w); code != protocol.DaemonTaskClaimGenerationMismatchCode {
 				t.Fatalf("conflict code = %q, want %q", code, protocol.DaemonTaskClaimGenerationMismatchCode)
 			}
-			if status, _, _, _ := taskRowState(t, taskID); status != "running" {
-				t.Fatalf("status = %q, want running (untouched)", status)
+			status, current, result, _ := taskRowState(t, taskID)
+			if status != "running" || !current.Equal(reclaimed) || result != nil {
+				t.Fatalf("reclaim was mutated: status=%s generation=%s result=%s", status, current, result)
 			}
 		})
 
@@ -214,8 +247,11 @@ func TestFencedTerminalEndpointContract(t *testing.T) {
 		// a later claim, so acknowledging the older report as "already finalized"
 		// would tell the daemon its stale result had landed.
 		t.Run("stale generation after a newer settlement conflicts", func(t *testing.T) {
-			taskID, generation := fencedTerminalTask(t, "running", nil)
-			reclaimed := reclaimTask(t, taskID)
+			taskID, generation := fencedTerminalTask(t, "dispatched", nil)
+			reclaimed := reclaimDispatchedTask(t, taskID)
+			if _, err := testHandler.TaskService.StartTask(context.Background(), parseUUID(taskID)); err != nil {
+				t.Fatalf("start reclaimed task: %v", err)
+			}
 			if w := postFencedTerminalCallback(t, taskID, "complete", map[string]any{
 				"output":                 "result of the new claim",
 				"expected_dispatched_at": reclaimed.UTC().Format(time.RFC3339Nano),
@@ -292,8 +328,8 @@ func TestFencedTerminalEndpointContract(t *testing.T) {
 		}
 
 		t.Run("stale generation conflicts and leaves the reclaim alone", func(t *testing.T) {
-			taskID, generation := fencedTerminalTask(t, "running", nil)
-			reclaimed := reclaimTask(t, taskID)
+			taskID, generation := fencedTerminalTask(t, "dispatched", nil)
+			reclaimed := reclaimDispatchedTask(t, taskID)
 			w := postFencedTerminalCallback(t, taskID, "fail", map[string]any{
 				"error":                  "old claim failed",
 				"expected_dispatched_at": generation.UTC().Format(time.RFC3339Nano),
@@ -302,7 +338,7 @@ func TestFencedTerminalEndpointContract(t *testing.T) {
 				t.Fatalf("stale fenced fail: got %d: %s, want 409", w.Code, w.Body.String())
 			}
 			status, current, result, completedAt := taskRowState(t, taskID)
-			if status != "running" || !current.Equal(reclaimed) || result != nil || completedAt != nil {
+			if status != "dispatched" || !current.Equal(reclaimed) || result != nil || completedAt != nil {
 				t.Fatalf("reclaim was mutated: status=%s generation=%s result=%s", status, current, result)
 			}
 		})

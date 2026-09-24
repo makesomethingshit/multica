@@ -26,9 +26,9 @@ const (
 	// reject version 2 as unsupported and leave it untouched.
 	terminalReportRecordVersion = 2
 	// legacyTerminalReportRecordVersion is the pre-fence layout: keyed by task
-	// id alone, no generation. This daemon never writes it and never replays
-	// it; ownership of such a record cannot be proven, so it is retained for
-	// operators instead (see replayPendingTerminalReports).
+	// id alone, no generation. It keeps the #8533 legacy semantics: replayable
+	// through the unfenced legacy terminal endpoint. The generation fence
+	// applies only to version 2 records.
 	legacyTerminalReportRecordVersion = 1
 
 	terminalReportReplayWorkers = 4
@@ -52,10 +52,10 @@ const (
 // ACL; the queue never carries an auth token on either platform.
 //
 // Generation-aware records are version 2 and always carry claim_dispatched_at;
-// version 1 is the pre-fence layout, keyed by task id alone, whose ownership is
-// unknowable and which is therefore never replayed. A record of any other
-// version is left untouched and reported on every replay pass: downgrading must
-// never delete a payload merely because the older binary cannot decode it.
+// version 1 is the pre-fence #8533 layout, keyed by task id alone and replayed
+// through the legacy terminal endpoint. A record of any other version is left
+// untouched and reported on every replay pass: downgrading must never delete a
+// payload merely because the older binary cannot decode it.
 type persistedTerminalTaskReport struct {
 	Version               int       `json:"version"`
 	CreatedAt             time.Time `json:"created_at"`
@@ -219,11 +219,24 @@ func persistedTerminalReport(report terminalTaskReport, createdAt time.Time) (pe
 		return persistedTerminalTaskReport{}, errTerminalReportGenerationUnreadable
 	}
 	if report.claimGeneration.dispatchedAt.IsZero() {
-		// No generation means the claim came from a server that never fenced it.
-		// A version-2 record requires a generation, and a legacy version-1 record
-		// is never replayed, so writing one would only manufacture a file that
-		// cannot be delivered. The live callback still goes out unfenced.
-		return persistedTerminalTaskReport{}, errTerminalReportNotPersistable
+		// No generation means the claim came from a server that never advertised
+		// the fence. It keeps the #8533 legacy contract: a version-1 record,
+		// replayable through the unfenced legacy terminal endpoint.
+		return persistedTerminalTaskReport{
+			Version:               legacyTerminalReportRecordVersion,
+			CreatedAt:             createdAt.UTC(),
+			Kind:                  kind,
+			TaskID:                report.taskID,
+			Output:                report.output,
+			BranchName:            report.branchName,
+			ErrorMessage:          report.errorMessage,
+			SessionID:             report.sessionID,
+			WorkDir:               report.workDir,
+			DurableWorkDir:        report.durableWorkDir,
+			FailureReason:         report.failureReason,
+			SessionRolloutMissing: report.sessionRolloutMissing,
+			RetiredSessionID:      report.retiredSessionID,
+		}, nil
 	}
 	record := persistedTerminalTaskReport{
 		Version:               terminalReportRecordVersion,
@@ -252,11 +265,6 @@ func generationPtr(generation time.Time) *time.Time {
 	return &utc
 }
 
-// errTerminalReportNotPersistable marks a report this daemon will deliver but
-// not store: its claim carried no generation, so nothing about it could ever be
-// replayed safely.
-var errTerminalReportNotPersistable = errors.New("terminal report has no claim generation")
-
 // errTerminalReportGenerationUnreadable marks a claim whose dispatched_at was
 // present but unparseable. It is a protocol error, and it must never be treated
 // like an unfenced legacy claim.
@@ -264,7 +272,8 @@ var errTerminalReportGenerationUnreadable = errors.New("terminal report claim ge
 
 // terminalReport decodes one record. The version switch is explicit because the
 // two layouts carry different ownership semantics: version 2 names the claim
-// generation and is replayable, version 1 does not and must never be replayed.
+// generation and replays through the versioned endpoint, version 1 carries no
+// generation and replays through the legacy endpoint per #8533.
 // A version-2 record without a generation is corrupt, not legacy, so it is
 // reported as an error rather than downgraded into an unfenced report.
 func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, error) {
@@ -299,8 +308,9 @@ func (record persistedTerminalTaskReport) terminalReport() (terminalTaskReport, 
 		retiredSessionID:      record.RetiredSessionID,
 	}
 	if record.Version == legacyTerminalReportRecordVersion {
-		// Ownership unknown: the record predates the fence, and no generation may
-		// be invented for it from the current server state.
+		// Legacy #8533 record: no generation to invent from current server
+		// state, and none needed — it replays through the legacy endpoint with
+		// the pre-fence semantics. The fence applies only to version 2.
 		return report, nil
 	}
 	if record.ClaimDispatchedAt == nil || record.ClaimDispatchedAt.IsZero() {
@@ -920,9 +930,6 @@ func (d *Daemon) handleTerminalReportDeliveryError(ctx context.Context, item pen
 // The caller owns the outer backoff; each pending item gets exactly one HTTP
 // attempt. The one-time fail compensation after quarantine uses the normal
 // bounded terminal schedule because there will be no later replay for it.
-//
-// Reports with no claim generation are counted as pending but never sent: they
-// cannot be fenced to the claim that produced them.
 func (d *Daemon) replayPendingTerminalReports(ctx context.Context) (pending, delivered int) {
 	if d.terminalReports == nil {
 		return 0, 0
@@ -988,19 +995,6 @@ func (d *Daemon) replayPendingTerminalReports(ctx context.Context) (pending, del
 		}()
 	}
 	for _, item := range items {
-		if item.report.claimGeneration.dispatchedAt.IsZero() {
-			// A version-1 record from before the fence carries no claim
-			// generation, so ownership cannot be proven: sending it could settle a
-			// task a later claim now owns, and deleting it would discard the only
-			// copy. Retain it, and keep it visible as pending. The daemon that
-			// wrote it already gave it its one unfenced delivery.
-			d.logger.Warn("terminal report has no claim generation; retained without delivery",
-				"task", item.report.taskID,
-				"kind", item.report.kind,
-				"file", item.fileName,
-			)
-			continue
-		}
 		select {
 		case jobs <- item:
 		case <-ctx.Done():
