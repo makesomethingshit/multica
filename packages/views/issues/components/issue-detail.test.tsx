@@ -22,6 +22,9 @@ const mockViewport = vi.hoisted(() => ({ isMobile: false }));
 // Counts MockContentEditor mounts. This pins the description to exactly one
 // eager editor per issue and catches stale editor reuse across issue switches.
 const contentEditorMounts = vi.hoisted(() => ({ count: 0 }));
+// Every ReadonlyContent render, by content. A comment card renders its body
+// through it, so this counts card renders without reaching into the card.
+const readonlyContentRenders = vi.hoisted(() => [] as string[]);
 const descriptionSelectionAction = vi.hoisted(() => ({ current: undefined as { label: string; onSelect: () => void } | undefined }));
 // Stable empty-attachments reference: the real store returns a shared constant
 // so the `useCommentDraftStore(s => s.getAttachments(key))` selector keeps a
@@ -161,15 +164,17 @@ vi.mock("../../editor", async () => ({
     tryOpen: () => false,
     modal: null,
   }),
-  // Pass-through: the detail page wraps its column in the image-sequence
-  // provider, but paging between images is covered in
-  // image-sequence-context.test.tsx against the real provider.
-  ImageSequenceProvider: ({ children }: { children: React.ReactNode }) =>
+  // Pass-through: the detail page wraps its column in the preview-sequence
+  // provider, but paging between files is covered in
+  // preview-sequence-context.test.tsx against the real provider.
+  PreviewSequenceProvider: ({ children }: { children: React.ReactNode }) =>
     children,
+  collectPreviewSequence: () => [],
   isPreviewable: () => false,
-  ReadonlyContent: ({ content }: { content: string }) => (
-    <div data-testid="readonly-content">{content}</div>
-  ),
+  ReadonlyContent: ({ content }: { content: string }) => {
+    readonlyContentRenders.push(content);
+    return <div data-testid="readonly-content">{content}</div>;
+  },
   ContentEditor: forwardRef(function MockContentEditor(
     {
       defaultValue,
@@ -418,6 +423,10 @@ vi.mock("@multica/core/issues/stores", async () => ({
       }),
     },
   ),
+  useTaskSupplementDraftStore: (await import("zustand")).create(() => ({
+    drafts: {}, open: vi.fn(), setContent: vi.fn(), setRequestId: vi.fn(),
+    markEnded: vi.fn(), clear: vi.fn(),
+  })),
   useCommentComposerStore: Object.assign(
     (selector?: any) => {
       const state = { sticky: true, toggleSticky: () => {} };
@@ -447,7 +456,11 @@ const scrollToIndexSpy = vi.hoisted(() => vi.fn());
 
 vi.mock("react-virtuoso", () => ({
   Virtuoso: forwardRef(function MockVirtuoso(
-    { data, itemContent }: { data: unknown[]; itemContent: (i: number, item: unknown) => unknown },
+    { data, itemContent, computeItemKey }: {
+      data: unknown[];
+      itemContent: (i: number, item: unknown) => unknown;
+      computeItemKey: (i: number, item: unknown) => React.Key;
+    },
     ref: any,
   ) {
     useImperativeHandle(ref, () => ({
@@ -460,7 +473,7 @@ vi.mock("react-virtuoso", () => ({
     return (
       <div data-testid="virtuoso-mock">
         {data.map((item, i) => (
-          <div key={i}>{itemContent(i, item) as React.ReactElement}</div>
+          <div key={computeItemKey(i, item)}>{itemContent(i, item) as React.ReactElement}</div>
         ))}
       </div>
     );
@@ -676,6 +689,7 @@ describe("IssueDetail (shared)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     contentEditorMounts.count = 0;
+    readonlyContentRenders.length = 0;
     descriptionSelectionAction.current = undefined;
     mockViewport.isMobile = false;
     // Default: issue loads successfully
@@ -1397,7 +1411,7 @@ describe("IssueDetail (shared)", () => {
     expect(within(replyBlock as HTMLElement).getByRole("button", { name: "Open full log" })).toBe(headerLog);
   });
 
-  it("replaces each queued run in place without moving replies behind later requests", async () => {
+  it("keeps each queued run after its request and moves it in place to its reply's time", async () => {
     const root = mockTimeline[0]!;
     const second = { ...root, id: "request-two", parent_id: root.id, content: "Second request", created_at: "2026-01-16T00:00:02Z" };
     const third = { ...root, id: "request-three", parent_id: root.id, content: "Third request", created_at: "2026-01-16T00:00:04Z" };
@@ -1416,6 +1430,10 @@ describe("IssueDetail (shared)", () => {
     </I18nProvider>);
     await waitFor(() => expect(container.querySelectorAll('[data-run-slot-id]')).toHaveLength(3));
     const slots = tasks.map((task) => container.querySelector(`[data-run-slot-id="${task.id}"]`)!);
+    const [secondRow, thirdRow] = [second, third].map((request) => container.querySelector(`#comment-${request.id}`)!);
+    expect(secondRow!.previousElementSibling).toBe(slots[0]);
+    expect(secondRow!.nextElementSibling).toBe(slots[1]);
+    expect(thirdRow!.nextElementSibling).toBe(slots[2]);
     fireEvent.click(within(slots[0] as HTMLElement).getByRole("button", { name: /View activity/ }));
     await within(slots[0] as HTMLElement).findByText("No activity recorded yet.");
     for (const index of [0, 1]) {
@@ -1437,8 +1455,11 @@ describe("IssueDetail (shared)", () => {
     }
     expect(within(slots[0] as HTMLElement).getByRole("button", { name: "Open full log" })).toBeInTheDocument();
     expect(within(slots[0] as HTMLElement).queryByRole("button", { name: /View activity/ })).not.toBeInTheDocument();
-    expect(slots[0]!.nextElementSibling?.id).toBe("comment-request-two");
-    expect(slots[1]!.nextElementSibling?.id).toBe("comment-request-three");
+    // Answers land at their own time, after the requests; the queued run
+    // stays with its request.
+    expect(thirdRow!.nextElementSibling).toBe(slots[2]);
+    expect(slots[2]!.nextElementSibling).toBe(slots[0]);
+    expect(slots[0]!.nextElementSibling).toBe(slots[1]);
     expect(container.querySelector(`[data-run-slot-id="${tasks[2]!.id}"]`)).toBe(slots[2]);
     expect(within(slots[2] as HTMLElement).getByText("Waiting for an available agent.")).toBeInTheDocument();
   });
@@ -1457,6 +1478,42 @@ describe("IssueDetail (shared)", () => {
     await screen.findByText(answer.content);
     await waitFor(() => expect(container.querySelectorAll(`[data-run-id="${second.id}"]`)).toHaveLength(1));
     expect(container.querySelector(`#comment-${root.id}`)?.querySelector(`[data-run-id="${second.id}"]`)).not.toBeNull();
+  });
+
+  // MUL-7628: Elon was asked first but replied last; his review used to render
+  // under the request, above the rest of the thread.
+  it("orders thread replies by send time and quotes the request a late reply answers", async () => {
+    const root = mockTimeline[0]!;
+    const request = (id: string, content: string, created_at: string): TimelineEntry =>
+      ({ ...root, id, parent_id: root.id, content, created_at, updated_at: created_at });
+    const askElon = request("ask-elon", "Review the code", "2026-01-16T00:15:32Z");
+    const askSteve = request("ask-steve", "CI is failing", "2026-01-16T00:15:41Z");
+    const run = (id: string, trigger: TimelineEntry): AgentTask => ({
+      id, agent_id: "agent-1", runtime_id: "runtime-1", issue_id: "issue-1", status: "completed", priority: 0,
+      created_at: trigger.created_at, started_at: trigger.created_at, dispatched_at: trigger.created_at,
+      completed_at: "2026-01-16T00:40:00Z", result: null, error: null,
+      trigger_comment_id: trigger.id, delivered_comment_ids: [trigger.id],
+    });
+    const elon = run("ba2e8d1c-7f9b-4e2a-9c1d-123456789ab0", askElon);
+    const steve = run("ba2e8d1c-7f9b-4e2a-9c1d-123456789ab1", askSteve);
+    const answer = (id: string, task: AgentTask, content: string, created_at: string): TimelineEntry =>
+      ({ ...mockTimeline[1]!, id, parent_id: root.id, source_task_id: task.id, content, created_at, updated_at: created_at });
+    mockApiObj.listTimeline.mockResolvedValue([root, askElon, askSteve,
+      answer("steve-fixed", steve, "Fixed the CI failure", "2026-01-16T00:23:41Z"),
+      answer("elon-review", elon, "Review complete", "2026-01-16T00:32:29Z"),
+      request("follow-up", "Fix it, then ask for another review", "2026-01-16T00:35:05Z")]);
+    mockApiObj.listTasksByIssue.mockResolvedValue([elon, steve]);
+    const { container } = renderIssueDetail();
+
+    await screen.findByText("Review complete");
+    const order = ["ask-elon", "ask-steve", "steve-fixed", "elon-review", "follow-up"].map((id) => `comment-${id}`);
+    expect(Array.from(container.querySelectorAll("[id]"), (element) => element.id).filter((id) => order.includes(id)))
+      .toEqual(order);
+    const review = container.querySelector("#comment-elon-review") as HTMLElement;
+    const quote = within(review).getByRole("button", { name: "Replying to Test User: Review the code" });
+    expect(within(container.querySelector("#comment-steve-fixed") as HTMLElement).queryByText(/Replying to/)).toBeNull();
+    fireEvent.click(quote);
+    expect(container.querySelector("#comment-ask-elon")?.className).toContain(highlightedCommentBackgroundClass);
   });
 
   it.each(["failed", "cancelled"] as const)("keeps a %s run outside the user reply that triggered it", async (status) => {
@@ -1543,6 +1600,24 @@ describe("IssueDetail (shared)", () => {
     });
 
     expect(screen.getByText("I can help with this")).toBeInTheDocument();
+  });
+
+  // Comment cards are memoized so page state that has nothing to do with the
+  // timeline does not re-render every comment on a long issue. Any handler the
+  // page hands to the cards must keep its identity across such renders.
+  it("does not re-render comment cards when unrelated page state changes", async () => {
+    renderIssueDetail();
+    await screen.findByText("I can help with this");
+    await screen.findByText("Details");
+
+    const commentBodies = new Set(mockTimeline.map((entry) => entry.content));
+    const cardRenders = () =>
+      readonlyContentRenders.filter((content) => commentBodies.has(content)).length;
+    const before = cardRenders();
+
+    fireEvent.click(screen.getByText("Details"));
+
+    expect(cardRenders()).toBe(before);
   });
 
   it("prefers timeline identity when the actor is absent from the member directory", async () => {
@@ -1727,6 +1802,82 @@ describe("IssueDetail (shared)", () => {
       expect(screen.getByText(/changed status/i)).toBeInTheDocument();
     });
     expect(screen.getByText(/changed priority/i)).toBeInTheDocument();
+  });
+
+  // Duplicate marks (MUL-7349) name another issue; the identifier is a link
+  // to it, and a mark removed because its original was deleted is plain text.
+  it("links a duplicate mark to the issue it names", async () => {
+    mockApiObj.listTimeline.mockResolvedValue([
+      {
+        type: "activity",
+        id: "act-dup-marked",
+        actor_type: "member",
+        actor_id: "user-1",
+        action: "duplicate_marked",
+        details: { original_id: "issue-9", original_identifier: "MUL-9" },
+        created_at: "2026-01-16T00:00:00Z",
+      },
+      {
+        type: "activity",
+        id: "act-dup-unmarked",
+        actor_type: "member",
+        actor_id: "user-1",
+        action: "duplicate_unmarked",
+        details: { original_id: "issue-8", original_identifier: "MUL-8", reason: "original_deleted" },
+        created_at: "2026-01-16T00:00:30Z",
+      },
+      {
+        type: "activity",
+        id: "act-dup-reopened",
+        actor_type: "member",
+        actor_id: "user-1",
+        action: "duplicate_unmarked",
+        details: { original_id: "issue-9", original_identifier: "MUL-9", to: "todo" },
+        created_at: "2026-01-16T00:01:00Z",
+      },
+    ]);
+    renderIssueDetail();
+
+    const links = await screen.findAllByRole("link", { name: "MUL-9" });
+    expect(links[0]?.getAttribute("href")).toBe("/test/issues/issue-9");
+    expect(screen.getByText(/^marked this issue as a duplicate of/i)).toBeInTheDocument();
+    expect(screen.getByText(/removed the duplicate mark, MUL-8 was deleted/i)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "MUL-8" })).not.toBeInTheDocument();
+    // Reopening replaces the status row, so the unmarked row says where it went.
+    expect(screen.getByText(/and moved it to Todo/i)).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "MUL-9" })).toHaveLength(2);
+  });
+
+  // MUL-7429: an automatic status change says why, and the per-issue switch
+  // shows on the timeline.
+  it("explains PR auto-complete activity", async () => {
+    mockApiObj.listTimeline.mockResolvedValue([
+      {
+        type: "activity",
+        id: "act-pr-done",
+        actor_type: "system",
+        actor_id: null,
+        action: "status_changed",
+        details: { from: "in_progress", to: "done", source: "pr_automation", pull_requests: "#12, #19" },
+        created_at: "2026-01-18T00:00:00Z",
+      },
+      {
+        type: "activity",
+        id: "act-pr-off",
+        actor_type: "member",
+        actor_id: "user-1",
+        action: "pr_auto_complete_changed",
+        details: { disabled: true },
+        created_at: "2026-01-18T01:00:00Z",
+      },
+    ] as unknown as TimelineEntry[]);
+
+    renderIssueDetail();
+
+    await waitFor(() => {
+      expect(screen.getByText(/after every linked PR merged \(#12, #19\)/i)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/turned off PR auto-complete for this issue/i)).toBeInTheDocument();
   });
 
   it("renders activity rows with unknown status values without crashing", async () => {
@@ -2904,6 +3055,47 @@ describe("IssueDetail (shared)", () => {
     });
   });
 
+  it("keeps the initial assignment block before a later mention and its run (MUL-7632)", async () => {
+    const assignment: AgentTask = {
+      id: "initial-assignment", agent_id: "agent-1", runtime_id: "rt-1", issue_id: "issue-1",
+      kind: "direct", status: "running", priority: 0,
+      created_at: "2026-01-16T00:00:00Z", started_at: "2026-01-16T00:00:00Z",
+      dispatched_at: null, completed_at: null, result: null, error: null, delivered_comment_ids: [],
+    };
+    mockApiObj.listTimeline.mockResolvedValue([]);
+    mockApiObj.listTasksByIssue.mockResolvedValue([assignment]);
+    const client = createTestQueryClient();
+    const { container } = render(
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={client}>
+          <IssueDetail issueId="issue-1" defaultSidebarOpen={false} />
+        </QueryClientProvider>
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(container.querySelector('[data-run-slot-id="initial-assignment"]')).not.toBeNull());
+    const initialSlot = container.querySelector('[data-run-slot-id="initial-assignment"]')!;
+    const mention: TimelineEntry = {
+      type: "comment", id: "later-mention", actor_type: "member", actor_id: "user-1",
+      content: "Please handle the other task", parent_id: null, created_at: "2026-01-16T00:01:00Z",
+    };
+    const mentionedRun: AgentTask = {
+      ...assignment, id: "mentioned-run", agent_id: "agent-2", trigger_comment_id: mention.id,
+      created_at: "2026-01-16T00:01:01Z", delivered_comment_ids: [mention.id],
+    };
+    mockApiObj.listTimeline.mockResolvedValue([mention]);
+    mockApiObj.listTasksByIssue.mockResolvedValue([assignment, mentionedRun]);
+    act(() => {
+      client.setQueryData(issueKeys.timeline("issue-1"), [mention]);
+      client.setQueryData(issueKeys.tasks("issue-1"), [assignment, mentionedRun]);
+    });
+    await screen.findByText(mention.content!);
+    await waitFor(() => expect(container.querySelector('[data-run-id="mentioned-run"]')).not.toBeNull());
+    expect(container.querySelector('[data-run-slot-id="initial-assignment"]')).toBe(initialSlot);
+    const mentionBlock = container.querySelector("#comment-later-mention")!;
+    expect(initialSlot.compareDocumentPosition(mentionBlock) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(mentionBlock.querySelector('[data-run-id="mentioned-run"]')).not.toBeNull();
+  });
+
   // MUL-7211 regression: a standalone run's published reply belongs at the
   // reply's own time. It used to render in the run's ENQUEUE slot while the
   // card showed the reply time, pushing it above every comment written while
@@ -2935,6 +3127,50 @@ describe("IssueDetail (shared)", () => {
 
     const rendered = Array.from(container.querySelectorAll("[id^='comment-']")).map((el) => el.id);
     expect(rendered.indexOf("comment-midway")).toBeLessThan(rendered.indexOf("comment-run-reply"));
+  });
+
+  // MUL-7548 regression: a comment-triggered run that posts several comments
+  // used to render its latest one first — the run slot after the trigger held
+  // only the latest, and the earlier ones followed it (or stayed top-level).
+  // Each comment reads at its own time, so a reply written between two of the
+  // run's comments stays between them (MUL-7628).
+  it.each([
+    { placement: "top-level", parentId: null },
+    { placement: "in the trigger's thread", parentId: "confirm" },
+  ])("renders every comment of a run in posting order when posted $placement", async ({ parentId }) => {
+    const agentComment = (id: string, content: string, created_at: string): TimelineEntry => ({
+      type: "comment", id, actor_type: "agent", actor_id: "agent-1", content, parent_id: parentId,
+      source_task_id: "task-steps", created_at, updated_at: created_at, comment_type: "comment",
+    });
+    mockApiObj.listTimeline.mockResolvedValue([
+      {
+        type: "comment", id: "confirm", actor_type: "member", actor_id: "user-1",
+        content: "Confirmed", parent_id: null,
+        created_at: "2026-01-17T00:00:00Z", updated_at: "2026-01-17T00:00:00Z", comment_type: "comment",
+      },
+      agentComment("step2", "Step 2 done", "2026-01-17T00:10:00Z"),
+      {
+        type: "comment", id: "aside", actor_type: "member", actor_id: "user-1",
+        content: "Check the tests too", parent_id: "confirm",
+        created_at: "2026-01-17T00:15:00Z", updated_at: "2026-01-17T00:15:00Z", comment_type: "comment",
+      },
+      agentComment("step3", "Step 3 done", "2026-01-17T00:20:00Z"),
+    ]);
+    mockApiObj.listTasksByIssue.mockResolvedValue([{
+      id: "task-steps", agent_id: "agent-1", runtime_id: "rt-1", issue_id: "issue-1",
+      kind: "issue", status: "running", priority: 0,
+      dispatched_at: "2026-01-17T00:00:01Z", started_at: "2026-01-17T00:00:01Z",
+      completed_at: null, result: null, error: null,
+      created_at: "2026-01-17T00:00:01Z", trigger_comment_id: "confirm", delivered_comment_ids: ["confirm"],
+    }]);
+
+    const { container } = renderIssueDetail();
+    await screen.findByText("Step 2 done");
+    await screen.findByText("Step 3 done");
+
+    const rendered = Array.from(container.querySelectorAll("[id^='comment-']")).map((el) => el.id)
+      .filter((id) => ["comment-confirm", "comment-step2", "comment-aside", "comment-step3"].includes(id));
+    expect(rendered).toEqual(["comment-confirm", "comment-step2", "comment-aside", "comment-step3"]);
   });
 
 });

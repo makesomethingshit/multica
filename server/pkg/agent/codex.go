@@ -79,6 +79,17 @@ const (
 	// their default separate without slowing failures for lightweight RPCs.
 	defaultCodexThreadHandshakeTimeout = 60 * time.Second
 	codexVersionDiagnosticTimeout      = 2 * time.Second
+	// Keep a raw agent-message tail small enough that a slow daemon does not
+	// make the stdout reader retain token-sized channel entries indefinitely.
+	// At one sixty-fourth of the scanner's maximum completed-snapshot line, any
+	// reconcilable item occupies at most 65 of the 256 message slots (the leading
+	// delta plus 64 aggregates), reserving the rest for status and tool events.
+	// Since this threshold is 512 KiB, a normal message will not reach it: only
+	// its leading delta is usually handed off during generation, while the
+	// remaining deltas stay pending until item/completed reconciles the item.
+	// A single provider event may be larger, in which case that event is flushed
+	// as one chunk rather than split at an arbitrary byte boundary.
+	codexAgentMessageAggregateBytes = agentStreamMaxLineBytes / 64
 	// codexGracefulShutdownTimeout bounds how long the lifecycle goroutine
 	// waits for codex to exit on its own after stdin is closed, before forcing
 	// a context-cancel kill. A clean exit lets codex run its shutdown path and
@@ -309,15 +320,17 @@ type codexFirstItemWaitObservation struct {
 	mu         sync.Mutex
 	startedAt  time.Time
 	finishedAt time.Time
+	turnID     string
 	outcome    string
 	stderr     codexStderrClassification
 }
 
-func (o *codexFirstItemWaitObservation) start(now time.Time) {
+func (o *codexFirstItemWaitObservation) start(now time.Time, turnID string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.startedAt.IsZero() {
 		o.startedAt = now
+		o.turnID = turnID
 	}
 }
 
@@ -332,13 +345,13 @@ func (o *codexFirstItemWaitObservation) finish(now time.Time, outcome string, st
 	o.stderr = stderr
 }
 
-func (o *codexFirstItemWaitObservation) snapshot() (time.Duration, string, codexStderrClassification, bool) {
+func (o *codexFirstItemWaitObservation) snapshot() (time.Duration, string, string, codexStderrClassification, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.startedAt.IsZero() || o.finishedAt.IsZero() || o.outcome == "" {
-		return 0, "", codexStderrClassification{}, false
+		return 0, "", "", codexStderrClassification{}, false
 	}
-	return o.finishedAt.Sub(o.startedAt), o.outcome, o.stderr, true
+	return o.finishedAt.Sub(o.startedAt), o.turnID, o.outcome, o.stderr, true
 }
 
 // codexBackend implements Backend by spawning `codex app-server --listen stdio://`
@@ -926,8 +939,30 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 	}
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
+	var sessionMu sync.RWMutex
+	currentSession := firstSession
+	supplement := func(supplementCtx context.Context, instruction string) error {
+		sessionMu.RLock()
+		session := currentSession
+		sessionMu.RUnlock()
+		if session == nil || session.Supplement == nil {
+			return errors.New("codex turn does not accept additional messages")
+		}
+		return session.Supplement(supplementCtx, instruction)
+	}
+	supplementReady := func() bool {
+		sessionMu.RLock()
+		session := currentSession
+		sessionMu.RUnlock()
+		return session != nil && session.SupplementReady != nil && session.SupplementReady()
+	}
 
 	go func() {
+		defer func() {
+			sessionMu.Lock()
+			currentSession = nil
+			sessionMu.Unlock()
+		}()
 		defer close(msgCh)
 		defer close(resCh)
 		session := firstSession
@@ -940,6 +975,9 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					resCh <- Result{Status: "failed", Error: err.Error()}
 					return
 				}
+				sessionMu.Lock()
+				currentSession = session
+				sessionMu.Unlock()
 			}
 			// Hold back the leading session-pin status messages until this
 			// attempt proves it made real progress. A retry never continues the
@@ -1017,7 +1055,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	return &Session{Supplement: supplement, SupplementReady: supplementReady, Messages: msgCh, Result: resCh}, nil
 }
 
 func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts ExecOptions, attempt int) (*Session, error) {
@@ -1198,7 +1236,20 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// race between the lifecycle goroutine writing and the reader reading.
 	turnDone := make(chan bool, 1) // true = aborted
 
-	c := &codexClient{
+	var c *codexClient
+	observeMessage := func(msg Message) {
+		logCodexAgentMessage(b.cfg.Logger, msg)
+		activity := describeCodexSemanticActivity(msg)
+		if activity == "status:running" {
+			firstItemWait.start(time.Now(), c.activeTurnID())
+		}
+		trySendString(semanticActivityCh, activity)
+		if activity != "" {
+			semanticObserved.Store(true)
+		}
+	}
+
+	c = &codexClient{
 		cfg:                    b.cfg,
 		stdin:                  stdin,
 		pending:                make(map[int]*pendingRPC),
@@ -1217,21 +1268,27 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			semanticObserved.Store(true)
 		},
 		onMessage: func(msg Message) {
-			logCodexAgentMessage(b.cfg.Logger, msg)
-			if msg.Type == MessageText {
-				outputMu.Lock()
-				lastAgentMessage = msg.Content
-				outputMu.Unlock()
-			}
-			activity := describeCodexSemanticActivity(msg)
-			if activity == "status:running" {
-				firstItemWait.start(time.Now())
-			}
+			observeMessage(msg)
 			trySend(msgCh, msg)
-			trySendString(semanticActivityCh, activity)
-			if activity != "" {
-				semanticObserved.Store(true)
-			}
+		},
+		onAgentMessageChunk: func(text string) bool {
+			msg := Message{Type: MessageText, Content: text}
+			observeMessage(msg)
+			// Agent text is the user-visible transcript, so unlike auxiliary
+			// progress events it participates in reconciliation. A false return
+			// leaves the text pending for completed/terminal/EOF retry. Keep the
+			// send non-blocking because Session.Messages is optional; bounded
+			// coalescing prevents a token burst from filling the channel while
+			// preserving the reader's EOF and cancellation liveness.
+			return trySend(msgCh, msg)
+		},
+		onAgentMessage: func(text string) {
+			// Delta events make MessageText incremental. Keep Result.Output's
+			// legacy fallback authoritative by updating it from the completed
+			// agent-message snapshot, not whichever delta happened to arrive last.
+			outputMu.Lock()
+			lastAgentMessage = text
+			outputMu.Unlock()
 		},
 		onFinalAnswer: func(text string) {
 			outputMu.Lock()
@@ -1263,6 +1320,11 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			}
 			c.handleLine(line)
 		}
+		// A cancelled or crashed app-server may close stdout without an
+		// item/completed snapshot. Preserve every complete delta JSON event
+		// already parsed; an incomplete final JSON token is ignored by
+		// handleLine and can never enter this buffer.
+		c.flushAgentMessageDeltas()
 		if err := scanner.Err(); err != nil {
 			// %w on BOTH: callers match errCodexProcessExited to decide the
 			// process is gone, and bufio.ErrTooLong to tell "we could not read
@@ -1664,7 +1726,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				resetTimer(semanticTimer, semanticInactivityTimeout)
 				if activity == "status:running" && !firstTurnStarted {
 					firstTurnStarted = true
-					firstItemWait.start(time.Now())
+					firstItemWait.start(time.Now(), c.activeTurnID())
 					firstTurnNoProgressTimer = time.NewTimer(firstTurnNoProgressTimeout)
 					firstTurnNoProgressTimerC = firstTurnNoProgressTimer.C
 				} else if firstTurnStarted && !firstTurnProgressObserved && isCodexFirstTurnProgressActivity(activity) {
@@ -1781,7 +1843,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			)
 		}
 
-		if waitLatency, outcome, classification, ok := firstItemWait.snapshot(); ok {
+		if waitLatency, firstTurnID, outcome, classification, ok := firstItemWait.snapshot(); ok {
 			if waitLatency < 0 {
 				waitLatency = 0
 			}
@@ -1802,7 +1864,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 				"active_launches", activeLaunches,
 				"method", "turn/start",
 				"thread_id", threadID,
-				"turn_id", c.activeTurnID(),
+				"turn_id", firstTurnID,
 				"outcome", outcome,
 				"latency", waitLatency.Round(time.Millisecond).String(),
 				"latency_ms", waitLatency.Milliseconds(),
@@ -1872,7 +1934,29 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		}
 	}()
 
-	return &Session{Messages: msgCh, Result: resCh}, nil
+	supplement := func(supplementCtx context.Context, instruction string) error {
+		return supplementCodexTurn(supplementCtx, c, instruction)
+	}
+	supplementReady := func() bool {
+		return c.getThreadID() != "" && c.activeTurnID() != ""
+	}
+	return &Session{Supplement: supplement, SupplementReady: supplementReady, Messages: msgCh, Result: resCh}, nil
+}
+
+func supplementCodexTurn(ctx context.Context, c *codexClient, instruction string) error {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	threadID := c.getThreadID()
+	turnID := c.activeTurnID()
+	if threadID == "" || turnID == "" {
+		return errors.New("codex turn has not started")
+	}
+	_, err := c.request(ctx, "turn/steer", map[string]any{
+		"threadId":       threadID,
+		"expectedTurnId": turnID,
+		"input":          []map[string]any{{"type": "text", "text": instruction}},
+	})
+	return err
 }
 
 func resolveCodexHandshakeTimeouts(opts ExecOptions) (time.Duration, time.Duration) {
@@ -2306,10 +2390,20 @@ type codexClient struct {
 	threadIDMu             sync.RWMutex
 	threadID               string
 	turnIDMu               sync.RWMutex
+	lastTurnID             string
 	turnID                 string
 	onMessage              func(Message)
-	onSemanticActivity     func(description string)
-	onTurnDone             func(aborted bool)
+	// onAgentMessageChunk reports whether a text chunk was handed to the
+	// daemon-facing message channel. Raw delta reconciliation advances only on
+	// true, so channel pressure cannot turn observed provider bytes into a false
+	// delivered prefix. Unit clients may leave this nil and use onMessage.
+	onAgentMessageChunk func(text string) bool
+	// onAgentMessage receives the authoritative completed text for one agent
+	// message. onAgentMessageChunk may deliver that text incrementally, so
+	// Result.Output fallbacks must use this callback rather than the last chunk.
+	onAgentMessage     func(text string)
+	onSemanticActivity func(description string)
+	onTurnDone         func(aborted bool)
 	// onFinalAnswer fires only for an agent message the app-server itself
 	// labelled `phase: "final_answer"` — the turn's deliverable, as opposed to
 	// the intermediate agent messages that narrate work between tool calls.
@@ -2324,6 +2418,12 @@ type codexClient struct {
 	// suppressing an initialize retry after observed activity) without letting
 	// filtered history mutate current-turn output or lifecycle state.
 	onDiscardedNotification func(method string, params map[string]any)
+	// agentMessageStreams tracks raw-v2 agent text on the single stdout reader.
+	// The first delta is handed off immediately; subsequent deltas are aggregated
+	// into bounded chunks and reconciled against item/completed. delivered is
+	// advanced only after onAgentMessageChunk confirms daemon handoff.
+	agentMessageStreams map[string]*codexAgentMessageStream
+	agentMessageOrder   []string
 
 	notificationProtocol string // "unknown", "legacy", "raw"
 	turnCompleted        bool
@@ -2338,6 +2438,11 @@ type codexClient struct {
 
 	turnErrorMu sync.Mutex
 	turnError   string // captured from turn/completed status=failed or terminal error notifications
+}
+
+type codexAgentMessageStream struct {
+	delivered strings.Builder
+	pending   strings.Builder
 }
 
 // codexTurnNotificationGate keeps resume-time history replay from mutating the
@@ -2440,12 +2545,19 @@ func (c *codexClient) getThreadID() string {
 }
 
 func (c *codexClient) setActiveTurnID(turnID string) {
-	if turnID == "" {
-		return
-	}
 	c.turnIDMu.Lock()
+	if turnID != "" {
+		c.lastTurnID = turnID
+	}
 	c.turnID = turnID
 	c.turnIDMu.Unlock()
+}
+
+// usageTurnID retains attribution after the turn closes its steering window.
+func (c *codexClient) usageTurnID() string {
+	c.turnIDMu.RLock()
+	defer c.turnIDMu.RUnlock()
+	return c.lastTurnID
 }
 
 func (c *codexClient) activeTurnID() string {
@@ -3280,6 +3392,9 @@ func (c *codexClient) handleEvent(msg map[string]any) {
 		if text != "" && c.onMessage != nil {
 			c.onMessage(Message{Type: MessageText, Content: text})
 		}
+		if text != "" && c.onAgentMessage != nil {
+			c.onAgentMessage(text)
+		}
 	case "exec_command_begin":
 		callID, _ := msg["call_id"].(string)
 		command, _ := msg["command"].(string)
@@ -3385,6 +3500,7 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 			return
 		}
 		c.turnCompleted = true
+		c.setActiveTurnID("")
 		aborted := status == "cancelled" || status == "canceled" ||
 			status == "aborted" || status == "interrupted"
 
@@ -3402,6 +3518,11 @@ func (c *codexClient) handleRawNotification(method string, params map[string]any
 		if turn, ok := params["turn"].(map[string]any); ok {
 			c.extractUsageFromMap(turn)
 		}
+
+		// Some cancellation and transport-failure paths do not emit an
+		// item/completed snapshot. Flush the aggregate of every complete delta
+		// notification before publishing the terminal boundary.
+		c.flushAgentMessageDeltas()
 
 		if c.onTurnDone != nil {
 			c.onTurnDone(aborted)
@@ -3452,18 +3573,155 @@ func (c *codexClient) isNotificationFromOtherThread(params map[string]any) bool 
 	return currentThreadID != "" && threadID != currentThreadID
 }
 
+func (c *codexClient) emitAgentMessageChunk(text string) bool {
+	if text == "" {
+		return true
+	}
+	if c.onAgentMessageChunk != nil {
+		return c.onAgentMessageChunk(text)
+	}
+	if c.onMessage != nil {
+		c.onMessage(Message{Type: MessageText, Content: text})
+		return true
+	}
+	return false
+}
+
+func (c *codexClient) agentMessageStream(itemID string) *codexAgentMessageStream {
+	if c.agentMessageStreams == nil {
+		c.agentMessageStreams = make(map[string]*codexAgentMessageStream)
+	}
+	stream := c.agentMessageStreams[itemID]
+	if stream == nil {
+		stream = &codexAgentMessageStream{}
+		c.agentMessageStreams[itemID] = stream
+		c.agentMessageOrder = append(c.agentMessageOrder, itemID)
+	}
+	return stream
+}
+
+func (c *codexClient) handleAgentMessageDelta(itemID, delta string) {
+	if itemID == "" || delta == "" {
+		return
+	}
+
+	stream := c.agentMessageStream(itemID)
+	// The leading delta is the latency-critical event. Deliver it immediately;
+	// coalesce the rest so a burst of token notifications cannot fill the
+	// daemon channel before its consumer is scheduled.
+	if stream.delivered.Len() == 0 && stream.pending.Len() == 0 {
+		if c.emitAgentMessageChunk(delta) {
+			stream.delivered.WriteString(delta)
+			return
+		}
+	}
+
+	stream.pending.WriteString(delta)
+	if stream.pending.Len() >= codexAgentMessageAggregateBytes {
+		c.flushAgentMessageStream(stream)
+	}
+}
+
+func (c *codexClient) flushAgentMessageStream(stream *codexAgentMessageStream) bool {
+	if stream == nil || stream.pending.Len() == 0 {
+		return true
+	}
+	text := stream.pending.String()
+	if !c.emitAgentMessageChunk(text) {
+		return false
+	}
+	stream.delivered.WriteString(text)
+	stream.pending.Reset()
+	return true
+}
+
+// flushAgentMessageDeltas preserves complete delta events when a turn is
+// cancelled or stdout ends before item/completed. agentMessageOrder retains
+// provider order; iterating the map directly would make two unfinished items
+// nondeterministic.
+func (c *codexClient) flushAgentMessageDeltas() {
+	for _, itemID := range c.agentMessageOrder {
+		stream := c.agentMessageStreams[itemID]
+		if stream == nil {
+			continue
+		}
+		if c.flushAgentMessageStream(stream) {
+			delete(c.agentMessageStreams, itemID)
+		}
+	}
+}
+
+func (c *codexClient) completeAgentMessage(itemID, text string) {
+	stream := c.agentMessageStreams[itemID]
+	if text == "" {
+		if c.flushAgentMessageStream(stream) {
+			delete(c.agentMessageStreams, itemID)
+		}
+		return
+	}
+
+	delivered := ""
+	if stream != nil {
+		delivered = stream.delivered.String()
+	} else {
+		stream = c.agentMessageStream(itemID)
+	}
+
+	if !strings.HasPrefix(text, delivered) {
+		// Already-persisted text cannot be retracted without a new event/schema.
+		// Appending the full snapshot would duplicate it, but every complete delta
+		// event still belongs in the append-only transcript. Flush pending normally;
+		// if the channel refuses it, leave the stream intact for terminal/EOF retry.
+		// onAgentMessage remains the authoritative Result.Output fallback.
+		if c.cfg.Logger != nil {
+			c.cfg.Logger.Warn("codex agent-message delta did not match completed text",
+				"item_id", itemID, "delivered_bytes", len(delivered), "completed_bytes", len(text))
+		}
+		if c.flushAgentMessageStream(stream) {
+			delete(c.agentMessageStreams, itemID)
+		}
+		return
+	}
+
+	// With an acknowledged prefix match, the completed snapshot supersedes
+	// observed-but-unacknowledged bytes and supplies their authoritative suffix.
+	stream.pending.Reset()
+	suffix := strings.TrimPrefix(text, delivered)
+	if suffix == "" || c.emitAgentMessageChunk(suffix) {
+		delete(c.agentMessageStreams, itemID)
+		return
+	}
+	// A process cancellation can race the final handoff. Keep the authoritative
+	// suffix so the stdout-EOF flush gets one more chance without duplicating the
+	// prefix that was already accepted.
+	stream.pending.WriteString(suffix)
+}
+
 func (c *codexClient) handleItemNotification(method string, params map[string]any) {
 	item, _ := params["item"].(map[string]any)
 	itemType, _ := item["type"].(string)
 	itemID, _ := item["id"].(string)
+	if method == "item/agentMessage/delta" {
+		// Unlike item/started and item/completed, the real app-server delta
+		// schema is flat: {threadId, turnId, itemId, delta}.
+		itemType = "agentMessage"
+		itemID, _ = params["itemId"].(string)
+	}
 	if isCodexItemProgressActivity(method) && c.onSemanticActivity != nil {
 		c.onSemanticActivity(describeCodexItemProgressActivity(method, itemType, itemID))
 	}
-	if item == nil {
+	if item == nil && method != "item/agentMessage/delta" {
 		return
 	}
 
 	switch {
+	case method == "item/agentMessage/delta" && itemType == "agentMessage":
+		// JSON-RPC framing remains authoritative: handleLine invokes us only
+		// after a whole newline-delimited JSON event parsed successfully. Stream
+		// the event's text payload, not arbitrary stdout bytes.
+		delta, _ := params["delta"].(string)
+		c.handleAgentMessageDelta(itemID, delta)
+
 	case method == "item/started" && itemType == "commandExecution":
 		command, _ := item["command"].(string)
 		if c.onMessage != nil {
@@ -3532,9 +3790,10 @@ func (c *codexClient) handleItemNotification(method string, params map[string]an
 
 	case method == "item/completed" && itemType == "agentMessage":
 		text, _ := item["text"].(string)
-		if text != "" && c.onMessage != nil {
-			c.onMessage(Message{Type: MessageText, Content: text})
+		if text != "" && c.onAgentMessage != nil {
+			c.onAgentMessage(text)
 		}
+		c.completeAgentMessage(itemID, text)
 		phase, _ := item["phase"].(string)
 		if phase == "final_answer" {
 			// The gate exists so a subagent or a replayed history turn cannot
@@ -3553,13 +3812,14 @@ func (c *codexClient) handleItemNotification(method string, params map[string]an
 
 // updateThreadTokenUsage consumes the v2 app-server's real usage notification.
 // Resume can replay a historical snapshot after thread/resume returns, so only
-// notifications attributed to the active turn are eligible. The first current-
+// notifications attributed to this run's active or just-completed turn are eligible.
+// A late final snapshot must survive closing supplement admission. The first current-
 // turn snapshot contributes `last`; later snapshots contribute the monotonic
 // delta from `total`. This retains multi-response tool loops without charging
 // replayed history or duplicate snapshots twice.
 func (c *codexClient) updateThreadTokenUsage(params map[string]any) {
 	turnID, _ := params["turnId"].(string)
-	if turnID == "" || turnID != c.activeTurnID() {
+	if turnID == "" || turnID != c.usageTurnID() {
 		return
 	}
 
