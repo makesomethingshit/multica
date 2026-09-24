@@ -1663,7 +1663,10 @@ func (s *TaskService) DispatchCompletionFallbackByLineage(ctx context.Context, i
 		return fmt.Errorf("merge fallback into pending task: %w", err)
 	}
 	if _, err := s.EnqueueCompletionFallbackHandoff(ctx, issue, target.Agent.ID, target.SquadID(), fallback.ID, workerTask); err != nil {
-		if !isDuplicatePendingTaskErr(err) {
+		// The enqueue path normalizes the pending-slot unique violation into
+		// the bare ErrDuplicatePendingTask sentinel (#5958), so match both
+		// shapes: a concurrent dispatcher won the coordinator slot.
+		if !pendingSlotTakenErr(err) {
 			return fmt.Errorf("create fallback handoff task: %w", err)
 		}
 		if merged, err := s.Queries.MergeCompletionFallbackIntoPendingTask(ctx, db.MergeCompletionFallbackIntoPendingTaskParams{
@@ -1676,6 +1679,21 @@ func (s *TaskService) DispatchCompletionFallbackByLineage(ctx context.Context, i
 			return nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("merge fallback into pending task: %w", err)
+		}
+		// The winner may have attached the fallback between our coverage
+		// check and the lost enqueue race; re-check so a covered fallback
+		// is not reported as a dispatch failure (GH #8719 single-winner).
+		covered, err := s.Queries.HasTaskCoveringCompletionFallback(ctx, db.HasTaskCoveringCompletionFallbackParams{
+			IssueID:       issue.ID,
+			AgentID:       target.Agent.ID,
+			CommentID:     fallback.ID,
+			ExcludeTaskID: workerTask.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("recheck fallback coverage: %w", err)
+		}
+		if covered {
+			return nil
 		}
 		if _, err := s.Queries.RegisterPlannedCommentForActiveTask(ctx, db.RegisterPlannedCommentForActiveTaskParams{
 			CommentID: fallback.ID,

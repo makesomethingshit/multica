@@ -854,33 +854,71 @@ func TestCompletionFallbackAtomicBoundary(t *testing.T) {
 	}
 }
 
-// rendezvousTxStarter pauses the first synthesis transaction for a completed
-// unrecorded run at Begin while the test drives the sweeper concurrently,
-// forcing the completion-callback-vs-sweeper race to interleave
-// deterministically: the sweeper wins, the callback replays the winner.
-type rendezvousTxStarter struct {
-	delegate   *pgxpool.Pool
-	workerTask string
-	done       atomic.Bool
-	started    chan struct{}
-	release    chan struct{}
-	timedOut   atomic.Bool
+// lockRendezvousTxStarter forces the completion-callback-vs-sweeper race to
+// interleave on the run row lock (GH #8719): the callback synthesis tx
+// acquires GetAgentTaskForUpdate, confirms NULL, then holds the lock while
+// the sweeper blocks on the same row. Releasing the callback lets it commit;
+// the sweeper then replays the recorded winner instead of inserting again.
+type lockRendezvousTxStarter struct {
+	delegate    *pgxpool.Pool
+	started     chan struct{}
+	release     chan struct{}
+	entered     chan struct{}
+	enteredOnce atomic.Bool
+	calls       atomic.Int32
+	timedOut    atomic.Bool
 }
 
-func (s *rendezvousTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
-	if !s.done.Load() {
-		var status string
-		var record pgtype.UUID
-		if err := s.delegate.QueryRow(ctx, "SELECT status, completion_fallback_comment_id FROM agent_task_queue WHERE id = $1", s.workerTask).Scan(&status, &record); err == nil && status == "completed" && !record.Valid && s.done.CompareAndSwap(false, true) {
-			close(s.started)
-			select {
-			case <-s.release:
-			case <-time.After(30 * time.Second):
-				s.timedOut.Store(true)
-			}
-		}
+func (s *lockRendezvousTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.delegate.Begin(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return s.delegate.Begin(ctx)
+	return &lockRendezvousTx{Tx: tx, starter: s}, nil
+}
+
+type lockRendezvousTx struct {
+	pgx.Tx
+	starter *lockRendezvousTxStarter
+}
+
+func (t *lockRendezvousTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if !strings.Contains(sql, "GetAgentTaskForUpdate") {
+		return t.Tx.QueryRow(ctx, sql, args...)
+	}
+	if t.starter.calls.Add(1) != 1 {
+		if t.starter.enteredOnce.CompareAndSwap(false, true) {
+			close(t.starter.entered)
+		}
+		return t.Tx.QueryRow(ctx, sql, args...)
+	}
+	return &lockHoldRow{Row: t.Tx.QueryRow(ctx, sql, args...), starter: t.starter}
+}
+
+type lockHoldRow struct {
+	pgx.Row
+	starter *lockRendezvousTxStarter
+}
+
+func (r *lockHoldRow) Scan(dest ...any) error {
+	err := r.Row.Scan(dest...)
+	if err != nil {
+		return err
+	}
+	if len(dest) == 0 {
+		return nil
+	}
+	id, ok := dest[len(dest)-1].(*pgtype.UUID)
+	if !ok || id.Valid {
+		return nil
+	}
+	close(r.starter.started)
+	select {
+	case <-r.starter.release:
+	case <-time.After(30 * time.Second):
+		r.starter.timedOut.Store(true)
+	}
+	return nil
 }
 
 // TestCompletionFallbackSingleWinner pins the synthesis race (GH #8719): when
@@ -916,14 +954,15 @@ func TestCompletionFallbackSingleWinner(t *testing.T) {
 		"originator_user_id": testUserID, "accountable_user_id": testUserID,
 		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
 	})
-	starter := &rendezvousTxStarter{
-		delegate:   testPool,
-		workerTask: workerTaskID,
-		started:    make(chan struct{}),
-		release:    make(chan struct{}),
+	starter := &lockRendezvousTxStarter{
+		delegate: testPool,
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		entered:  make(chan struct{}),
 	}
 	originalTxStarter := testHandler.TaskService.TxStarter
 	testHandler.TaskService.TxStarter = starter
+	defer func() { testHandler.TaskService.TxStarter = originalTxStarter }()
 	done := make(chan int, 1)
 	go func() {
 		req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+workerTaskID+"/complete", map[string]any{"output": "Processed the inputs delivered to this run"}, testWorkspaceID, "worker-reply-handoff")
@@ -935,18 +974,38 @@ func TestCompletionFallbackSingleWinner(t *testing.T) {
 	select {
 	case <-starter.started:
 	case <-time.After(30 * time.Second):
-		t.Fatal("completion synthesis never reached the rendezvous")
+		t.Fatal("completion synthesis never acquired the row lock")
 	}
-	// The sweeper wins while the callback waits: late synthesis inserts and
-	// records exactly once.
-	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
-		t.Fatalf("concurrent sweeper run failed: %v", err)
+	// The callback holds the run row lock (NULL confirmed) while the sweeper
+	// blocks on the same row; releasing the callback lets it commit first so
+	// the sweeper must replay the recorded winner.
+	sweeperDone := make(chan error, 1)
+	go func() {
+		_, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10)
+		sweeperDone <- err
+	}()
+	select {
+	case <-starter.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("sweeper never reached the contended row lock")
 	}
 	close(starter.release)
-	if code := <-done; code != http.StatusOK {
-		t.Fatalf("concurrent completion callback status = %d, want 200", code)
+	select {
+	case err := <-sweeperDone:
+		if err != nil {
+			t.Fatalf("concurrent sweeper run failed: %v", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("sweeper did not return after the winner committed")
 	}
-	testHandler.TaskService.TxStarter = originalTxStarter
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("concurrent completion callback status = %d, want 200", code)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("completion callback did not return after release")
+	}
 	if starter.timedOut.Load() {
 		t.Fatal("rendezvous timed out: race did not interleave as designed")
 	}
