@@ -4486,10 +4486,18 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 	}
 	issue, err := h.Queries.GetIssue(ctx, task.IssueID)
 	if err != nil {
+		// A deleted issue is permanent; a read failure stays replayable.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, true, nil
+		}
 		return false, false, err
 	}
 	comment, err := h.Queries.GetComment(ctx, fallbackCommentID)
 	if err != nil {
+		// A deleted fallback row is permanent; a read failure is transient.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, true, nil
+		}
 		return false, false, err
 	}
 	var parentComment *db.Comment
@@ -4497,14 +4505,19 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 		// The parent is routing authority, not display metadata: the guest
 		// squad path restores the delegation chain through it, and without it
 		// the comment would fall through to the unrelated assigned-squad
-		// fallback. A reply whose parent cannot be resolved in the issue
-		// workspace is not routed at all (fail closed, MUL-4252).
+		// fallback. Only a PROVEN-absent parent fails closed (MUL-4252):
+		// pgx.ErrNoRows means the row genuinely does not exist in this
+		// workspace, so the lineage is permanently unprovable. Any other
+		// error is transient infrastructure failure and must stay replayable.
 		parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
 			ID:          comment.ParentID,
 			WorkspaceID: issue.WorkspaceID,
 		})
 		if err != nil {
-			return false, true, nil
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, true, nil
+			}
+			return false, false, err
 		}
 		parentComment = &parent
 	}
@@ -4521,6 +4534,14 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.AgentTaskQueue) {
 	if task == nil || !task.IssueID.Valid || !task.AgentID.Valid || !task.CreatedAt.Valid {
 		return
+	}
+	// Re-read the completing row: the in-memory copy predates any delivery
+	// receipts recorded while this run was finishing (e.g. a coordinator run
+	// that claimed and delivered a comment seconds earlier). The delivered
+	// set below must reflect stored rows, or already-delivered input earns a
+	// duplicate follow-up.
+	if fresh, err := h.Queries.GetAgentTask(ctx, task.ID); err == nil {
+		task = &fresh
 	}
 	plannedCommentIDs := append([]pgtype.UUID{}, task.CoalescedCommentIds...)
 	if task.TriggerCommentID.Valid {
@@ -4567,17 +4588,22 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 			continue
 		}
 		// A synthesized completion fallback is the durable worker-to-coordinator
-		// handoff (GH #8719), not a fresh generic invocation. Replay it through
-		// the narrow fallback resolver — never generic mention fan-out — and
-		// exclude this just-completed worker from the coverage check because
-		// the fallback was synthesized at its completion, not delivered to it.
+		// handoff (GH #8719), not a fresh generic invocation. A fallback is
+		// identified durably — an agent comment whose source task is THIS
+		// completing run and which is NOT that run's delivered/planned input
+		// (an explicit worker reply is recorded in delivered/coalesced ids at
+		// claim time, so it never reaches this branch). Replay it through
+		// the narrow fallback resolver — never generic mention fan-out.
+		// The narrow branch owns these rows: skip the generic routing below
+		// even when the fallback dispatch fails, so a fallback body carrying
+		// @mentions can never be re-parsed as a fresh invocation by THIS or
+		// any other completing task's reconcile pass.
 		// Completion-callback replays (transitioned == false) never reach
 		// here: CompleteTask returns before routing, so replays cannot
 		// duplicate the fallback comment or the coordinator task.
 		if c.AuthorType == "agent" && c.SourceTaskID.Valid &&
 			uuidToString(c.SourceTaskID) == uuidToString(task.ID) &&
-			c.ID.Valid && c.CreatedAt.Valid && task.CompletedAt.Valid &&
-			!c.CreatedAt.Time.Before(task.CompletedAt.Time.Add(-time.Minute)) {
+			!slices.Contains(plannedCommentIDs, c.ID) {
 			if _, _, err := h.dispatchCompletionFallback(ctx, task, c.ID); err != nil {
 				slog.Warn("reconcile comments on completion: completion fallback replay failed, fallback comment remains the durable obligation",
 					"issue_id", uuidToString(task.IssueID),
@@ -4607,6 +4633,19 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 				scheduled++
 			}
 			continue
+		}
+		// Synthesized completion fallbacks from OTHER runs are never generic
+		// input either: their source task differs from this completing run,
+		// so the narrow branch above does not own them — but routing their
+		// bodies through mention fan-out here would resurrect the terminal
+		// originator authority §1/§4 forbids. Skip them here; the sweeper's
+		// ListPendingCompletionFallbacks replay owns their durable delivery.
+		if c.AuthorType == "agent" && c.SourceTaskID.Valid {
+			if srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID); err == nil {
+				if !srcTask.IsLeaderTask && srcTask.Status == "completed" {
+					continue
+				}
+			}
 		}
 		var parentComment *db.Comment
 		if c.ParentID.Valid {

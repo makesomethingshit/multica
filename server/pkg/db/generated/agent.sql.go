@@ -5026,6 +5026,48 @@ func (q *Queries) HasRetryTaskForParent(ctx context.Context, parentTaskID pgtype
 	return column_1, err
 }
 
+const hasTaskCoveringCompletionFallback = `-- name: HasTaskCoveringCompletionFallback :one
+SELECT count(*) > 0 AS covered
+FROM agent_task_queue
+WHERE issue_id = $1
+  AND agent_id = $2
+  AND (
+      $3::uuid = ANY(delivered_comment_ids)
+      OR (
+          id IS DISTINCT FROM $4::uuid
+          AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+          AND (trigger_comment_id = $3::uuid OR $3::uuid = ANY(coalesced_comment_ids))
+      )
+  )
+`
+
+type HasTaskCoveringCompletionFallbackParams struct {
+	IssueID       pgtype.UUID `json:"issue_id"`
+	AgentID       pgtype.UUID `json:"agent_id"`
+	CommentID     pgtype.UUID `json:"comment_id"`
+	ExcludeTaskID pgtype.UUID `json:"exclude_task_id"`
+}
+
+// Durable idempotency check for a synthesized completion fallback (GH #8719).
+// Shared by the completion path and the sweeper replay so both agree on what
+// "covered" means: some runnable coordinator task carries the fallback as
+// trigger/planned input, or a terminal task recorded its delivery receipt.
+// The completing worker task itself is excluded: the fallback is synthesized
+// AT this task's completion and was never delivered to it, so without the
+// exclusion the worker's own row would read as already owning the obligation.
+// (The delegated-failure variant documents the same exclusion rationale.)
+func (q *Queries) HasTaskCoveringCompletionFallback(ctx context.Context, arg HasTaskCoveringCompletionFallbackParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasTaskCoveringCompletionFallback,
+		arg.IssueID,
+		arg.AgentID,
+		arg.CommentID,
+		arg.ExcludeTaskID,
+	)
+	var covered bool
+	err := row.Scan(&covered)
+	return covered, err
+}
+
 const hasTaskCoveringDelegatedFailureComment = `-- name: HasTaskCoveringDelegatedFailureComment :one
 SELECT count(*) > 0 AS covered
 FROM agent_task_queue
@@ -5764,6 +5806,58 @@ func (q *Queries) ListChatFinalizeDeferredExpired(ctx context.Context, arg ListC
 			&i.CancelledByName,
 			&i.IssueSnapshot,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPendingCompletionFallbacks = `-- name: ListPendingCompletionFallbacks :many
+SELECT fallback.id AS fallback_id, worker.id AS worker_task_id
+FROM comment AS fallback
+JOIN agent_task_queue AS worker ON worker.id = fallback.source_task_id
+WHERE fallback.author_type = 'agent'
+  AND fallback.source_task_id IS NOT NULL
+  AND fallback.deleted_at IS NULL
+  AND worker.status = 'completed'
+  AND NOT worker.is_leader_task
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS covering
+      WHERE covering.issue_id = fallback.issue_id
+        AND (fallback.id = ANY(covering.delivered_comment_ids)
+            OR (covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+                AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids))))
+  )
+ORDER BY fallback.created_at ASC, fallback.id ASC
+LIMIT $1::int
+`
+
+type ListPendingCompletionFallbacksRow struct {
+	FallbackID   pgtype.UUID `json:"fallback_id"`
+	WorkerTaskID pgtype.UUID `json:"worker_task_id"`
+}
+
+// Durable outbox scan for synthesized completion fallbacks (GH #8719) that
+// are not yet owned by an executable coordinator task and have no terminal
+// delivery receipt. A fallback is identified durably — an agent comment
+// whose source task is a completed, non-leader worker run — never by body
+// text or a creation-time window. Ordered oldest-first and bounded so one
+// sweep tick cannot monopolise the runtime loop.
+func (q *Queries) ListPendingCompletionFallbacks(ctx context.Context, maxPerTick int32) ([]ListPendingCompletionFallbacksRow, error) {
+	rows, err := q.db.Query(ctx, listPendingCompletionFallbacks, maxPerTick)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPendingCompletionFallbacksRow{}
+	for rows.Next() {
+		var i ListPendingCompletionFallbacksRow
+		if err := rows.Scan(&i.FallbackID, &i.WorkerTaskID); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -7129,6 +7223,115 @@ func (q *Queries) MergeCommentIntoPendingTask(ctx context.Context, arg MergeComm
 	)
 	var i MergeCommentIntoPendingTaskRow
 	err := row.Scan(&i.ID, &i.CoalescedCommentIds)
+	return i, err
+}
+
+const mergeCompletionFallbackIntoPendingTask = `-- name: MergeCompletionFallbackIntoPendingTask :one
+UPDATE agent_task_queue
+SET coalesced_comment_ids = (
+        SELECT COALESCE(array_agg(DISTINCT e), '{}')
+        FROM unnest(array_append(coalesced_comment_ids, trigger_comment_id)) AS e
+        WHERE e IS NOT NULL AND e <> $1::uuid
+    ),
+    trigger_comment_id = $1::uuid,
+    trigger_summary = $2
+WHERE id = (
+    SELECT t.id FROM agent_task_queue t
+    WHERE t.context->>'wakeup_id' IS NULL AND t.issue_id = $3
+      AND t.agent_id = $4
+      AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id($1::uuid)
+      AND (
+          t.status = 'queued'
+          OR (t.status = 'deferred' AND t.context->>'channel_issue_media_pending' = 'true')
+      )
+      AND t.trigger_comment_id IS DISTINCT FROM $1::uuid
+      AND NOT ($1::uuid = ANY(t.coalesced_comment_ids))
+    ORDER BY t.created_at DESC
+    LIMIT 1
+)
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision, comment_thread_id, cancelled_by_type, cancelled_by_id, cancelled_by_name, issue_snapshot
+`
+
+type MergeCompletionFallbackIntoPendingTaskParams struct {
+	CommentID      pgtype.UUID `json:"comment_id"`
+	TriggerSummary pgtype.Text `json:"trigger_summary"`
+	IssueID        pgtype.UUID `json:"issue_id"`
+	AgentID        pgtype.UUID `json:"agent_id"`
+}
+
+// Fold an uncovered completion fallback (GH #8719) into the coordinator's
+// pre-claim task without replacing that task's attribution snapshot: the
+// fallback is platform evidence of an already-established delegation, not a
+// new human instruction. Mirrors MergeDelegatedFailureCommentIntoPendingTask.
+func (q *Queries) MergeCompletionFallbackIntoPendingTask(ctx context.Context, arg MergeCompletionFallbackIntoPendingTaskParams) (AgentTaskQueue, error) {
+	row := q.db.QueryRow(ctx, mergeCompletionFallbackIntoPendingTask,
+		arg.CommentID,
+		arg.TriggerSummary,
+		arg.IssueID,
+		arg.AgentID,
+	)
+	var i AgentTaskQueue
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+		&i.WaitReason,
+		&i.InitiatorUserID,
+		&i.HandoffNote,
+		&i.PrepareLeaseExpiresAt,
+		&i.SquadID,
+		&i.RuntimeMcpOverlay,
+		&i.EscalationForTaskID,
+		&i.FireAt,
+		&i.OriginatorUserID,
+		&i.RuntimeConnectedApps,
+		&i.CoalescedCommentIds,
+		&i.DeliveredCommentIds,
+		&i.ChatInputTaskID,
+		&i.ChatFinalizeDeferredAt,
+		&i.OriginatorSource,
+		&i.DelegatedFromTaskID,
+		&i.RetryOfTaskID,
+		&i.RerunOfTaskID,
+		&i.RuleVersionID,
+		&i.TriggerEvidenceKind,
+		&i.TriggerEvidenceRefID,
+		&i.AccountableUserID,
+		&i.SessionRolloutMissing,
+		&i.RetiredSessionID,
+		&i.QuickActionsDisabled,
+		&i.RegenerateQuickActionsFor,
+		&i.BranchName,
+		&i.DurableWorkDir,
+		&i.ChannelContextRevision,
+		&i.CommentThreadID,
+		&i.CancelledByType,
+		&i.CancelledByID,
+		&i.CancelledByName,
+		&i.IssueSnapshot,
+	)
 	return i, err
 }
 

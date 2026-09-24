@@ -2040,6 +2040,83 @@ WHERE id = (
 )
 RETURNING *;
 
+-- name: HasTaskCoveringCompletionFallback :one
+-- Durable idempotency check for a synthesized completion fallback (GH #8719).
+-- Shared by the completion path and the sweeper replay so both agree on what
+-- "covered" means: some runnable coordinator task carries the fallback as
+-- trigger/planned input, or a terminal task recorded its delivery receipt.
+-- The completing worker task itself is excluded: the fallback is synthesized
+-- AT this task's completion and was never delivered to it, so without the
+-- exclusion the worker's own row would read as already owning the obligation.
+-- (The delegated-failure variant documents the same exclusion rationale.)
+SELECT count(*) > 0 AS covered
+FROM agent_task_queue
+WHERE issue_id = @issue_id
+  AND agent_id = @agent_id
+  AND (
+      @comment_id::uuid = ANY(delivered_comment_ids)
+      OR (
+          id IS DISTINCT FROM sqlc.narg('exclude_task_id')::uuid
+          AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+          AND (trigger_comment_id = @comment_id::uuid OR @comment_id::uuid = ANY(coalesced_comment_ids))
+      )
+  );
+
+-- name: MergeCompletionFallbackIntoPendingTask :one
+-- Fold an uncovered completion fallback (GH #8719) into the coordinator's
+-- pre-claim task without replacing that task's attribution snapshot: the
+-- fallback is platform evidence of an already-established delegation, not a
+-- new human instruction. Mirrors MergeDelegatedFailureCommentIntoPendingTask.
+UPDATE agent_task_queue
+SET coalesced_comment_ids = (
+        SELECT COALESCE(array_agg(DISTINCT e), '{}')
+        FROM unnest(array_append(coalesced_comment_ids, trigger_comment_id)) AS e
+        WHERE e IS NOT NULL AND e <> @comment_id::uuid
+    ),
+    trigger_comment_id = @comment_id::uuid,
+    trigger_summary = sqlc.narg('trigger_summary')
+WHERE id = (
+    SELECT t.id FROM agent_task_queue t
+    WHERE t.context->>'wakeup_id' IS NULL AND t.issue_id = @issue_id
+      AND t.agent_id = @agent_id
+      AND t.comment_thread_id IS NOT DISTINCT FROM comment_thread_root_id(@comment_id::uuid)
+      AND (
+          t.status = 'queued'
+          OR (t.status = 'deferred' AND t.context->>'channel_issue_media_pending' = 'true')
+      )
+      AND t.trigger_comment_id IS DISTINCT FROM @comment_id::uuid
+      AND NOT (@comment_id::uuid = ANY(t.coalesced_comment_ids))
+    ORDER BY t.created_at DESC
+    LIMIT 1
+)
+RETURNING *;
+
+-- name: ListPendingCompletionFallbacks :many
+-- Durable outbox scan for synthesized completion fallbacks (GH #8719) that
+-- are not yet owned by an executable coordinator task and have no terminal
+-- delivery receipt. A fallback is identified durably — an agent comment
+-- whose source task is a completed, non-leader worker run — never by body
+-- text or a creation-time window. Ordered oldest-first and bounded so one
+-- sweep tick cannot monopolise the runtime loop.
+SELECT fallback.id AS fallback_id, worker.id AS worker_task_id
+FROM comment AS fallback
+JOIN agent_task_queue AS worker ON worker.id = fallback.source_task_id
+WHERE fallback.author_type = 'agent'
+  AND fallback.source_task_id IS NOT NULL
+  AND fallback.deleted_at IS NULL
+  AND worker.status = 'completed'
+  AND NOT worker.is_leader_task
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue AS covering
+      WHERE covering.issue_id = fallback.issue_id
+        AND (fallback.id = ANY(covering.delivered_comment_ids)
+            OR (covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+                AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids))))
+  )
+ORDER BY fallback.created_at ASC, fallback.id ASC
+LIMIT @max_per_tick::int;
+
 -- name: HasTaskCoveringDelegatedFailureComment :one
 -- Durable idempotency check for a recovery comment. The completion reconciler
 -- excludes its own just-completed task when replaying a planned-but-undelivered

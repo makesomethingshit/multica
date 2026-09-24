@@ -359,6 +359,71 @@ func TestCompletionFallbackInvalidParentStaysFailClosed(t *testing.T) {
 	}
 }
 
+// TestCompletionFallbackCrossTaskReparseBlocked pins review blocker 1 (GH
+// #8719): when another agent B completes later on the same thread, B's
+// completion reconcile must NOT re-parse W's fallback body as a fresh generic
+// comment — even when the fallback names B with an explicit @mention and B's
+// originator could invoke the mention target. The fallback is owned solely by
+// the narrow handoff path (and the sweeper replay), never by generic mention
+// fan-out from any completing task.
+func TestCompletionFallbackCrossTaskReparseBlocked(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback cross leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback cross leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback cross worker runtime")
+	workerID := dbfx.Agent(t, "Fallback cross worker", workerRuntimeID)
+	otherRuntimeID := dbfx.Runtime(t, "Fallback cross other runtime")
+	otherID := dbfx.Agent(t, "Fallback cross other", otherRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	squadID := dbfx.Squad(t, "Fallback cross squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Fallback cross-task reparse stays blocked", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) verify the implementation", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, workerTaskID)
+	var fallbackID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("completion fallback comment was not synthesized")
+	}
+	// Rewrite the fallback body to mention an unrelated agent B explicitly.
+	dbfx.Exec(t, `UPDATE comment SET content = $2 WHERE id = $1`, fallbackID,
+		fmt.Sprintf("Done. [@B](mention://agent/%s) please take over", otherID))
+	// B runs later on the same thread and completes: B's reconcile pass must
+	// not re-parse W's fallback body into a fresh invocation of B (or Other).
+	otherTaskID := dbfx.Task(t, otherID, testutil.Cols{
+		"runtime_id": otherRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, otherTaskID)
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, otherID); got != 0 {
+		t.Fatalf("cross-task reconcile re-parsed fallback mention: got %d queued B task(s), want 0", got)
+	}
+	// The fallback still belongs to W's coordinator handoff, not to B.
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory') AND is_leader_task = TRUE", issueID, leaderID); got != 1 {
+		t.Fatalf("coordinator handoff lost during cross-task completion: got %d, want 1", got)
+	}
+	_ = ctx
+}
+
 // TestCompletionFallbackReplayIsIdempotent pins §10 Test E (GH #8719):
 // dispatching the same fallback obligation twice must leave exactly one
 // runnable coordinator task, and a completion-callback replay must duplicate
@@ -470,9 +535,26 @@ func TestCompletionFallbackTransientHandoffFailureIsRecoverable(t *testing.T) {
 		t.Fatalf("failed route created %d coordinator task(s), want 0", got)
 	}
 
-	testHandler.reconcileCommentsOnCompletion(ctx, completed)
+	// Fail the same-request reconcile too, then prove the post-request sweeper
+	// replay — not the in-request path — delivers the handoff. This pins
+	// review blocker 2: after HTTP success with every in-request attempt down,
+	// a real later replay must still exist.
+	if _, provenInvalid, err := testHandler.dispatchCompletionFallback(failedCtx, completed, fallbackID); err == nil || provenInvalid {
+		t.Fatalf("second route attempt = (invalid=%v, err=%v), want transient error", provenInvalid, err)
+	}
+	testHandler.reconcileCommentsOnCompletion(failedCtx, completed)
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
+		t.Fatalf("failed same-request reconcile created %d coordinator task(s), want 0", got)
+	}
+	result, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10)
+	if err != nil {
+		t.Fatalf("sweeper replay failed: %v", err)
+	}
+	if result.Replayed != 1 {
+		t.Fatalf("sweeper replayed %d fallback(s), want 1 (scanned=%d)", result.Replayed, result.Scanned)
+	}
 	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
-		t.Fatalf("reconciliation left %d runnable coordinator task(s), want exactly 1", got)
+		t.Fatalf("sweeper replay left %d runnable coordinator task(s), want exactly 1", got)
 	}
 	if got := dbfx.Count(t, "SELECT count(*) FROM comment WHERE id = $1", uuidToString(fallbackID)); got != 1 {
 		t.Fatalf("fallback comment after recovery: got %d rows, want 1", got)
@@ -525,19 +607,31 @@ func TestCompletionFallbackExplicitReplyUnchanged(t *testing.T) {
 	req.Header.Set("X-Task-ID", workerTaskID)
 	var response CommentResponse
 	testutil.Call(t, testHandler.CreateComment, req).Want(http.StatusCreated).JSON(&response)
+	_ = response
+	// The review blocker-3 scenario is an explicit reply the leader ALREADY
+	// handled and terminated. Model it without a raw status flip (which
+	// would leave the reply uncovered and force a reconcile re-wake): claim
+	// the wake the explicit reply enqueued, start it, and complete it —
+	// recording the reply as delivered. The worker's later completion must
+	// then produce no duplicate wake and no synthesized fallback.
+	first := claimWorkerReplyRun(t, leaderRuntimeID)
+	if first == nil || !first.IsLeaderTask {
+		t.Fatal("explicit reply did not enqueue the first leader wake")
+	}
+	if _, err := testHandler.TaskService.StartTask(context.Background(), parseUUID(first.ID)); err != nil {
+		t.Fatalf("start first leader run: %v", err)
+	}
+	completeWorkerReplyRun(t, first.ID)
 	completeWorkerReplyRun(t, workerTaskID)
 	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID); got != 1 {
 		t.Fatalf("explicit reply plus completion left %d worker comment(s), want 1 (no synthesized fallback)", got)
 	}
 	next := claimWorkerReplyRun(t, leaderRuntimeID)
-	if next == nil {
-		t.Fatal("explicit worker reply did not wake the squad leader")
+	if next != nil {
+		t.Fatalf("handled reply must not re-wake the terminated leader, got task %s", next.ID)
 	}
-	if !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, response.ID) {
-		t.Fatal("follow-up must deliver the explicit reply in the squad leader role")
-	}
-	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
-		t.Fatalf("leader has %d runnable task(s) after claim, want exactly one wake", got)
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
+		t.Fatalf("leader has %d runnable task(s) after handled completion, want 0", got)
 	}
 }
 
