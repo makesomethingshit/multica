@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -849,6 +851,130 @@ func TestCompletionFallbackAtomicBoundary(t *testing.T) {
 	}
 	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
 		t.Fatalf("recovery created %d runnable coordinator task(s), want exactly 1", got)
+	}
+}
+
+// rendezvousTxStarter pauses the first synthesis transaction for a completed
+// unrecorded run at Begin while the test drives the sweeper concurrently,
+// forcing the completion-callback-vs-sweeper race to interleave
+// deterministically: the sweeper wins, the callback replays the winner.
+type rendezvousTxStarter struct {
+	delegate   *pgxpool.Pool
+	workerTask string
+	done       atomic.Bool
+	started    chan struct{}
+	release    chan struct{}
+	timedOut   atomic.Bool
+}
+
+func (s *rendezvousTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	if !s.done.Load() {
+		var status string
+		var record pgtype.UUID
+		if err := s.delegate.QueryRow(ctx, "SELECT status, completion_fallback_comment_id FROM agent_task_queue WHERE id = $1", s.workerTask).Scan(&status, &record); err == nil && status == "completed" && !record.Valid && s.done.CompareAndSwap(false, true) {
+			close(s.started)
+			select {
+			case <-s.release:
+			case <-time.After(30 * time.Second):
+				s.timedOut.Store(true)
+			}
+		}
+	}
+	return s.delegate.Begin(ctx)
+}
+
+// TestCompletionFallbackSingleWinner pins the synthesis race (GH #8719): when
+// the completion callback and the sweeper late synthesis target the same
+// unrecorded run at once, row-level serialization elects exactly one winner.
+// One fallback comment, one recorded id, one coordinator task, one delivery —
+// the loser inserts nothing and replays the winner.
+func TestCompletionFallbackSingleWinner(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback winner leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback winner leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback winner worker runtime")
+	workerID := dbfx.Agent(t, "Fallback winner worker", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback winner squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Single fallback winner", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) do the work", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	starter := &rendezvousTxStarter{
+		delegate:   testPool,
+		workerTask: workerTaskID,
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	originalTxStarter := testHandler.TaskService.TxStarter
+	testHandler.TaskService.TxStarter = starter
+	done := make(chan int, 1)
+	go func() {
+		req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/tasks/"+workerTaskID+"/complete", map[string]any{"output": "Processed the inputs delivered to this run"}, testWorkspaceID, "worker-reply-handoff")
+		req = withURLParam(req, "taskId", workerTaskID)
+		rec := httptest.NewRecorder()
+		testHandler.CompleteTask(rec, req)
+		done <- rec.Code
+	}()
+	select {
+	case <-starter.started:
+	case <-time.After(30 * time.Second):
+		t.Fatal("completion synthesis never reached the rendezvous")
+	}
+	// The sweeper wins while the callback waits: late synthesis inserts and
+	// records exactly once.
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("concurrent sweeper run failed: %v", err)
+	}
+	close(starter.release)
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("concurrent completion callback status = %d, want 200", code)
+	}
+	testHandler.TaskService.TxStarter = originalTxStarter
+	if starter.timedOut.Load() {
+		t.Fatal("rendezvous timed out: race did not interleave as designed")
+	}
+	// Exactly one winner: one comment, one recorded id, one coordinator task.
+	var winnerID string
+	dbfx.QueryRow(t, "SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2", workerTaskID, workerID).Scan(&winnerID)
+	if winnerID == "" {
+		t.Fatal("no fallback comment survived the race")
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2", workerTaskID, workerID); got != 1 {
+		t.Fatalf("race left %d fallback comment(s), want exactly 1", got)
+	}
+	stored, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(workerTaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.CompletionFallbackCommentID.Valid || uuidToString(stored.CompletionFallbackCommentID) != winnerID {
+		t.Fatal("recorded id does not match the single fallback comment")
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("race left %d runnable coordinator task(s), want exactly 1", got)
+	}
+	next := claimWorkerReplyRun(t, leaderRuntimeID)
+	if next == nil || !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, winnerID) {
+		t.Fatalf("race recovery did not deliver the fallback to the coordinator: task=%+v", next)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("race recovery created %d runnable coordinator task(s), want exactly 1", got)
 	}
 }
 

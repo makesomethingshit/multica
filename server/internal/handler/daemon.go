@@ -4588,24 +4588,24 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 			continue
 		}
 		// A synthesized completion fallback is the durable worker-to-coordinator
-			// handoff (GH #8719), not a fresh generic invocation. A fallback is
-			// the exact comment id recorded on the completing run at synthesis
-			// time — never a shape match. An explicit worker reply carries the
-			// same (agent, source run) shape but has no record, so it is never
-			// reclassified here: it keeps whatever routing (or suppression) the
-			// creation path gave it. Replay the recorded fallback through the
-			// narrow fallback resolver — never generic mention fan-out.
-			// The narrow branch owns these rows: skip the generic routing below
-			// even when the fallback dispatch fails, so a fallback body carrying
-			// @mentions can never be re-parsed as a fresh invocation by THIS or
-			// any other completing task's reconcile pass.
-			// Completion-callback replays (transitioned == false) never reach
-			// here: CompleteTask returns before routing, so replays cannot
-			// duplicate the fallback comment or the coordinator task.
-			if c.AuthorType == "agent" && c.SourceTaskID.Valid &&
-				task.CompletionFallbackCommentID.Valid &&
-				uuidToString(c.ID) == uuidToString(task.CompletionFallbackCommentID) &&
-				!slices.Contains(plannedCommentIDs, c.ID) {
+		// handoff (GH #8719), not a fresh generic invocation. A fallback is
+		// the exact comment id recorded on the completing run at synthesis
+		// time — never a shape match. An explicit worker reply carries the
+		// same (agent, source run) shape but has no record, so it is never
+		// reclassified here: it keeps whatever routing (or suppression) the
+		// creation path gave it. Replay the recorded fallback through the
+		// narrow fallback resolver — never generic mention fan-out.
+		// The narrow branch owns these rows: skip the generic routing below
+		// even when the fallback dispatch fails, so a fallback body carrying
+		// @mentions can never be re-parsed as a fresh invocation by THIS or
+		// any other completing task's reconcile pass.
+		// Completion-callback replays (transitioned == false) never reach
+		// here: CompleteTask returns before routing, so replays cannot
+		// duplicate the fallback comment or the coordinator task.
+		if c.AuthorType == "agent" && c.SourceTaskID.Valid &&
+			task.CompletionFallbackCommentID.Valid &&
+			uuidToString(c.ID) == uuidToString(task.CompletionFallbackCommentID) &&
+			!slices.Contains(plannedCommentIDs, c.ID) {
 			if _, _, err := h.dispatchCompletionFallback(ctx, task, c.ID); err != nil {
 				slog.Warn("reconcile comments on completion: completion fallback replay failed, fallback comment remains the durable obligation",
 					"issue_id", uuidToString(task.IssueID),
@@ -4642,19 +4642,19 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		// bodies through mention fan-out here would resurrect the terminal
 		// originator authority §1/§4 forbids. Skip them here; the sweeper's
 		// ListPendingCompletionFallbacks replay owns their durable delivery.
-			if c.AuthorType == "agent" && c.SourceTaskID.Valid {
-				srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID)
-				if err != nil {
-					// Fail closed: an unverifiable lineage claim must never
-					// fall through to generic mention parsing. Transient
-					// lookup failures stay pending for the sweeper replay;
-					// they are not proven-invalid lineage.
-					continue
-				}
-				if !srcTask.IsLeaderTask && srcTask.Status == "completed" {
-					continue
-				}
+		if c.AuthorType == "agent" && c.SourceTaskID.Valid {
+			srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID)
+			if err != nil {
+				// Fail closed: an unverifiable lineage claim must never
+				// fall through to generic mention parsing. Transient
+				// lookup failures stay pending for the sweeper replay;
+				// they are not proven-invalid lineage.
+				continue
 			}
+			if !srcTask.IsLeaderTask && srcTask.Status == "completed" {
+				continue
+			}
+		}
 		var parentComment *db.Comment
 		if c.ParentID.Valid {
 			// Scope to the issue's workspace; a comment's parent is always in the

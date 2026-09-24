@@ -2127,6 +2127,16 @@ UPDATE agent_task_queue
 SET completion_fallback_comment_id = @fallback_id::uuid
 WHERE id = @task_id::uuid;
 
+-- name: GetAgentTaskForUpdate :one
+-- FOR UPDATE variant for completion-fallback synthesis (GH #8719). Locks the
+-- worker run row so concurrent synthesizers (completion callback vs sweeper
+-- late synthesis) serialize: exactly one winner inserts the fallback comment
+-- and records its id, while the loser re-reads the recorded id and replays it
+-- instead of inserting a second comment.
+SELECT * FROM agent_task_queue
+WHERE id = @task_id::uuid
+FOR UPDATE;
+
 -- name: ListCompletionFallbackOwedRuns :many
 -- Completed non-leader issue runs that never recorded a synthesized fallback
 -- (GH #8719): the atomic synthesis transaction failed before persisting

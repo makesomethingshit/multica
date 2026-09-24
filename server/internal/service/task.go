@@ -4810,16 +4810,16 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 				"error", err,
 			)
 		}
-			agentCommented, _ := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
-				IssueID:  task.IssueID,
-				AuthorID: task.AgentID,
-				// Anchor on start when known: the query matches on
-				// issue/agent/time only, so anchoring on creation would let
-				// another run's comment posted while this task waited in the
-				// queue suppress this run's fallback synthesis. Fall back to
-				// creation only for fixture/legacy rows with NULL started_at.
-				Since: coalesceTaskCommentAnchor(task),
-			})
+		agentCommented, _ := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
+			IssueID:  task.IssueID,
+			AuthorID: task.AgentID,
+			// Anchor on start when known: the query matches on
+			// issue/agent/time only, so anchoring on creation would let
+			// another run's comment posted while this task waited in the
+			// queue suppress this run's fallback synthesis. Fall back to
+			// creation only for fixture/legacy rows with NULL started_at.
+			Since: coalesceTaskCommentAnchor(task),
+		})
 		if !suppressNoActionComment && !agentCommented {
 			var payload protocol.TaskCompletedPayload
 			if err := json.Unmarshal(result, &payload); err == nil {
@@ -7145,24 +7145,41 @@ func (s *TaskService) replayCompletionFallbackRow(ctx context.Context, row db.Li
 // commit; their failure never loses the obligation.
 func (s *TaskService) synthesizeCompletionFallbackComment(ctx context.Context, task db.AgentTaskQueue, body string) (pgtype.UUID, error) {
 	content := truncateFallbackCommentBody(redact.Text(body), maxSynthesizedFallbackCommentRunes)
+	var fallbackID pgtype.UUID
 	var created db.CreateCommentRow
 	var issue db.Issue
 	var rootComment *db.Comment
 	if err := s.runInTx(ctx, func(q *db.Queries) error {
-		var err error
+		// Serialize concurrent synthesizers (completion callback vs sweeper
+		// late synthesis) on the run row: exactly one winner inserts the
+		// fallback comment and records its id. A loser finds the winner's
+		// recorded id, inserts nothing, and replays it instead.
+		locked, err := q.GetAgentTaskForUpdate(ctx, task.ID)
+		if err != nil {
+			return err
+		}
+		if locked.CompletionFallbackCommentID.Valid {
+			fallbackID = locked.CompletionFallbackCommentID
+			return nil
+		}
 		created, issue, rootComment, err = insertAgentCommentRow(ctx, q, task.IssueID, task.AgentID, content, "comment", task.TriggerCommentID, task.ID)
 		if err != nil {
 			return err
 		}
+		fallbackID = created.Comment().ID
 		return q.RecordCompletionFallbackComment(ctx, db.RecordCompletionFallbackCommentParams{
 			TaskID:     task.ID,
-			FallbackID: created.Comment().ID,
+			FallbackID: fallbackID,
 		})
 	}); err != nil {
 		return pgtype.UUID{}, err
 	}
-	s.publishAgentComment(ctx, issue, created, rootComment, task.AgentID, task.ID)
-	return created.Comment().ID, nil
+	// Only the inserting winner publishes; a loser replays the winner's id
+	// through the coverage-guarded dispatch, which cannot duplicate the task.
+	if created.ID.Valid {
+		s.publishAgentComment(ctx, issue, created, rootComment, task.AgentID, task.ID)
+	}
+	return fallbackID, nil
 }
 
 // replayCompletionFallbackOwedRun synthesizes a fallback the completion path
