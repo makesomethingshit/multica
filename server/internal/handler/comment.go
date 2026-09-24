@@ -2650,28 +2650,47 @@ func (h *Handler) enqueueSingleCommentTrigger(ctx context.Context, issue db.Issu
 				"agent_id", uuidToString(trigger.Agent.ID))
 			return err
 		}
-	case commentTriggerSourceThreadParent, commentTriggerSourceConversation, commentTriggerSourceCompletionFallback:
-		// Squad is set on these sources only when the routing already
+	case commentTriggerSourceThreadParent, commentTriggerSourceConversation:
+		var err error
+		// Squad is set on these two sources only when the routing already
 		// proved a leader role to continue: the thread root's prior task for
 		// the conversation path, the replied-to comment's own authoring task
-		// for the thread-parent path, the exact delegation lineage for the
-		// completion-fallback handoff (GH #8719). Gating on the source as
-		// well would keep the thread-parent path demoted for no reason
-		// (MUL-7006).
-		if trigger.Squad == nil {
-			return nil
-		}
+		// for the thread-parent path. Gating on the source as well would keep
+		// the thread-parent path demoted for no reason (MUL-7006).
+		// (The completion-fallback source never reaches this shared enqueue
+		// helper: routeCompletionFallbackCoordinator enqueues through
+		// EnqueueCompletionFallbackHandoff instead, so the fallback cannot
+		// alter generic thread-parent/conversation routing.)
 		if trigger.Squad != nil {
-			_, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, issue, trigger.Agent.ID, trigger.Squad.ID, triggerCommentID, service.OriginNamed)
-			if err != nil {
-				logCommentEnqueueFailure("enqueue routed comment agent task failed", err,
-					"issue_id", uuidToString(issue.ID),
-					"agent_id", uuidToString(trigger.Agent.ID),
-					"source", trigger.Source)
-				return err
-			}
+			_, err = h.TaskService.EnqueueTaskForSquadLeader(ctx, issue, trigger.Agent.ID, trigger.Squad.ID, triggerCommentID, service.OriginNamed)
 		} else {
-			return nil
+			_, err = h.TaskService.EnqueueTaskForThreadParent(ctx, issue, trigger.Agent.ID, triggerCommentID)
+		}
+		if err != nil {
+			logCommentEnqueueFailure("enqueue routed comment agent task failed", err,
+				"issue_id", uuidToString(issue.ID),
+				"agent_id", uuidToString(trigger.Agent.ID),
+				"source", trigger.Source)
+			return err
+		}
+	case commentTriggerSourceCompletionFallback:
+		// Narrow handoff-only source (GH #8719): Squad is always set by the
+		// fallback resolver, which proved the exact delegation lineage.
+		// Any trigger reaching here without one is a programming error, not
+		// a silent no-op: fail loudly so it surfaces in tests and logs.
+		if trigger.Squad == nil {
+			slog.Error("completion fallback trigger missing squad role",
+				"issue_id", uuidToString(issue.ID),
+				"agent_id", uuidToString(trigger.Agent.ID))
+			return errors.New("completion fallback trigger missing squad role")
+		}
+		_, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, issue, trigger.Agent.ID, trigger.Squad.ID, triggerCommentID, service.OriginNamed)
+		if err != nil {
+			logCommentEnqueueFailure("enqueue routed comment agent task failed", err,
+				"issue_id", uuidToString(issue.ID),
+				"agent_id", uuidToString(trigger.Agent.ID),
+				"source", trigger.Source)
+			return err
 		}
 	}
 	return nil
