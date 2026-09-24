@@ -249,7 +249,18 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				resultIsError = msg.IsError
 				terminalReasonError = claudeTerminalReasonFailure(msg.TerminalReason, msg.ResultText)
 				sessionID = msg.SessionID
-				if resultUsage := claudeResultUsage(msg, opts.Model); len(resultUsage) > 0 {
+				var resultUsage map[string]TokenUsage
+				if opts.ResumeSessionID != "" {
+					// On resumed sessions modelUsage is session-cumulative; usage is
+					// the current main-loop turn. Fresh runs retain modelUsage so
+					// their full model and subagent breakdown remains available.
+					// ponytail: resumed subagent totals need a turn-local protocol source;
+					// do not reuse cumulative modelUsage until one is available.
+					resultUsage = claudeTurnUsage(msg, opts.Model)
+				} else {
+					resultUsage = claudeResultUsage(msg, opts.Model)
+				}
+				if len(resultUsage) > 0 {
 					usage = resultUsage
 				}
 				closeStdin()
@@ -654,6 +665,10 @@ func claudeResultUsage(msg claudeSDKMessage, fallbackModel string) map[string]To
 		}
 	}
 
+	return claudeTurnUsage(msg, fallbackModel)
+}
+
+func claudeTurnUsage(msg claudeSDKMessage, fallbackModel string) map[string]TokenUsage {
 	model := msg.Model
 	if model == "" {
 		model = fallbackModel

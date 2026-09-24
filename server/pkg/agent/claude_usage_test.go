@@ -100,7 +100,7 @@ func TestClaudeExecuteFallbackUsage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			backend := claudeUsageFixtureBackend(t, tt.events, tt.result, !tt.success)
-			result := executeClaudeUsageFixture(t, backend, len(tt.events))
+			result := executeClaudeUsageFixture(t, backend, len(tt.events), "")
 			wantStatus := "failed"
 			if tt.success {
 				wantStatus = "completed"
@@ -115,6 +115,45 @@ func TestClaudeExecuteFallbackUsage(t *testing.T) {
 	}
 }
 
+func TestClaudeExecuteKeepsResumedUsageTaskLocal(t *testing.T) {
+	t.Parallel()
+	const model = "claude-sonnet-4-6"
+	run1 := TokenUsage{InputTokens: 100, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40}
+	run2 := TokenUsage{InputTokens: 40, OutputTokens: 6, CacheReadTokens: 8, CacheWriteTokens: 12}
+	run3 := TokenUsage{InputTokens: 60, OutputTokens: 10, CacheReadTokens: 15, CacheWriteTokens: 5}
+
+	for _, tc := range []struct {
+		name            string
+		resumeSessionID string
+		current         TokenUsage
+		cumulative      TokenUsage
+	}{
+		{name: "fresh", current: run1, cumulative: run1},
+		{name: "resume_2", resumeSessionID: "session-1", current: run2, cumulative: TokenUsage{InputTokens: 140, OutputTokens: 26, CacheReadTokens: 38, CacheWriteTokens: 52}},
+		{name: "resume_3", resumeSessionID: "session-1", current: run3, cumulative: TokenUsage{InputTokens: 200, OutputTokens: 36, CacheReadTokens: 53, CacheWriteTokens: 57}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resultEvent := mustMarshal(t, map[string]any{
+				"type": "result", "subtype": "success", "is_error": false, "session_id": "session-1", "model": model,
+				"usage": map[string]int64{
+					"input_tokens": tc.current.InputTokens, "output_tokens": tc.current.OutputTokens,
+					"cache_read_input_tokens": tc.current.CacheReadTokens, "cache_creation_input_tokens": tc.current.CacheWriteTokens,
+				},
+				"modelUsage": map[string]any{model: map[string]int64{
+					"inputTokens": tc.cumulative.InputTokens, "outputTokens": tc.cumulative.OutputTokens,
+					"cacheReadInputTokens": tc.cumulative.CacheReadTokens, "cacheCreationInputTokens": tc.cumulative.CacheWriteTokens,
+				}},
+			})
+			backend := claudeUsageFixtureBackend(t, nil, resultEvent, false)
+			result := executeClaudeUsageFixture(t, backend, 0, tc.resumeSessionID)
+			if want := map[string]TokenUsage{model: tc.current}; !reflect.DeepEqual(result.Usage, want) {
+				t.Fatalf("usage = %#v, want current invocation usage %#v", result.Usage, want)
+			}
+		})
+	}
+}
+
 func TestClaudeFallbackUsageIsScopedToExecution(t *testing.T) {
 	t.Parallel()
 	event := json.RawMessage(`{"type":"assistant","message":{"id":"msg_reused","role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":200,"cache_creation_input_tokens":10},"content":[{"type":"text","text":"visible text"},{"type":"tool_use","id":"tool_reused","name":"Read","input":{"file_path":"fixture.txt"}}]}}`)
@@ -122,7 +161,7 @@ func TestClaudeFallbackUsageIsScopedToExecution(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		t.Run(fmt.Sprintf("execution_%d", i), func(t *testing.T) {
 			t.Parallel()
-			result := executeClaudeUsageFixture(t, backend, 2)
+			result := executeClaudeUsageFixture(t, backend, 2, "")
 			want := TokenUsage{InputTokens: 100, CacheReadTokens: 200, CacheWriteTokens: 10}
 			if got := result.Usage["claude-sonnet-4-6"]; got != want {
 				t.Fatalf("usage = %+v, want %+v", got, want)
@@ -163,11 +202,11 @@ func claudeUsageFixtureBackend(t *testing.T, events []json.RawMessage, result js
 	return backend
 }
 
-func executeClaudeUsageFixture(t *testing.T, backend Backend, eventCount int) Result {
+func executeClaudeUsageFixture(t *testing.T, backend Backend, eventCount int, resumeSessionID string) Result {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	session, err := backend.Execute(ctx, "fixture", ExecOptions{Timeout: 5 * time.Second})
+	session, err := backend.Execute(ctx, "fixture", ExecOptions{Timeout: 5 * time.Second, ResumeSessionID: resumeSessionID})
 	if err != nil {
 		t.Fatal(err)
 	}
