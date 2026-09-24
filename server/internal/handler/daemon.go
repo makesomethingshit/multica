@@ -4453,17 +4453,44 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 //     run, and terminating: the follow-up's own created_at is later than all of
 //     these comments and its delivered set will contain them, so its completion
 //     finds nothing to re-schedule.
+//
+// routeCompletionFallbackComment routes a synthesized worker completion
+// fallback as a durable, narrowly scoped worker-to-coordinator handoff, not
+// as a fresh generic agent-authored comment invocation (GH #8719).
+//
+// The fallback comment itself is the durable obligation: its row persists
+// inside the completion transaction's aftermath, so a transient routing or
+// enqueue failure can be replayed later by re-resolving the same
+// (worker task, fallback comment, parent) triple. The enqueue path coalesces
+// through the existing pending/coalescing invariant, so a replay never
+// duplicates the coordinator task. Invalid lineage fails closed permanently
+// and is never retried; transient errors are returned to the caller, which
+// preserves the obligation instead of reporting success.
 func (h *Handler) routeCompletionFallbackComment(ctx context.Context, task *db.AgentTaskQueue, fallbackCommentID pgtype.UUID) {
+	_, _, err := h.dispatchCompletionFallback(ctx, task, fallbackCommentID)
+	if err != nil {
+		slog.Warn("completion fallback handoff deferred: coordinator wake will replay from the persisted fallback comment",
+			"task_id", uuidToString(task.ID),
+			"fallback_comment_id", uuidToString(fallbackCommentID),
+			"error", err)
+	}
+}
+
+// dispatchCompletionFallback resolves the fallback's coordinator and enqueues
+// exactly one handoff. The bool reports proven-invalid lineage (permanent
+// fail-closed); any error is transient and the persisted fallback comment
+// remains the replayable obligation.
+func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.AgentTaskQueue, fallbackCommentID pgtype.UUID) (bool, bool, error) {
 	if task == nil || !fallbackCommentID.Valid || !task.IssueID.Valid || !task.AgentID.Valid {
-		return
+		return false, true, nil
 	}
 	issue, err := h.Queries.GetIssue(ctx, task.IssueID)
 	if err != nil {
-		return
+		return false, false, err
 	}
 	comment, err := h.Queries.GetComment(ctx, fallbackCommentID)
 	if err != nil {
-		return
+		return false, false, err
 	}
 	var parentComment *db.Comment
 	if comment.ParentID.Valid {
@@ -4477,15 +4504,18 @@ func (h *Handler) routeCompletionFallbackComment(ctx context.Context, task *db.A
 			WorkspaceID: issue.WorkspaceID,
 		})
 		if err != nil {
-			return
+			return false, true, nil
 		}
 		parentComment = &parent
 	}
-	// Same originator resolution as the completion reconcile: the human at the
-	// top of this run's trigger chain, so the A2A permission check sees the
-	// same principal an explicit reply would have carried (MUL-3963).
-	originatorUserID := uuidToString(h.TaskService.ResolveOriginatorFromTriggerComment(ctx, issue.WorkspaceID, comment.ID))
-	h.triggerTasksForComment(ctx, issue, comment, parentComment, comment.AuthorType, uuidToString(comment.AuthorID), originatorUserID, nil)
+	routed, provenInvalid, err := h.routeCompletionFallbackCoordinator(ctx, issue, *task, comment, parentComment)
+	if err != nil {
+		return false, false, err
+	}
+	if provenInvalid {
+		return false, true, nil
+	}
+	return routed, false, nil
 }
 
 func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.AgentTaskQueue) {
@@ -4534,6 +4564,30 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 			continue
 		}
 		if isNoteComment(c.Content) {
+			continue
+		}
+		// A synthesized completion fallback is the durable worker-to-coordinator
+		// handoff (GH #8719), not a fresh generic invocation. Replay it through
+		// the narrow fallback resolver — never generic mention fan-out — and
+		// exclude this just-completed worker from the coverage check because
+		// the fallback was synthesized at its completion, not delivered to it.
+		// Completion-callback replays (transitioned == false) never reach
+		// here: CompleteTask returns before routing, so replays cannot
+		// duplicate the fallback comment or the coordinator task.
+		if c.AuthorType == "agent" && c.SourceTaskID.Valid &&
+			uuidToString(c.SourceTaskID) == uuidToString(task.ID) &&
+			c.ID.Valid && c.CreatedAt.Valid && task.CompletedAt.Valid &&
+			!c.CreatedAt.Time.Before(task.CompletedAt.Time.Add(-time.Minute)) {
+			if _, _, err := h.dispatchCompletionFallback(ctx, task, c.ID); err != nil {
+				slog.Warn("reconcile comments on completion: completion fallback replay failed, fallback comment remains the durable obligation",
+					"issue_id", uuidToString(task.IssueID),
+					"task_id", uuidToString(task.ID),
+					"comment_id", uuidToString(c.ID),
+					"error", err,
+				)
+			} else {
+				scheduled++
+			}
 			continue
 		}
 		// A delegated failure recovery signal is platform-authored and targets

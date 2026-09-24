@@ -114,7 +114,7 @@ func TestCompletionFallbackWakesGuestSquadLeader(t *testing.T) {
 		"runtime_id": testRuntimeID, "issue_id": issueID, "status": "running",
 		"trigger_comment_id": delegationID, "squad_id": guestSquadID,
 		"delegated_from_task_id": guestLeaderTaskID,
-		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"originator_user_id":     testUserID, "accountable_user_id": testUserID,
 		"delivered_comment_ids": testutil.Raw("ARRAY['" + delegationID + "'::uuid]"),
 	})
 	completeWorkerReplyRun(t, workerTaskID)
@@ -168,6 +168,302 @@ func TestCompletionFallbackUnresolvedParentDoesNotRoute(t *testing.T) {
 	}
 	if n := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status = 'queued'", issueID); n != 0 {
 		t.Fatalf("unroutable fallback enqueued %d task(s), want 0", n)
+	}
+}
+
+// TestCompletionFallbackMentionDoesNotFanOut pins §10 Test A (GH #8719): a
+// fallback body naming an unrelated agent must wake only the source
+// coordinator, never the named target.
+func TestCompletionFallbackMentionDoesNotFanOut(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback fanout leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback fanout leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback fanout worker runtime")
+	workerID := dbfx.Agent(t, "Fallback fanout worker", workerRuntimeID)
+	otherID := dbfx.Agent(t, "Fallback fanout other", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback fanout squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Fallback mention must not fan out", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) verify the implementation", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, workerTaskID)
+	var fallbackID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("completion fallback comment was not synthesized")
+	}
+	// Rewrite the synthesized body to carry an unrelated @agent mention, then
+	// re-run the narrow handoff resolver: only the source coordinator may wake.
+	dbfx.Exec(t, `UPDATE comment SET content = $2 WHERE id = $1`, fallbackID,
+		fmt.Sprintf("Done. [@Other](mention://agent/%s) please review as well", otherID))
+	stored, err := testHandler.Queries.GetAgentTask(context.Background(), parseUUID(workerTaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := testHandler.Queries.GetComment(context.Background(), parseUUID(fallbackID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drain the coordinator task already enqueued by the completion call so
+	// this dispatch proves exactly-once behavior, not a second wake.
+	dbfx.Exec(t, `DELETE FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`, issueID, leaderID)
+	issue, err := testHandler.Queries.GetIssue(context.Background(), parseUUID(issueID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parent *db.Comment
+	if fallback.ParentID.Valid {
+		p, err := testHandler.Queries.GetComment(context.Background(), fallback.ParentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent = &p
+	}
+	routed, provenInvalid, err := testHandler.routeCompletionFallbackCoordinator(context.Background(), issue, stored, fallback, parent)
+	if err != nil || provenInvalid || !routed {
+		t.Fatalf("mention-carrying fallback must still route to its coordinator: routed=%v invalid=%v err=%v", routed, provenInvalid, err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, otherID); got != 0 {
+		t.Fatalf("fallback mention fanned out to unrelated agent: got %d task(s), want 0", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND is_leader_task = TRUE", issueID, leaderID); got != 1 {
+		t.Fatalf("coordinator received %d task(s), want 1", got)
+	}
+}
+
+// TestCompletionFallbackTerminalOriginatorNotReused pins §10 Test B (GH
+// #8719): the terminal worker task's persisted human originator must not
+// authorize a generic invocation of an unrelated invocable agent named in the
+// fallback body.
+func TestCompletionFallbackTerminalOriginatorNotReused(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback originator leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback originator leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback originator worker runtime")
+	workerID := dbfx.Agent(t, "Fallback originator worker", workerRuntimeID)
+	invocableID := dbfx.Agent(t, "Fallback originator invocable", workerRuntimeID, testutil.Cols{
+		"visibility": "workspace", "permission_mode": "public_to",
+	})
+	dbfx.Exec(t, `INSERT INTO agent_invocation_target (agent_id, target_type, target_id) VALUES ($1, 'workspace', $2) ON CONFLICT DO NOTHING`, invocableID, testWorkspaceID)
+	squadID := dbfx.Squad(t, "Fallback originator squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Terminal originator must not re-authorize", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) verify the implementation", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, workerTaskID)
+	var fallbackID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("completion fallback comment was not synthesized")
+	}
+	dbfx.Exec(t, `UPDATE comment SET content = $2 WHERE id = $1`, fallbackID,
+		fmt.Sprintf("Done. [@B](mention://agent/%s) please take over", invocableID))
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'", issueID, invocableID); got != 0 {
+		t.Fatalf("terminal originator re-authorized unrelated agent B: got %d task(s), want 0", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND is_leader_task = TRUE", issueID, leaderID); got != 1 {
+		t.Fatalf("coordinator received %d task(s), want 1", got)
+	}
+}
+
+// TestCompletionFallbackInvalidParentStaysFailClosed pins §10 Test D (GH
+// #8719): an unresolvable lineage must wake nobody — guest, assigned, or
+// worker — and the resolver must report it permanently invalid, not transient.
+func TestCompletionFallbackInvalidParentStaysFailClosed(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	foreignWS := dbfx.Workspace(t, "Fallback failclosed foreign workspace", "fb-8719-failclosed")
+	foreignIssue := dbfx.Issue(t, "Fallback failclosed foreign issue", testutil.Cols{"workspace_id": foreignWS})
+	foreignComment := dbfx.Comment(t, foreignIssue, "foreign delegation", testutil.Cols{"workspace_id": foreignWS})
+	workerID := dbfx.Agent(t, "Fallback failclosed worker", testRuntimeID)
+	assignedLeaderID := dbfx.Agent(t, "Fallback failclosed assigned leader", testRuntimeID)
+	assignedSquadID := dbfx.Squad(t, "Fallback failclosed assigned squad", assignedLeaderID)
+	issueID := dbfx.Issue(t, "Invalid lineage stays fail-closed", testutil.Cols{
+		"assignee_type": "squad", "assignee_id": assignedSquadID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": testRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": foreignComment,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + foreignComment + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, workerTaskID)
+	var fallbackID string
+	dbfx.QueryRow(t, "SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2", workerTaskID, workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("completion fallback comment was not synthesized")
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status = 'queued'", issueID); got != 0 {
+		t.Fatalf("invalid lineage enqueued %d task(s), want 0", got)
+	}
+	stored, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(workerTaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := testHandler.Queries.GetComment(ctx, parseUUID(fallbackID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue, err := testHandler.Queries.GetIssue(ctx, parseUUID(issueID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, provenInvalid, err := testHandler.resolveCompletionFallbackCoordinator(ctx, issue, stored, fallback, nil)
+	if err != nil || !provenInvalid {
+		t.Fatalf("invalid parent must be proven-invalid: invalid=%v err=%v", provenInvalid, err)
+	}
+	routed, _, err := testHandler.dispatchCompletionFallback(ctx, &stored, parseUUID(fallbackID))
+	if err != nil || routed {
+		t.Fatalf("fail-closed replay must not route: routed=%v err=%v", routed, err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status = 'queued'", issueID); got != 0 {
+		t.Fatalf("fail-closed replay enqueued %d task(s), want 0", got)
+	}
+}
+
+// TestCompletionFallbackReplayIsIdempotent pins §10 Test E (GH #8719):
+// dispatching the same fallback obligation twice must leave exactly one
+// runnable coordinator task, and a completion-callback replay must duplicate
+// neither the fallback comment nor the coordinator task.
+func TestCompletionFallbackReplayIsIdempotent(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback idempotent leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback idempotent leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback idempotent worker runtime")
+	workerID := dbfx.Agent(t, "Fallback idempotent worker", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback idempotent squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Fallback replay stays idempotent", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) verify the implementation", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	completeWorkerReplyRun(t, workerTaskID)
+	var fallbackID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("completion fallback comment was not synthesized")
+	}
+	stored, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(workerTaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, err := testHandler.dispatchCompletionFallback(ctx, &stored, parseUUID(fallbackID)); err != nil {
+			t.Fatalf("replay %d failed: %v", i, err)
+		}
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("coordinator has %d runnable task(s), want 1", got)
+	}
+	completeWorkerReplyRun(t, workerTaskID)
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID); got != 1 {
+		t.Fatalf("callback replay duplicated fallback comment: got %d, want 1", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
+		t.Fatalf("callback replay duplicated coordinator task: got %d, want 1", got)
+	}
+}
+
+// TestCompletionFallbackExplicitReplyUnchanged pins §10 Test F (GH #8719): the
+// explicit worker reply path keeps its normal routing and still wakes the
+// leader exactly once.
+func TestCompletionFallbackExplicitReplyUnchanged(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	leaderRuntimeID := dbfx.Runtime(t, "Fallback explicit leader runtime")
+	leaderID := dbfx.Agent(t, "Fallback explicit leader", leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	workerRuntimeID := dbfx.Runtime(t, "Fallback explicit worker runtime")
+	workerID := dbfx.Agent(t, "Fallback explicit worker", workerRuntimeID)
+	squadID := dbfx.Squad(t, "Fallback explicit squad", leaderID)
+	dbfx.SquadMember(t, squadID, "agent", workerID)
+	issueID := dbfx.Issue(t, "Explicit worker reply unchanged", testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": squadID,
+	})
+	sourceID := dbfx.Task(t, leaderID, testutil.Cols{
+		"runtime_id": leaderRuntimeID, "issue_id": issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	rootID := dbfx.Comment(t, issueID, fmt.Sprintf("[@Worker](mention://agent/%s) verify the implementation", workerID), testutil.Cols{
+		"author_type": "agent", "author_id": leaderID, "source_task_id": sourceID,
+	})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": workerRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": squadID, "delegated_from_task_id": sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	req := withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{
+		"content": "Verification complete: all checks pass", "parent_id": rootID,
+	}), "id", issueID)
+	req.Header.Set("X-Agent-ID", workerID)
+	req.Header.Set("X-Task-ID", workerTaskID)
+	var response CommentResponse
+	testutil.Call(t, testHandler.CreateComment, req).Want(http.StatusCreated).JSON(&response)
+	completeWorkerReplyRun(t, workerTaskID)
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, workerID); got != 1 {
+		t.Fatalf("explicit reply plus completion left %d worker comment(s), want 1 (no synthesized fallback)", got)
+	}
+	next := claimWorkerReplyRun(t, leaderRuntimeID)
+	if next == nil {
+		t.Fatal("explicit worker reply did not wake the squad leader")
+	}
+	if !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, response.ID) {
+		t.Fatal("follow-up must deliver the explicit reply in the squad leader role")
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running')", issueID, leaderID); got != 0 {
+		t.Fatalf("leader woke %d extra time(s), want exactly one wake", got)
 	}
 }
 

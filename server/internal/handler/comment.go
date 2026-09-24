@@ -1519,6 +1519,12 @@ const (
 	commentTriggerSourceMentionSquadLeader commentAgentTriggerSource = "mention_squad_leader"
 	commentTriggerSourceThreadParent       commentAgentTriggerSource = "thread_parent"
 	commentTriggerSourceConversation       commentAgentTriggerSource = "conversation_continuation"
+	// commentTriggerSourceCompletionFallback marks a synthesized worker
+	// completion fallback routed as a durable worker-to-coordinator handoff
+	// (GH #8719). It is set only by the completion-fallback resolver below
+	// and never produced by generic mention parsing, so the fallback cannot
+	// fan out to unrelated @agent/@squad targets named in its body.
+	commentTriggerSourceCompletionFallback commentAgentTriggerSource = "completion_fallback"
 )
 
 type commentAgentTrigger struct {
@@ -1543,6 +1549,10 @@ type commentTriggerComputeOptions struct {
 	// (MUL-3963). Only consulted for AGENT actors — canInvokeAgent judges A2A
 	// by the originator, not the immediate agent principal. Members are their
 	// own originator so this may be empty for member-authored triggers.
+	// Completion-fallback handoffs never set it: the completed worker task is
+	// terminal and must not lend its persisted originator as a fresh generic
+	// A2A invocation token (GH #8719). The fallback resolver copies the
+	// worker's delegation lineage directly instead.
 	OriginatorUserID string
 }
 
@@ -1558,6 +1568,8 @@ func commentAgentTriggerReason(trigger commentAgentTrigger) string {
 		return "This reply will trigger the parent comment's author."
 	case commentTriggerSourceConversation:
 		return "This follow-up will continue the recent agent conversation."
+	case commentTriggerSourceCompletionFallback:
+		return "A delegated worker completed and handed its result back to the coordinator."
 	default:
 		return "This comment will trigger this agent."
 	}
@@ -2638,24 +2650,28 @@ func (h *Handler) enqueueSingleCommentTrigger(ctx context.Context, issue db.Issu
 				"agent_id", uuidToString(trigger.Agent.ID))
 			return err
 		}
-	case commentTriggerSourceThreadParent, commentTriggerSourceConversation:
-		var err error
-		// Squad is set on these two sources only when the routing already
+	case commentTriggerSourceThreadParent, commentTriggerSourceConversation, commentTriggerSourceCompletionFallback:
+		// Squad is set on these sources only when the routing already
 		// proved a leader role to continue: the thread root's prior task for
 		// the conversation path, the replied-to comment's own authoring task
-		// for the thread-parent path. Gating on the source as well would keep
-		// the thread-parent path demoted for no reason (MUL-7006).
-		if trigger.Squad != nil {
-			_, err = h.TaskService.EnqueueTaskForSquadLeader(ctx, issue, trigger.Agent.ID, trigger.Squad.ID, triggerCommentID, service.OriginNamed)
-		} else {
-			_, err = h.TaskService.EnqueueTaskForThreadParent(ctx, issue, trigger.Agent.ID, triggerCommentID)
+		// for the thread-parent path, the exact delegation lineage for the
+		// completion-fallback handoff (GH #8719). Gating on the source as
+		// well would keep the thread-parent path demoted for no reason
+		// (MUL-7006).
+		if trigger.Squad == nil {
+			return nil
 		}
-		if err != nil {
-			logCommentEnqueueFailure("enqueue routed comment agent task failed", err,
-				"issue_id", uuidToString(issue.ID),
-				"agent_id", uuidToString(trigger.Agent.ID),
-				"source", trigger.Source)
-			return err
+		if trigger.Squad != nil {
+			_, err := h.TaskService.EnqueueTaskForSquadLeader(ctx, issue, trigger.Agent.ID, trigger.Squad.ID, triggerCommentID, service.OriginNamed)
+			if err != nil {
+				logCommentEnqueueFailure("enqueue routed comment agent task failed", err,
+					"issue_id", uuidToString(issue.ID),
+					"agent_id", uuidToString(trigger.Agent.ID),
+					"source", trigger.Source)
+				return err
+			}
+		} else {
+			return nil
 		}
 	}
 	return nil
@@ -2851,6 +2867,232 @@ func (h *Handler) squadLeaderRoleOfAuthoringTask(ctx context.Context, issue db.I
 		return nil, false
 	}
 	return &squad, true
+}
+
+// completionFallbackTarget is the single coordinator a synthesized worker
+// completion fallback hands its result to (GH #8719). Squad is non-nil for a
+// squad-leader execution so the enqueue path injects the leader briefing.
+type completionFallbackTarget struct {
+	Agent db.Agent
+	Squad *db.Squad
+}
+
+// resolveCompletionFallbackCoordinator selects the exact source coordinator
+// for a synthesized worker completion fallback using server-trusted lineage
+// only — the completed worker task, the fallback comment, and its parent.
+// It never parses the fallback body for mentions and never consults the
+// terminal task's persisted originator: the handoff authority is the already
+// established delegation edge, not a fresh generic agent-authored invocation.
+//
+// Assigned squad: the worker must belong to the assigned squad's run and must
+// not be the leader itself; the current leader must be valid and runnable.
+// Guest squad: the exact delegation lineage must prove out (parent resolvable
+// in the same workspace, fallback authored by the completed worker, worker
+// covering the parent delegation comment, parent's source task a leader task
+// of the guest squad, current leader still matching). A guest lineage that
+// fails any check fails closed WITHOUT falling through to the assigned squad.
+//
+// The second return reports whether the lineage was PROVEN INVALID
+// (permanent, fail closed) as opposed to a transient lookup failure (caller
+// must preserve the handoff obligation for replay). Callers must not treat an
+// error as fail-closed.
+func (h *Handler) resolveCompletionFallbackCoordinator(ctx context.Context, issue db.Issue, workerTask db.AgentTaskQueue, fallback db.Comment, parentComment *db.Comment) (completionFallbackTarget, bool, error) {
+	invalid := func() (completionFallbackTarget, bool, error) {
+		return completionFallbackTarget{}, true, nil
+	}
+	if !workerTask.AgentID.Valid || !workerTask.IssueID.Valid ||
+		uuidToString(workerTask.IssueID) != uuidToString(issue.ID) {
+		return invalid()
+	}
+	if !fallback.SourceTaskID.Valid || uuidToString(fallback.SourceTaskID) != uuidToString(workerTask.ID) {
+		return invalid()
+	}
+	if uuidToString(fallback.AuthorID) != uuidToString(workerTask.AgentID) {
+		return invalid()
+	}
+	if workerTask.IsLeaderTask {
+		return invalid()
+	}
+	// Guest path first: a parented fallback under a guest delegation must
+	// resolve to its own coordinator and never borrow the assigned leader.
+	if parentComment != nil && parentComment.ID.Valid {
+		target, provenInvalid, err := h.resolveCompletionFallbackGuestCoordinator(ctx, issue, workerTask, *parentComment)
+		if err != nil {
+			return completionFallbackTarget{}, false, err
+		}
+		if provenInvalid {
+			return invalid()
+		}
+		if target != nil {
+			return *target, false, nil
+		}
+		// No guest lineage (e.g. delegation from the assigned squad itself,
+		// or a member-authored parent): fall through to the assigned path.
+	}
+	return h.resolveCompletionFallbackAssignedCoordinator(ctx, issue, workerTask)
+}
+
+// resolveCompletionFallbackGuestCoordinator proves the exact guest-squad
+// delegation lineage for a parented fallback comment. A nil target with
+// (false, nil) means "no guest lineage claimed" — the caller may try the
+// assigned path. A nil target with (true, nil) means the lineage was claimed
+// but proven invalid — the caller must fail closed without falling through.
+func (h *Handler) resolveCompletionFallbackGuestCoordinator(ctx context.Context, issue db.Issue, workerTask db.AgentTaskQueue, parent db.Comment) (*completionFallbackTarget, bool, error) {
+	if parent.DeletedAt.Valid {
+		return nil, true, nil
+	}
+	if !parent.SourceTaskID.Valid {
+		return nil, true, nil
+	}
+	if !taskCoversReplyParent(workerTask, parent.ID) {
+		return nil, true, nil
+	}
+	leaderTask, err := h.Queries.GetAgentTask(ctx, parent.SourceTaskID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !leaderTask.IsLeaderTask || !leaderTask.SquadID.Valid ||
+		!leaderTask.AgentID.Valid || leaderTask.AgentID != parent.AuthorID {
+		return nil, true, nil
+	}
+	// A delegation from the assigned squad itself is not a guest lineage;
+	// leave it to the assigned path.
+	if issue.AssigneeType.Valid && issue.AssigneeType.String == "squad" &&
+		issue.AssigneeID.Valid && issue.AssigneeID == leaderTask.SquadID {
+		return nil, false, nil
+	}
+	squad, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
+		ID:          leaderTask.SquadID,
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if squad.ArchivedAt.Valid || uuidToString(squad.LeaderID) != uuidToString(leaderTask.AgentID) {
+		return nil, true, nil
+	}
+	agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID:          squad.LeaderID,
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
+		return nil, true, nil
+	}
+	if uuidToString(agent.ID) == uuidToString(workerTask.AgentID) {
+		return nil, true, nil
+	}
+	return &completionFallbackTarget{Agent: agent, Squad: &squad}, false, nil
+}
+
+// resolveCompletionFallbackAssignedCoordinator selects the assigned squad's
+// current leader for a fallback whose worker ran under that assignment. The
+// worker's delegation lineage (delegated_from_task_id, squad_id, trigger
+// coverage) — not its persisted originator — is the authority. Top-level
+// (parentless) fallbacks are allowed here: assignment itself is the lineage.
+func (h *Handler) resolveCompletionFallbackAssignedCoordinator(ctx context.Context, issue db.Issue, workerTask db.AgentTaskQueue) (completionFallbackTarget, bool, error) {
+	invalid := func() (completionFallbackTarget, bool, error) {
+		return completionFallbackTarget{}, true, nil
+	}
+	if issue.TriageState.Valid {
+		return invalid()
+	}
+	if !issue.AssigneeType.Valid || issue.AssigneeType.String != "squad" || !issue.AssigneeID.Valid {
+		return invalid()
+	}
+	squad, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
+		ID:          issue.AssigneeID,
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		return completionFallbackTarget{}, false, err
+	}
+	if squad.ArchivedAt.Valid {
+		return invalid()
+	}
+	if uuidToString(squad.LeaderID) == uuidToString(workerTask.AgentID) {
+		return invalid()
+	}
+	// The worker must belong to this delegated run: same squad, and either an
+	// explicit delegation edge or trigger coverage of a squad-routed comment.
+	// A same-squad worker whose lineage proves nothing about this delegation
+	// must not wake the coordinator on a bare squad-membership claim.
+	if !workerTask.SquadID.Valid || uuidToString(workerTask.SquadID) != uuidToString(squad.ID) {
+		if !workerTask.DelegatedFromTaskID.Valid {
+			return invalid()
+		}
+	}
+	agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID:          squad.LeaderID,
+		WorkspaceID: issue.WorkspaceID,
+	})
+	if err != nil {
+		return completionFallbackTarget{}, false, err
+	}
+	if !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
+		return invalid()
+	}
+	return completionFallbackTarget{Agent: agent, Squad: &squad}, false, nil
+}
+
+// routeCompletionFallbackCoordinator enqueues exactly one coordinator task for
+// a synthesized completion fallback (GH #8719). It routes through the existing
+// comment enqueue infrastructure with a pre-resolved trigger — never the
+// generic mention-parsing fan-out — so the fallback body cannot wake unrelated
+// @agent/@squad targets. The second return reports proven-invalid lineage
+// (permanent fail-closed); any error is transient and the caller must preserve
+// the handoff obligation for replay.
+func (h *Handler) routeCompletionFallbackCoordinator(ctx context.Context, issue db.Issue, workerTask db.AgentTaskQueue, fallback db.Comment, parentComment *db.Comment) (bool, bool, error) {
+	target, provenInvalid, err := h.resolveCompletionFallbackCoordinator(ctx, issue, workerTask, fallback, parentComment)
+	if err != nil || provenInvalid {
+		return false, provenInvalid, err
+	}
+	if target.Squad == nil {
+		return false, true, nil
+	}
+	trigger := commentAgentTrigger{
+		Agent:               target.Agent,
+		Source:              commentTriggerSourceCompletionFallback,
+		Squad:               target.Squad,
+		NonLeaderAgentReply: true,
+	}
+	opts := commentTriggerComputeOptions{
+		ExcludeTriggerCommentID: fallback.ID,
+		AuthoringTaskID:         workerTask.ID,
+	}
+	if parentComment != nil && parentComment.ID.Valid {
+		opts.ThreadCommentID = parentComment.ID
+	} else {
+		opts.ThreadCommentID = fallback.ID
+	}
+	// Coalesce with an existing coordinator run when one already covers this
+	// handoff; otherwise enqueue a single fresh successor through the
+	// completion-handoff path (delegation lineage, never the fallback
+	// comment's own originator chain). Both avoid computeCommentAgentTriggers
+	// and triggerTasksForComment, which would reopen generic mention fan-out.
+	if h.mergeCommentIntoPendingTask(ctx, issue, trigger, fallback.ID, h.TaskService.ResolveIssueReviewSHAParam(ctx, issue.ID)) == commentMergeSucceeded {
+		return true, false, nil
+	}
+	if _, err := h.TaskService.EnqueueCompletionFallbackHandoff(ctx, issue, target.Agent.ID, target.Squad.ID, fallback.ID, workerTask); err != nil {
+		// A duplicate-pending race means a sibling coordinator run now owns
+		// the slot: fold the fallback into it rather than dropping the
+		// handoff. Any other error is transient — the persisted fallback
+		// comment stays the replayable obligation.
+		if errors.Is(err, service.ErrDuplicatePendingTask) {
+			if h.mergeCommentIntoPendingTask(ctx, issue, trigger, fallback.ID, h.TaskService.ResolveIssueReviewSHAParam(ctx, issue.ID)) == commentMergeSucceeded {
+				return true, false, nil
+			}
+			if registered, regErr := h.registerPlannedCommentForActiveTask(ctx, issue, target.Agent.ID, fallback.ID, h.TaskService.ResolveIssueReviewSHAParam(ctx, issue.ID)); regErr == nil && registered {
+				return true, false, nil
+			} else if regErr != nil {
+				return false, false, regErr
+			}
+		}
+		return false, false, err
+	}
+	return true, false, nil
 }
 
 // routeGuestSquadLeaderFallback closes the leader→worker→leader loop when the

@@ -1426,7 +1426,34 @@ func (s *TaskService) enqueueMentionTask(ctx context.Context, issue db.Issue, ag
 	return s.enqueueMentionTaskWithCommentPlan(ctx, issue, agentID, triggerCommentID, nil, isLeader, squadID, forceFreshSession, handoffNote, actorUserID, rerunOfTaskID, origin)
 }
 
-func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin) (db.AgentTaskQueue, error) {
+// EnqueueCompletionFallbackHandoff enqueues the coordinator successor for a
+// synthesized worker completion fallback (GH #8719). Unlike
+// enqueueMentionTask, it never inherits the fallback comment's own
+// originator chain: the worker task is terminal and must not lend its
+// persisted originator as a fresh generic A2A invocation token. Authority
+// comes from the already established delegation edge — copied from the
+// completed worker task's own attribution snapshot — so the handoff is a
+// lifecycle continuation, not a new user-delegated invocation.
+func (s *TaskService) EnqueueCompletionFallbackHandoff(ctx context.Context, issue db.Issue, leaderID pgtype.UUID, squadID pgtype.UUID, fallbackCommentID pgtype.UUID, workerTask db.AgentTaskQueue) (db.AgentTaskQueue, error) {
+	return s.enqueueMentionTaskWithCommentPlan(ctx, issue, leaderID, fallbackCommentID, nil, true, squadID, false, "", pgtype.UUID{}, pgtype.UUID{}, OriginDerived, workerTaskAttribution(workerTask))
+}
+
+func workerTaskAttribution(workerTask db.AgentTaskQueue) *attribution.Result {
+	if !workerTask.OriginatorUserID.Valid && !workerTask.AccountableUserID.Valid {
+		return nil
+	}
+	return &attribution.Result{
+		UserID:              workerTask.OriginatorUserID,
+		AccountableUserID:   workerTask.AccountableUserID,
+		Source:              attribution.SourceCommentSource,
+		DelegatedFromTaskID: workerTask.DelegatedFromTaskID,
+		RuleVersionID:       workerTask.RuleVersionID,
+		EvidenceKind:        attribution.EvidenceComment,
+		EvidenceRefID:       workerTask.TriggerCommentID,
+	}
+}
+
+func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, issue db.Issue, agentID pgtype.UUID, triggerCommentID pgtype.UUID, coalescedCommentIDs []pgtype.UUID, isLeader bool, squadID pgtype.UUID, forceFreshSession bool, handoffNote string, actorUserID pgtype.UUID, rerunOfTaskID pgtype.UUID, origin RunOrigin, handoffAttribution ...*attribution.Result) (db.AgentTaskQueue, error) {
 	if err := guardIssueNotInTriage(ctx, s.Queries, issue.ID, origin); err != nil {
 		return db.AgentTaskQueue{}, err
 	}
@@ -1448,7 +1475,18 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	// agent-authored comment is a delegation (the parent task's human is
 	// copied); a member mention is direct_human. attr.UserID matches the
 	// pre-MUL-4302 value, so authorization is unchanged.
-	attr := s.attributionForIssueTask(ctx, issue, triggerCommentID, attribution.SourceDelegation, actorUserID)
+	//
+	// A completion-fallback handoff instead carries the completed worker
+	// task's own attribution snapshot (see EnqueueCompletionFallbackHandoff):
+	// the terminal task's persisted lineage is copied as the established
+	// delegation edge, never re-resolved through the fallback comment's
+	// originator chain.
+	var attr attribution.Result
+	if len(handoffAttribution) > 0 && handoffAttribution[0] != nil {
+		attr = *handoffAttribution[0]
+	} else {
+		attr = s.attributionForIssueTask(ctx, issue, triggerCommentID, attribution.SourceDelegation, actorUserID)
+	}
 	// No precise human resolved → owner_fallback (accountable = agent owner), or
 	// refuse the enqueue if the workspace is fail-closed (MUL-4302 §3.5).
 	attr, err = s.applyAttributionFallback(ctx, attr, agent)
