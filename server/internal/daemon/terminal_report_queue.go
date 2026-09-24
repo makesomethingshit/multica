@@ -71,11 +71,10 @@ type persistedTerminalTaskReport struct {
 	SessionRolloutMissing bool      `json:"session_rollout_missing,omitempty"`
 	RetiredSessionID      string    `json:"retired_session_id,omitempty"`
 	// ClaimDispatchedAt is the claim generation this result belongs to: the
-	// server-issued dispatched_at of the claim that produced it. Absent means
-	// unknown ownership — a record written before the daemon learned to fence
-	// terminal reports — and such a record is never replayed, because sending it
-	// now could settle a task a later claim owns (see
-	// replayPendingTerminalReports).
+	// server-issued dispatched_at of the claim that produced it. Absent means a
+	// pre-fence version 1 report, which keeps the legacy unfenced replay path.
+	// Version 2 records must carry a generation and are never replayed without it
+	// (see replayPendingTerminalReports).
 	ClaimDispatchedAt *time.Time `json:"claim_dispatched_at,omitempty"`
 
 	PermanentRejectionCount   int        `json:"permanent_rejection_count,omitempty"`

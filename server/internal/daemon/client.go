@@ -58,11 +58,14 @@ func isTaskNotFoundError(err error) bool {
 	if reqErr.StatusCode != http.StatusNotFound {
 		return false
 	}
-	// Prefer the stable code a current server sends. The sentence stays as the
-	// fallback for servers that predate the code, which every installed daemon
-	// already matched on.
+	// A code-less 404 on the versioned route may come from an older replica that
+	// does not have that route. Only the stable code proves task absence there;
+	// keep the text fallback for legacy endpoints.
 	if hasErrorCode(reqErr.Body, protocol.DaemonTaskNotFoundCode) {
 		return true
+	}
+	if strings.Contains(reqErr.Path, "/api/daemon/v2/") {
+		return false
 	}
 	return strings.Contains(strings.ToLower(reqErr.Body), "task not found")
 }

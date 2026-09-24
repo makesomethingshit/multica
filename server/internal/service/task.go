@@ -4943,6 +4943,8 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
+		} else if expectedDispatchedAt.Valid && !sameClaimGeneration(parent.DispatchedAt, expectedDispatchedAt) {
+			return nil, false, fmt.Errorf("%w: task %s", ErrTaskClaimGenerationMismatch, util.UUIDToString(taskID))
 		} else if retryEligible(failureReason, parent) {
 			wantRetry = true
 			// Persist the reason-aware effective budget into the child so the

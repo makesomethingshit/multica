@@ -1298,12 +1298,22 @@ func TestIsTaskNotFoundError(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "404 with mixed-case body still matches",
+			name: "legacy 404 with mixed-case body still matches",
 			err: &requestError{
+				Path:       "/api/daemon/tasks/abc/complete",
 				StatusCode: http.StatusNotFound,
 				Body:       `{"error":"Task Not Found"}`,
 			},
 			want: true,
+		},
+		{
+			name: "v2 code-less JSON 404 is not task-not-found",
+			err: &requestError{
+				Path:       "/api/daemon/v2/tasks/abc/complete",
+				StatusCode: http.StatusNotFound,
+				Body:       `{"error":"task not found"}`,
+			},
+			want: false,
 		},
 		{
 			name: "500 with same body is not task-not-found",

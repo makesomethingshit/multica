@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
@@ -128,6 +130,86 @@ func TestTerminalReportReplaySurvivesMixedReplicaDeployment(t *testing.T) {
 	}
 	if got := fencedCalls.Load(); got != 2 {
 		t.Fatalf("fenced requests = %d, want one per attempt", got)
+	}
+}
+
+func TestCodeLessJSON404StaysPendingUntilFencedReplicaIsAvailable(t *testing.T) {
+	var fencedCalls, legacyCalls atomic.Int32
+	var oldReplica atomic.Bool
+	oldReplica.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !strings.Contains(req.URL.Path, "/api/daemon/v2/") {
+			legacyCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		fencedCalls.Add(1)
+		if oldReplica.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"task not found"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := New(Config{
+		ServerBaseURL:  srv.URL,
+		WorkspacesRoot: t.TempDir(),
+		DaemonID:       "daemon-codeless-v2-404",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	base := time.Now().UTC()
+	now := base
+	d.terminalReportNow = func() time.Time { return now }
+	report := generationReport("task-codeless-v2-404", testClaimGeneration(), "fenced answer")
+	if err := d.terminalReports.enqueue(report); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	for _, elapsed := range []time.Duration{0, 6 * time.Minute, 12 * time.Minute} {
+		now = base.Add(elapsed)
+		pending, delivered := d.replayPendingTerminalReports(context.Background())
+		if pending != 1 || delivered != 0 {
+			t.Fatalf("old replica replay at %v = pending:%d delivered:%d, want 1/0", elapsed, pending, delivered)
+		}
+	}
+	stats, err := d.terminalReports.stats()
+	if err != nil {
+		t.Fatalf("queue stats: %v", err)
+	}
+	if stats.PendingCount != 1 || stats.FailedCount != 0 {
+		t.Fatalf("queue stats after code-less 404s = %+v, want one pending and none failed", stats)
+	}
+	items, err := d.terminalReports.list()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("pending reports = %d (%v), want one", len(items), err)
+	}
+	body, err := os.ReadFile(filepath.Join(d.terminalReports.dir, items[0].fileName))
+	if err != nil {
+		t.Fatalf("read pending report: %v", err)
+	}
+	record, err := decodePersistedTerminalReport(body)
+	if err != nil {
+		t.Fatalf("decode pending report: %v", err)
+	}
+	if record.PermanentRejectionCount != 0 || record.QuarantinedAt != nil {
+		t.Fatalf("code-less 404 rejection metadata = %+v, want no rejection or quarantine", record)
+	}
+	if got := fencedCalls.Load(); got != 3 {
+		t.Fatalf("fenced requests to old replica = %d, want 3", got)
+	}
+	if got := legacyCalls.Load(); got != 0 {
+		t.Fatalf("legacy requests while v2 route is unsupported = %d, want 0", got)
+	}
+
+	oldReplica.Store(false)
+	now = base.Add(13 * time.Minute)
+	if pending, delivered := d.replayPendingTerminalReports(context.Background()); pending != 0 || delivered != 1 {
+		t.Fatalf("supported replica replay = pending:%d delivered:%d, want 0/1", pending, delivered)
+	}
+	if got := legacyCalls.Load(); got != 0 {
+		t.Fatalf("legacy fallback after v2 success = %d, want 0", got)
 	}
 }
 
