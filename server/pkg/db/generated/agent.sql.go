@@ -5939,9 +5939,10 @@ WHERE worker.status = 'completed'
   AND NULLIF(worker.result->>'output', '') IS NOT NULL
   AND NOT EXISTS (
       SELECT 1 FROM comment AS reply
-      WHERE reply.source_task_id = worker.id
+      WHERE reply.issue_id = worker.issue_id
         AND reply.author_type = 'agent'
         AND reply.author_id = worker.agent_id
+        AND reply.created_at >= COALESCE(worker.started_at, worker.created_at)
         AND reply.deleted_at IS NULL
   )
 ORDER BY worker.completed_at DESC NULLS LAST, worker.id DESC

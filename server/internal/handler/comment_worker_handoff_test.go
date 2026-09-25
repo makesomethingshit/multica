@@ -742,6 +742,18 @@ func TestCompletionFallbackSuppressedReplyNotReclassified(t *testing.T) {
 			t.Fatal("suppressed reply listed as pending completion fallback")
 		}
 	}
+	// Legacy replies may lack source_task_id; the owed-run scan must still
+	// honor the same issue/agent/start-time check as completion synthesis.
+	dbfx.Exec(t, `UPDATE comment SET source_task_id = NULL WHERE id = $1`, replyID)
+	owed, err := testHandler.Queries.ListCompletionFallbackOwedRuns(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range owed {
+		if uuidToString(id) == workerTaskID {
+			t.Fatal("explicit reply without source task listed as owed fallback")
+		}
+	}
 	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
 		t.Fatalf("sweeper replay failed: %v", err)
 	}
