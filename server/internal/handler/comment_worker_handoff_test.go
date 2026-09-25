@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -859,14 +860,59 @@ func TestCompletionFallbackAtomicBoundary(t *testing.T) {
 // acquires GetAgentTaskForUpdate, confirms NULL, then holds the lock while
 // the sweeper blocks on the same row. Releasing the callback lets it commit;
 // the sweeper then replays the recorded winner instead of inserting again.
-// The release gate is an observed pg_stat_activity tuple-lock wait, never a
-// timer: waitSweeperRowLockWait must see the sweeper queued on the row first.
+// The release gate is an observed pg_stat_activity lock wait pinned to both
+// backend PIDs and the same run row, never a timer or an unlinked waiter
+// count: waitSweeperRowLockWait must see the sweeper PID blocked by the
+// callback PID first.
 type lockRendezvousTxStarter struct {
-	delegate *pgxpool.Pool
-	started  chan struct{}
-	release  chan struct{}
-	calls    atomic.Int32
-	timedOut atomic.Bool
+	delegate       *pgxpool.Pool
+	started        chan struct{}
+	release        chan struct{}
+	calls          atomic.Int32
+	timedOut       atomic.Bool
+	mu             sync.Mutex
+	callbackPID    int32
+	sweeperPID     int32
+	callbackTaskID pgtype.UUID
+	sweeperTaskID  pgtype.UUID
+}
+
+// recordSynthesisCaller pins one GetAgentTaskForUpdate call to its backend
+// PID and target run. The first call is the callback (it runs before the
+// sweeper starts); the second is the sweeper. PIDs come from
+// pg_backend_pid() on the caller's own transaction, so the release gate can
+// require the exact sweeper-PID-blocked-by-callback-PID edge.
+func (s *lockRendezvousTxStarter) recordSynthesisCaller(pid int32, taskID pgtype.UUID) {
+	if pid == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.callbackPID == 0 {
+		s.callbackPID = pid
+		s.callbackTaskID = taskID
+	} else if s.sweeperPID == 0 {
+		s.sweeperPID = pid
+		s.sweeperTaskID = taskID
+	}
+}
+
+func (s *lockRendezvousTxStarter) pids() (sweeperPID, callbackPID int32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sweeperPID, s.callbackPID
+}
+
+// sameRunLocked reports whether both synthesizers targeted the expected
+// worker run. Call only after the gate observed the sweeper blocked, so both
+// records are present; anything unset or mismatched fails the test.
+func (s *lockRendezvousTxStarter) sameRunLocked(workerTaskID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.callbackTaskID.Valid || !s.sweeperTaskID.Valid {
+		return false
+	}
+	return uuidToString(s.callbackTaskID) == workerTaskID && uuidToString(s.sweeperTaskID) == workerTaskID
 }
 
 func (s *lockRendezvousTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -885,6 +931,18 @@ type lockRendezvousTx struct {
 func (t *lockRendezvousTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	if !strings.Contains(sql, "GetAgentTaskForUpdate") {
 		return t.Tx.QueryRow(ctx, sql, args...)
+	}
+	// Pin this synthesis call to its backend PID and target run before it can
+	// block: pg_backend_pid() runs on the caller's own transaction, so the
+	// release gate can later demand the exact sweeper-blocked-by-callback edge
+	// instead of counting any waiter on the shared database.
+	var pid int32
+	if err := t.Tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err == nil {
+		var taskID pgtype.UUID
+		if len(args) > 0 {
+			taskID, _ = args[0].(pgtype.UUID)
+		}
+		t.starter.recordSynthesisCaller(pid, taskID)
 	}
 	if t.starter.calls.Add(1) != 1 {
 		return t.Tx.QueryRow(ctx, sql, args...)
@@ -918,22 +976,31 @@ func (r *lockHoldRow) Scan(dest ...any) error {
 	return nil
 }
 
-// waitSweeperRowLockWait blocks until pg_stat_activity shows an active backend
-// waiting on a lock while running the synthesis lock query, i.e. the sweeper
-// is genuinely queued on the run row the callback holds (empirically a
-// transactionid lock wait for SELECT ... FOR UPDATE on this server). It polls
-// observable DB state with a hard timeout and fails instead of releasing
-// early, so the callback release can never precede the actual lock wait.
-func waitSweeperRowLockWait(t *testing.T, ctx context.Context) {
+// waitSweeperRowLockWait blocks until pg_stat_activity shows the recorded
+// sweeper backend actively waiting on a lock while running the synthesis
+// lock query with the recorded callback backend in its blocker set
+// (pg_blocking_pids), i.e. our sweeper is queued on the row our callback
+// holds. It then asserts both synthesizers targeted the same worker run.
+// A stray waiter on the shared database can never satisfy the pinned PIDs,
+// and lookup errors, timeouts, and PID/task mismatches fail instead of
+// releasing early, so the callback release can never precede the proven
+// same-row lock wait.
+func waitSweeperRowLockWait(t *testing.T, ctx context.Context, starter *lockRendezvousTxStarter, workerTaskID string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		var waiting int
-		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE '%GetAgentTaskForUpdate%'`).Scan(&waiting); err != nil {
-			t.Fatalf("poll sweeper row-lock wait: %v", err)
-		}
-		if waiting > 0 {
-			return
+		sweeperPID, callbackPID := starter.pids()
+		if sweeperPID != 0 && callbackPID != 0 {
+			var waiting int
+			if err := testPool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid = $1 AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE '%GetAgentTaskForUpdate%' AND $2 = ANY (pg_blocking_pids(pid))`, sweeperPID, callbackPID).Scan(&waiting); err != nil {
+				t.Fatalf("poll sweeper row-lock wait: %v", err)
+			}
+			if waiting > 0 {
+				if !starter.sameRunLocked(workerTaskID) {
+					t.Fatal("synthesis callers did not target the same worker run")
+				}
+				return
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("sweeper never blocked on the contended run row lock")
@@ -1005,11 +1072,11 @@ func TestCompletionFallbackSingleWinner(t *testing.T) {
 		sweeperDone <- err
 	}()
 	// Release only after the sweeper is observably queued on the same row:
-	// waitSweeperRowLockWait polls pg_stat_activity for a backend waiting on
-	// the tuple lock while running the synthesis lock query. The 20ms pacing
-	// is poll granularity only; the release gate is the observed lock wait,
-	// so a timeout fails loudly instead of degenerating to a sequential run.
-	waitSweeperRowLockWait(t, ctx)
+	// waitSweeperRowLockWait demands the recorded sweeper PID blocked by the
+	// recorded callback PID plus the same target run. The 20ms pacing is poll
+	// granularity only; the release gate is the observed blocker edge, so a
+	// timeout fails loudly instead of degenerating to a sequential run.
+	waitSweeperRowLockWait(t, ctx, starter, workerTaskID)
 	close(starter.release)
 	select {
 	case err := <-sweeperDone:
