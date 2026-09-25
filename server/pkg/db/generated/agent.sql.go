@@ -6009,6 +6009,35 @@ const listPendingCompletionFallbacks = `-- name: ListPendingCompletionFallbacks 
 SELECT fallback.id AS fallback_id, worker.id AS worker_task_id
 FROM comment AS fallback
 JOIN agent_task_queue AS worker ON worker.completion_fallback_comment_id = fallback.id
+LEFT JOIN issue AS current_issue ON current_issue.id = worker.issue_id
+  AND current_issue.id = fallback.issue_id AND current_issue.workspace_id = fallback.workspace_id
+LEFT JOIN comment AS parent ON parent.id = fallback.parent_id
+  AND parent.workspace_id = current_issue.workspace_id
+LEFT JOIN agent_task_queue AS parent_task ON parent_task.id = parent.source_task_id
+LEFT JOIN squad AS parent_squad ON parent_squad.id = parent_task.squad_id
+  AND parent_squad.workspace_id = current_issue.workspace_id
+LEFT JOIN agent_task_queue AS source_task ON source_task.id = worker.delegated_from_task_id
+LEFT JOIN squad AS assigned_squad ON assigned_squad.id = current_issue.assignee_id
+  AND assigned_squad.workspace_id = current_issue.workspace_id
+LEFT JOIN agent AS parent_agent ON parent_agent.id = parent_task.agent_id
+  AND parent_agent.workspace_id = current_issue.workspace_id
+LEFT JOIN agent AS assigned_agent ON assigned_agent.id = assigned_squad.leader_id
+  AND assigned_agent.workspace_id = current_issue.workspace_id
+LEFT JOIN LATERAL (
+    SELECT head_sha FROM (
+        SELECT pr.head_sha, pr.state, pr.pr_updated_at
+        FROM github_pull_request pr
+        JOIN issue_pull_request ipr ON ipr.pull_request_id = pr.id
+        WHERE ipr.issue_id = current_issue.id AND pr.head_sha <> ''
+        UNION ALL
+        SELECT pr.head_sha, pr.state, pr.pr_updated_at
+        FROM vcs_pull_request pr
+        JOIN issue_vcs_pull_request ipr ON ipr.pull_request_id = pr.id
+        WHERE ipr.issue_id = current_issue.id AND pr.head_sha <> ''
+    ) heads
+    ORDER BY (state IN ('open', 'draft')) DESC, pr_updated_at DESC
+    LIMIT 1
+) review_head ON true
 WHERE fallback.author_type = 'agent'
   AND fallback.source_task_id IS NOT NULL
   AND fallback.deleted_at IS NULL
@@ -6016,15 +6045,42 @@ WHERE fallback.author_type = 'agent'
   AND NOT worker.is_leader_task
   AND worker.completion_fallback_state IS DISTINCT FROM 'settled'
   AND NOT EXISTS (
-      SELECT 1
-      FROM agent_task_queue AS covering
-      WHERE covering.issue_id = fallback.issue_id
-        AND (
-            fallback.id = ANY(covering.delivered_comment_ids)
-            OR ((covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
-                OR (covering.status = 'deferred' AND covering.context->>'channel_issue_media_pending' = 'true'))
-                AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids)))
-        )
+      SELECT 1 FROM agent_task_queue AS covering
+      WHERE covering.issue_id = current_issue.id
+        AND fallback.source_task_id = worker.id
+        AND fallback.author_id = worker.agent_id
+        AND covering.agent_id = CASE
+            WHEN fallback.parent_id IS NOT NULL AND (
+                parent.id IS NOT NULL AND parent.deleted_at IS NULL
+                AND (worker.trigger_comment_id = parent.id OR parent.id = ANY(worker.coalesced_comment_ids))
+                AND parent_task.is_leader_task AND parent_task.squad_id IS NOT NULL
+                AND parent_task.agent_id = parent.author_id
+            ) IS NOT TRUE THEN NULL
+            WHEN parent.id IS NOT NULL AND (
+                current_issue.assignee_type = 'squad'
+                AND current_issue.assignee_id = parent_task.squad_id
+            ) IS NOT TRUE THEN CASE WHEN parent_squad.archived_at IS NULL
+                AND parent_squad.leader_id = parent_task.agent_id
+                AND parent_agent.archived_at IS NULL AND parent_agent.runtime_id IS NOT NULL
+                AND parent_agent.id IS DISTINCT FROM worker.agent_id
+                THEN parent_agent.id END
+            WHEN current_issue.triage_state IS NULL
+                AND current_issue.assignee_type = 'squad'
+                AND assigned_squad.archived_at IS NULL
+                AND assigned_agent.archived_at IS NULL AND assigned_agent.runtime_id IS NOT NULL
+                AND assigned_agent.id IS DISTINCT FROM worker.agent_id
+                AND (worker.delegated_from_task_id IS NULL AND worker.squad_id = assigned_squad.id
+                     OR source_task.issue_id = worker.issue_id
+                        AND source_task.is_leader_task AND source_task.squad_id = assigned_squad.id
+                        AND source_task.agent_id = assigned_agent.id)
+                THEN assigned_agent.id
+            END
+        AND (fallback.id = ANY(covering.delivered_comment_ids)
+             OR (covering.id IS DISTINCT FROM worker.id
+                 AND (covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+                      OR (covering.status = 'deferred' AND covering.context->>'channel_issue_media_pending' = 'true'))
+                 AND (COALESCE(review_head.head_sha, '') = '' OR covering.context->>'head_sha' = review_head.head_sha)
+                 AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids))))
   )
 ORDER BY fallback.created_at ASC, fallback.id ASC
 LIMIT $1::int
@@ -6035,9 +6091,12 @@ type ListPendingCompletionFallbacksRow struct {
 	WorkerTaskID pgtype.UUID `json:"worker_task_id"`
 }
 
-// Durable outbox scan for synthesized completion fallbacks (GH #8719) that
-// are not yet owned by an executable coordinator task and have no terminal
-// delivery receipt. A fallback is identified durably — an agent comment
+// Durable outbox scan for synthesized completion fallbacks (GH #8719).
+// Coverage depends on the current coordinator and review HEAD. This scan
+// excludes a carrier only when it can prove both; otherwise the shared
+// dispatcher decides after loading the row. Keep this conservative relative
+// to ResolveCompletionFallbackTarget and GetIssueReviewHeadSha.
+// A fallback is identified durably — an agent comment
 // whose source task is a completed, non-leader worker run — never by body
 // text or a creation-time window. Ordered oldest-first and bounded so one
 // sweep tick cannot monopolise the runtime loop.

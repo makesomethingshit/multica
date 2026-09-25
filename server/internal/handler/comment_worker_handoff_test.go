@@ -1604,7 +1604,7 @@ func TestCompletionFallbackDifferentHeadSweeperReplayDoesNotCoalesceOldRun(t *te
 	head1, head2 := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	prNumber := int32(500000 + time.Now().UnixNano()%400000)
 	var prID string
-	if err := testPool.QueryRow(ctx, `INSERT INTO github_pull_request (workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, pr_created_at, pr_updated_at, head_sha) VALUES ($1, 1, 'multica-ai', 'multica', $2, 'fallback head fence', 'open', 'https://example.test/pr', now(), now(), $3) RETURNING id`, testWorkspaceID, prNumber, head2).Scan(&prID); err != nil {
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_pull_request (workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, pr_created_at, pr_updated_at, head_sha) VALUES ($1, 1, 'multica-ai', 'multica', $2, 'fallback head fence', 'open', 'https://example.test/pr', now(), now(), $3) RETURNING id`, testWorkspaceID, prNumber, head1).Scan(&prID); err != nil {
 		t.Fatalf("seed linked PR: %v", err)
 	}
 	t.Cleanup(func() {
@@ -1620,6 +1620,8 @@ func TestCompletionFallbackDifferentHeadSweeperReplayDoesNotCoalesceOldRun(t *te
 	}
 	workerTaskID := createFallbackWorkerRun(t, fx)
 	fallbackID := completeFallbackWithoutDispatch(t, workerTaskID)
+	dbfx.Exec(t, `UPDATE agent_task_queue SET coalesced_comment_ids = ARRAY[$2::uuid] WHERE id = $1`, oldTaskID, fallbackID)
+	dbfx.Exec(t, `UPDATE github_pull_request SET head_sha = $2, pr_updated_at = now() WHERE id = $1`, prID, head2)
 	readOld := func() string {
 		t.Helper()
 		var snapshot string
@@ -1637,7 +1639,7 @@ func TestCompletionFallbackDifferentHeadSweeperReplayDoesNotCoalesceOldRun(t *te
 	if after := readOld(); after != before {
 		t.Fatalf("H2 fallback mutated H1 trigger/coalescing/attribution: before=%s after=%s", before, after)
 	}
-	if got := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND (trigger_comment_id = $3 OR $3 = ANY(coalesced_comment_ids))`, fx.issueID, fx.leaderID, fallbackID); got != 0 {
+	if got := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND id <> $3 AND status = 'queued' AND (trigger_comment_id = $4 OR $4 = ANY(coalesced_comment_ids))`, fx.issueID, fx.leaderID, oldTaskID, fallbackID); got != 0 {
 		t.Fatalf("H2 fallback was carried by %d queued task(s) while H1 owned the slot", got)
 	}
 	pending, err := testHandler.Queries.ListPendingCompletionFallbacks(ctx, 100)
@@ -1654,11 +1656,36 @@ func TestCompletionFallbackDifferentHeadSweeperReplayDoesNotCoalesceOldRun(t *te
 		t.Fatal("fallback obligation was cleared instead of staying pending behind H1")
 	}
 	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, oldTaskID)
+	dbfx.Task(t, fx.workerID, testutil.Cols{
+		"runtime_id": fx.workerRuntimeID, "issue_id": fx.issueID, "status": "queued",
+		"trigger_comment_id": uuidToString(fallbackID),
+		"context": testutil.Raw(`'{"head_sha":"` + head2 + `"}'::jsonb`),
+	})
+	pending, err = testHandler.Queries.ListPendingCompletionFallbacks(ctx, 100)
+	if err != nil {
+		t.Fatalf("list pending with wrong-agent H2 carrier: %v", err)
+	}
+	found = false
+	for _, row := range pending {
+		found = found || row.FallbackID == fallbackID
+	}
+	if !found {
+		t.Fatal("wrong-agent H2 carrier hid the coordinator obligation")
+	}
 	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
 		t.Fatalf("sweeper after H1 released its slot: %v", err)
 	}
 	if got := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory') AND context->>'head_sha' = $3 AND (trigger_comment_id = $4 OR $4 = ANY(coalesced_comment_ids))`, fx.issueID, fx.leaderID, head2, fallbackID); got != 1 {
 		t.Fatalf("H2 fallback coverage after H1 release = %d, want exactly 1", got)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("idempotent H2 sweep: %v", err)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND context->>'head_sha' = $3 AND (trigger_comment_id = $4 OR $4 = ANY(coalesced_comment_ids))`, fx.issueID, fx.leaderID, head2, fallbackID); got != 1 {
+		t.Fatalf("H2 fallback carriers after repeat sweep = %d, want exactly 1", got)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_type = 'agent' AND author_id = $2`, workerTaskID, fx.workerID); got != 1 {
+		t.Fatalf("recorded fallback comments = %d, want exactly 1", got)
 	}
 	if after := readOld(); after != before {
 		t.Fatalf("completed H1 row changed while dispatching H2: before=%s after=%s", before, after)
