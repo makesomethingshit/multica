@@ -994,7 +994,6 @@ func TestCompletionReconcileSkipsRecordedFallback(t *testing.T) {
 	}
 }
 
-
 // TestCompleteTask_SkipsExplicitMentionWhenSourceGone pins the permanent half
 // of the reconcile lookup contract (GH #8719): an agent comment whose source
 // run is provably gone (no-rows) stays skipped -- its lineage can never be
@@ -1065,6 +1064,7 @@ func TestCompleteTask_SkipsExplicitMentionWhenSourceGone(t *testing.T) {
 		t.Fatalf("source-gone comment must stay skipped, got %d queued follow-up(s)", n)
 	}
 }
+
 // retryObligationCount reads how many durable completion-reconcile retry
 // obligations a run currently carries (GH #8719).
 func retryObligationCount(t *testing.T, taskID string) int {
@@ -1095,8 +1095,16 @@ func fallbackCommentCountForTask(t *testing.T, taskID string) int {
 type failQueriesDB struct {
 	db.DBTX
 	missingTasks map[string]bool
+	failQuery    string
 	failQueryRow string
 	failExec     string
+}
+
+func (d *failQueriesDB) Query(ctx context.Context, query string, args ...any) (pgx.Rows, error) {
+	if d.failQuery != "" && strings.Contains(query, d.failQuery) {
+		return nil, errors.New("injected query failure: " + d.failQuery)
+	}
+	return d.DBTX.Query(ctx, query, args...)
 }
 
 func (d *failQueriesDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
@@ -1286,6 +1294,70 @@ func TestCompleteTask_RecordsRestrictedMentionDuringSourceOutage(t *testing.T) {
 	}
 	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
 		t.Fatalf("sweeper left %d retry obligation(s), want 0", n)
+	}
+}
+
+func TestCompletionReconcileRetryRetainsObligationOnRoutingReadFailure(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	for i, outage := range []struct {
+		name         string
+		failQuery    string
+		failQueryRow string
+	}{
+		{name: "invocation target lookup", failQuery: "ListAgentInvocationTargets"},
+		{name: "parent lookup", failQueryRow: "GetCommentInWorkspace"},
+	} {
+		t.Run(outage.name, func(t *testing.T) {
+			ctx := context.Background()
+			fx := seedRetryFixture(t, 999022+i, "Retry Read Outage "+outage.name, func(agentB, _ string) string {
+				return mentionAgentBody(agentB)
+			})
+			dbfx.Exec(t, `DELETE FROM agent_invocation_target WHERE agent_id = $1`, fx.agentB)
+			originatorID := dbfx.User(t, "Retry Read Outage Actor", "retry-read-outage-"+strings.ReplaceAll(outage.name, " ", "-")+"-"+time.Now().Format("20060102150405.000000000")+"@multica.test")
+			dbfx.Member(t, testWorkspaceID, originatorID, "member")
+			dbfx.Exec(t, `UPDATE agent_task_queue SET originator_user_id = $2, accountable_user_id = $2 WHERE id = $1`, fx.wTaskID, originatorID)
+			dbfx.Exec(t, `INSERT INTO agent_invocation_target (agent_id, target_type, target_id) VALUES ($1, 'member', $2)`, fx.agentB, originatorID)
+			agent, err := testHandler.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: util.MustParseUUID(fx.agentB), WorkspaceID: util.MustParseUUID(testWorkspaceID)})
+			if err != nil {
+				t.Fatalf("load target agent: %v", err)
+			}
+			if allowed, err := testHandler.invokeAgentDecisionChecked(ctx, agent, "agent", fx.workerW, originatorID, testWorkspaceID); err != nil || !allowed {
+				t.Fatalf("seeded target permission is not invocable: allowed=%v err=%v", allowed, err)
+			}
+			withFailingQueries(t, &failQueriesDB{DBTX: testPool, missingTasks: map[string]bool{fx.wTaskID: true}}, func() {
+				if w := completeTaskViaHandler(t, fx.bTaskID, "done"); w.Code != http.StatusOK {
+					t.Fatalf("CompleteTask under source outage: expected 200, got %d: %s", w.Code, w.Body.String())
+				}
+			})
+			if got := retryObligationCount(t, fx.bTaskID); got != 1 {
+				t.Fatalf("retry obligations before replay = %d, want 1", got)
+			}
+			if got := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); got != 0 {
+				t.Fatalf("source outage queued %d follow-up tasks, want 0", got)
+			}
+			withFailingQueries(t, &failQueriesDB{DBTX: testPool, failQuery: outage.failQuery, failQueryRow: outage.failQueryRow}, func() {
+				if _, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10); err == nil {
+					t.Fatal("ReplayCompletionReconcileRetries succeeded during routing read outage")
+				}
+			})
+			if got := retryObligationCount(t, fx.bTaskID); got != 1 {
+				t.Fatalf("retry obligations after transient routing failure = %d, want 1", got)
+			}
+			if got := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); got != 0 {
+				t.Fatalf("transient routing failure queued %d follow-up tasks, want 0", got)
+			}
+			if _, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10); err != nil {
+				t.Fatalf("healthy retry replay: %v", err)
+			}
+			if got := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); got != 1 {
+				t.Fatalf("healthy replay queued %d follow-up tasks, want exactly 1", got)
+			}
+			if got := retryObligationCount(t, fx.bTaskID); got != 0 {
+				t.Fatalf("retry obligations after healthy replay = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -1669,4 +1741,5 @@ func TestCompletionReconcileRetryHonorsCurrentReadiness(t *testing.T) {
 		t.Fatalf("unready obligation left %d element(s), want 0", n)
 	}
 }
- // TestCompleteTask_SkipsExplicitMentionWhenSourceGone pins the permanent half
+
+// TestCompleteTask_SkipsExplicitMentionWhenSourceGone pins the permanent half

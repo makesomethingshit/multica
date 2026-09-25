@@ -277,6 +277,32 @@ func (s *TaskService) ResolveOriginatorFromTriggerComment(ctx context.Context, w
 	return s.resolveOriginatorFromTriggerComment(ctx, workspaceID, commentID)
 }
 
+// ResolveOriginatorFromCommentChecked resolves the current comment authoring run
+// without hiding transient source-task lookup failures from durable retries.
+func (s *TaskService) ResolveOriginatorFromCommentChecked(ctx context.Context, comment db.Comment) (pgtype.UUID, error) {
+	if s == nil || s.Queries == nil {
+		return pgtype.UUID{}, nil
+	}
+	facts := attribution.CommentFacts{
+		CommentID:  comment.ID,
+		AuthorType: comment.AuthorType,
+		AuthorID:   comment.AuthorID,
+	}
+	if comment.AuthorType == "agent" && comment.SourceTaskID.Valid {
+		facts.SourceTaskID = comment.SourceTaskID
+		parent, err := s.Queries.GetAgentTask(ctx, comment.SourceTaskID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return pgtype.UUID{}, nil
+			}
+			return pgtype.UUID{}, err
+		}
+		facts.ParentOriginator = parent.OriginatorUserID
+		facts.ParentAccountable = parent.AccountableUserID
+	}
+	return attribution.ClassifyComment(facts, attribution.SourceCommentSource).UserID, nil
+}
+
 // AttributionForMergedComment resolves the FULL attribution snapshot for a comment
 // being coalesced into an already-queued task (MUL-4302). A merge re-attributes the
 // run to the newly-arrived comment's human, so the whole snapshot — source, evidence,
@@ -1241,6 +1267,17 @@ func headShaText(sha string) pgtype.Text {
 // ResolveIssueReviewSHAParam is ResolveIssueReviewSHA wrapped as the pgtype.Text
 // the dedup queries take, so both service- and handler-package call sites can
 // key dedup on the reviewed head with a single call (TEN-356).
+func (s *TaskService) ResolveIssueReviewSHAChecked(ctx context.Context, issueID pgtype.UUID) (string, error) {
+	if !issueID.Valid {
+		return "", nil
+	}
+	sha, err := s.Queries.GetIssueReviewHeadSha(ctx, issueID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return sha, err
+}
+
 func (s *TaskService) ResolveIssueReviewSHAParam(ctx context.Context, issueID pgtype.UUID) pgtype.Text {
 	return headShaText(s.ResolveIssueReviewSHA(ctx, issueID))
 }
@@ -1647,96 +1684,81 @@ func workerCoversReplyParent(task db.AgentTaskQueue, parentID pgtype.UUID) bool 
 	return false
 }
 
-// DispatchCompletionFallbackByLineage routes one synthesized fallback through
-// the narrow coordinator resolver and enqueue path. It lives on TaskService
-// (rather than only in the handler) so the delegated-failure sweeper's
-// fallback replay shares the exact dispatch the completion path uses — one
-// resolver, one enqueue, one idempotency definition. Proven-invalid lineage
-// returns (false, true, nil); transient failures return an error so the row
-// stays pending for the next sweep.
-func (s *TaskService) DispatchCompletionFallbackByLineage(ctx context.Context, issue db.Issue, workerTask db.AgentTaskQueue, fallback db.Comment, parentComment *db.Comment) error {
+// DispatchCompletionFallbackByLineage is the shared callback and sweeper
+// policy: resolve trusted lineage, check coverage, safely merge/register by
+// HEAD, then enqueue a fresh lifecycle handoff. Invalid lineage settles the
+// exact fallback; transient failures preserve it for the next sweep.
+func (s *TaskService) DispatchCompletionFallbackByLineage(ctx context.Context, issue db.Issue, workerTask db.AgentTaskQueue, fallback db.Comment, parentComment *db.Comment) (bool, bool, error) {
 	target, provenInvalid, err := ResolveCompletionFallbackTarget(ctx, s.Queries, issue, workerTask, fallback, parentComment)
-	if err != nil || provenInvalid {
-		if provenInvalid {
-			// Permanently invalid lineage settles the recorded row so the
-			// bounded sweeper stops reselecting it; transient errors return
-			// and stay pending for the next sweep (GH #8719).
-			s.SettleCompletionFallbackState(ctx, workerTask.ID, fallback.ID)
-			return nil
-		}
-		return err
+	if err != nil {
+		return false, false, err
 	}
+	if provenInvalid {
+		s.SettleCompletionFallbackState(ctx, workerTask.ID, fallback.ID)
+		return false, true, nil
+	}
+	head, err := s.ResolveIssueReviewSHAChecked(ctx, issue.ID)
+	if err != nil {
+		return false, false, fmt.Errorf("resolve fallback review head: %w", err)
+	}
+	headSha := headShaText(head)
 	covered, err := s.Queries.HasTaskCoveringCompletionFallback(ctx, db.HasTaskCoveringCompletionFallbackParams{
 		IssueID:       issue.ID,
 		AgentID:       target.Agent.ID,
 		CommentID:     fallback.ID,
 		ExcludeTaskID: workerTask.ID,
+		HeadSha:       headSha,
 	})
 	if err != nil {
-		return fmt.Errorf("check fallback coverage: %w", err)
+		return false, false, fmt.Errorf("check fallback coverage: %w", err)
 	}
 	if covered {
-		return nil
+		return true, false, nil
 	}
-	if merged, err := s.Queries.MergeCompletionFallbackIntoPendingTask(ctx, db.MergeCompletionFallbackIntoPendingTaskParams{
-		CommentID:      fallback.ID,
-		TriggerSummary: s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, fallback.ID),
-		IssueID:        issue.ID,
-		AgentID:        target.Agent.ID,
-	}); err == nil {
+	var summary pgtype.Text
+	if text := truncateForSummary(fallback.Content, triggerSummaryMaxLen); text != "" {
+		summary = pgtype.Text{String: text, Valid: true}
+	}
+	merge := func() (db.AgentTaskQueue, error) {
+		return s.Queries.MergeCompletionFallbackIntoPendingTask(ctx, db.MergeCompletionFallbackIntoPendingTaskParams{
+			CommentID: fallback.ID, TriggerSummary: summary, IssueID: issue.ID, AgentID: target.Agent.ID, HeadSha: headSha,
+		})
+	}
+	if merged, err := merge(); err == nil {
 		slog.Info("completion fallback merged into pending coordinator task",
-			"worker_task_id", util.UUIDToString(workerTask.ID),
-			"coordinator_task_id", util.UUIDToString(merged.ID),
-		)
-		return nil
+			"worker_task_id", util.UUIDToString(workerTask.ID), "coordinator_task_id", util.UUIDToString(merged.ID))
+		return true, false, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("merge fallback into pending task: %w", err)
+		return false, false, fmt.Errorf("merge fallback into pending task: %w", err)
 	}
 	if _, err := s.EnqueueCompletionFallbackHandoff(ctx, issue, target.Agent.ID, target.SquadID(), fallback.ID, workerTask); err != nil {
-		// The enqueue path normalizes the pending-slot unique violation into
-		// the bare ErrDuplicatePendingTask sentinel (#5958), so match both
-		// shapes: a concurrent dispatcher won the coordinator slot.
 		if !pendingSlotTakenErr(err) {
-			return fmt.Errorf("create fallback handoff task: %w", err)
+			return false, false, fmt.Errorf("create fallback handoff task: %w", err)
 		}
-		if merged, err := s.Queries.MergeCompletionFallbackIntoPendingTask(ctx, db.MergeCompletionFallbackIntoPendingTaskParams{
-			CommentID:      fallback.ID,
-			TriggerSummary: s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, fallback.ID),
-			IssueID:        issue.ID,
-			AgentID:        target.Agent.ID,
-		}); err == nil {
-			_ = merged
-			return nil
+		if _, err := merge(); err == nil {
+			return true, false, nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("merge fallback into pending task: %w", err)
+			return false, false, fmt.Errorf("merge fallback into pending task: %w", err)
 		}
-		// The winner may have attached the fallback between our coverage
-		// check and the lost enqueue race; re-check so a covered fallback
-		// is not reported as a dispatch failure (GH #8719 single-winner).
 		covered, err := s.Queries.HasTaskCoveringCompletionFallback(ctx, db.HasTaskCoveringCompletionFallbackParams{
-			IssueID:       issue.ID,
-			AgentID:       target.Agent.ID,
-			CommentID:     fallback.ID,
-			ExcludeTaskID: workerTask.ID,
+			IssueID: issue.ID, AgentID: target.Agent.ID, CommentID: fallback.ID, ExcludeTaskID: workerTask.ID, HeadSha: headSha,
 		})
 		if err != nil {
-			return fmt.Errorf("recheck fallback coverage: %w", err)
+			return false, false, fmt.Errorf("recheck fallback coverage: %w", err)
 		}
 		if covered {
-			return nil
+			return true, false, nil
 		}
 		if _, err := s.Queries.RegisterPlannedCommentForActiveTask(ctx, db.RegisterPlannedCommentForActiveTaskParams{
-			CommentID: fallback.ID,
-			IssueID:   issue.ID,
-			AgentID:   target.Agent.ID,
+			CommentID: fallback.ID, IssueID: issue.ID, AgentID: target.Agent.ID, HeadSha: headSha,
 		}); err == nil {
-			return nil
+			return true, false, nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("register fallback on active task: %w", err)
+			return false, false, fmt.Errorf("register fallback on active task: %w", err)
 		}
-		return fmt.Errorf("fallback handoff could not acquire coordinator task slot")
+		return false, false, fmt.Errorf("fallback handoff could not acquire coordinator task slot")
 	}
-	return nil
+	return true, false, nil
 }
 
 // workerTaskAttribution inherits the completed worker's trusted delegation
@@ -7167,11 +7189,8 @@ func (s *TaskService) DispatchDelegatedFailureRecoveryComment(ctx context.Contex
 	return err
 }
 
-// replayCompletionFallbackRow replays one sweeper-scanned fallback row
-// through the narrow coordinator resolver. Resolution needs the worker task
-// row (server-trusted lineage), so a row whose worker task is gone is
-// permanently unroutable and skipped without error; transient lookup/enqueue
-// failures are returned so the row stays pending for the next sweep.
+// replayCompletionFallbackRow loads the recorded fallback's trusted lineage
+// inputs and sends them through the shared completion dispatcher.
 func (s *TaskService) replayCompletionFallbackRow(ctx context.Context, row db.ListPendingCompletionFallbacksRow) error {
 	workerTask, err := s.Queries.GetAgentTask(ctx, row.WorkerTaskID)
 	if err != nil {
@@ -7194,6 +7213,7 @@ func (s *TaskService) replayCompletionFallbackRow(ctx context.Context, row db.Li
 	issue, err := s.Queries.GetIssue(ctx, workerTask.IssueID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			s.SettleCompletionFallbackState(ctx, workerTask.ID, row.FallbackID)
 			return nil
 		}
 		return fmt.Errorf("load fallback issue: %w", err)
@@ -7215,7 +7235,8 @@ func (s *TaskService) replayCompletionFallbackRow(ctx context.Context, row db.Li
 		}
 		parentComment = &parent
 	}
-	return s.DispatchCompletionFallbackByLineage(ctx, issue, workerTask, fallback, parentComment)
+	_, _, err = s.DispatchCompletionFallbackByLineage(ctx, issue, workerTask, fallback, parentComment)
+	return err
 }
 
 // SettleCompletionFallbackState moves a run to the terminal 'settled' state
@@ -7341,20 +7362,6 @@ func (s *TaskService) replayCompletionFallbackOwedRun(ctx context.Context, taskI
 	return s.replayCompletionFallbackRow(ctx, db.ListPendingCompletionFallbacksRow{
 		WorkerTaskID: task.ID,
 		FallbackID:   id,
-	})
-}
-
-// HasTaskCoveringCompletionFallback reports whether a synthesized completion
-// fallback (GH #8719) is already owned: some runnable coordinator task
-// carries it as trigger/planned input, or a terminal task recorded its
-// delivery. Shared by the completion path and the sweeper replay so both
-// agree on one idempotency definition.
-func (s *TaskService) HasTaskCoveringCompletionFallback(ctx context.Context, issueID, agentID, commentID, excludeTaskID pgtype.UUID) (bool, error) {
-	return s.Queries.HasTaskCoveringCompletionFallback(ctx, db.HasTaskCoveringCompletionFallbackParams{
-		IssueID:       issueID,
-		AgentID:       agentID,
-		CommentID:     commentID,
-		ExcludeTaskID: excludeTaskID,
 	})
 }
 

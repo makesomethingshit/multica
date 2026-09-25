@@ -241,7 +241,7 @@ func TestCompletionFallbackMentionDoesNotFanOut(t *testing.T) {
 		}
 		parent = &p
 	}
-	routed, provenInvalid, err := testHandler.routeCompletionFallbackCoordinator(context.Background(), issue, stored, fallback, parent)
+	routed, provenInvalid, err := testHandler.TaskService.DispatchCompletionFallbackByLineage(context.Background(), issue, stored, fallback, parent)
 	if err != nil || provenInvalid || !routed {
 		t.Fatalf("mention-carrying fallback must still route to its coordinator: routed=%v invalid=%v err=%v", routed, provenInvalid, err)
 	}
@@ -352,7 +352,7 @@ func TestCompletionFallbackInvalidParentStaysFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, provenInvalid, err := testHandler.resolveCompletionFallbackCoordinator(ctx, issue, stored, fallback, nil)
+	_, provenInvalid, err := testHandler.TaskService.DispatchCompletionFallbackByLineage(ctx, issue, stored, fallback, nil)
 	if err != nil || !provenInvalid {
 		t.Fatalf("invalid parent must be proven-invalid: invalid=%v err=%v", provenInvalid, err)
 	}
@@ -1572,6 +1572,190 @@ func newFallbackLineageFixture(t *testing.T, name, assignee string) fallbackLine
 func runnableTaskCount(t *testing.T, issueID, agentID string) int {
 	t.Helper()
 	return dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, agentID)
+}
+
+func createFallbackWorkerRun(t *testing.T, fx fallbackObligationFixture) string {
+	t.Helper()
+	return dbfx.Task(t, fx.workerID, testutil.Cols{
+		"runtime_id": fx.workerRuntimeID, "issue_id": fx.issueID, "status": "running",
+		"trigger_comment_id": fx.rootID, "squad_id": fx.squadID, "delegated_from_task_id": fx.sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + fx.rootID + "'::uuid]"),
+	})
+}
+
+func completeFallbackWithoutDispatch(t *testing.T, workerTaskID string) pgtype.UUID {
+	t.Helper()
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		context.Background(), parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("record fallback: transitioned=%v fallback=%v err=%v", transitioned, fallbackID.Valid, err)
+	}
+	return fallbackID
+}
+
+func TestCompletionFallbackDifferentHeadSweeperReplayDoesNotCoalesceOldRun(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackObligationFixture(t, "sweeper-head-fence")
+	head1, head2 := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	prNumber := int32(500000 + time.Now().UnixNano()%400000)
+	var prID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_pull_request (workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, pr_created_at, pr_updated_at, head_sha) VALUES ($1, 1, 'multica-ai', 'multica', $2, 'fallback head fence', 'open', 'https://example.test/pr', now(), now(), $3) RETURNING id`, testWorkspaceID, prNumber, head2).Scan(&prID); err != nil {
+		t.Fatalf("seed linked PR: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue_pull_request WHERE pull_request_id = $1`, prID)
+		testPool.Exec(context.Background(), `DELETE FROM github_pull_request WHERE id = $1`, prID)
+	})
+	if _, err := testPool.Exec(ctx, `INSERT INTO issue_pull_request (issue_id, pull_request_id) VALUES ($1, $2)`, fx.issueID, prID); err != nil {
+		t.Fatalf("link PR: %v", err)
+	}
+	var oldTaskID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, comment_thread_id, status, priority, is_leader_task, squad_id, context, originator_user_id, accountable_user_id) VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], $4, 'queued', 0, true, $5, jsonb_build_object('head_sha', $6::text), $7, $7) RETURNING id`, fx.leaderID, fx.leaderRuntimeID, fx.issueID, fx.rootID, fx.squadID, head1, testUserID).Scan(&oldTaskID); err != nil {
+		t.Fatalf("seed old-head coordinator: %v", err)
+	}
+	workerTaskID := createFallbackWorkerRun(t, fx)
+	fallbackID := completeFallbackWithoutDispatch(t, workerTaskID)
+	readOld := func() string {
+		t.Helper()
+		var snapshot string
+		err := testPool.QueryRow(ctx, `SELECT jsonb_build_array(trigger_comment_id::text, coalesced_comment_ids::text, originator_user_id::text, accountable_user_id::text, originator_source::text, context->>'head_sha')::text FROM agent_task_queue WHERE id = $1`, oldTaskID).Scan(&snapshot)
+		if err != nil {
+			t.Fatalf("read H1 coordinator: %v", err)
+		}
+		return snapshot
+	}
+	before := readOld()
+	if !strings.Contains(before, head1) {
+		t.Fatalf("H1 fixture has no old head: %s", before)
+	}
+	_, _ = testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10)
+	if after := readOld(); after != before {
+		t.Fatalf("H2 fallback mutated H1 trigger/coalescing/attribution: before=%s after=%s", before, after)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND (trigger_comment_id = $3 OR $3 = ANY(coalesced_comment_ids))`, fx.issueID, fx.leaderID, fallbackID); got != 0 {
+		t.Fatalf("H2 fallback was carried by %d queued task(s) while H1 owned the slot", got)
+	}
+	pending, err := testHandler.Queries.ListPendingCompletionFallbacks(ctx, 100)
+	if err != nil {
+		t.Fatalf("list pending fallbacks: %v", err)
+	}
+	found := false
+	for _, row := range pending {
+		if row.FallbackID == fallbackID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("fallback obligation was cleared instead of staying pending behind H1")
+	}
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, oldTaskID)
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper after H1 released its slot: %v", err)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory') AND context->>'head_sha' = $3 AND (trigger_comment_id = $4 OR $4 = ANY(coalesced_comment_ids))`, fx.issueID, fx.leaderID, head2, fallbackID); got != 1 {
+		t.Fatalf("H2 fallback coverage after H1 release = %d, want exactly 1", got)
+	}
+	if after := readOld(); after != before {
+		t.Fatalf("completed H1 row changed while dispatching H2: before=%s after=%s", before, after)
+	}
+}
+
+func TestCompletionFallbackCallbackAndSweeperParity(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	type outcome struct {
+		leader, squad, trigger, thread                   bool
+		coalesced                                        bool
+		originator, accountable, attributionSource, head string
+	}
+	outcomes := make([]outcome, 0, 2)
+	for _, path := range []string{"callback", "sweeper"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			fx := newFallbackObligationFixture(t, "dispatch-parity-"+path)
+			workerTaskID := createFallbackWorkerRun(t, fx)
+			var fallbackID pgtype.UUID
+			if path == "callback" {
+				completeWorkerReplyRun(t, workerTaskID)
+				worker, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(workerTaskID))
+				if err != nil || !worker.CompletionFallbackCommentID.Valid {
+					t.Fatalf("callback did not record fallback: err=%v", err)
+				}
+				fallbackID = worker.CompletionFallbackCommentID
+			} else {
+				fallbackID = completeFallbackWithoutDispatch(t, workerTaskID)
+				if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+					t.Fatalf("sweeper dispatch: %v", err)
+				}
+			}
+			if got := runnableTaskCount(t, fx.issueID, fx.leaderID); got != 1 {
+				t.Fatalf("%s created %d coordinator tasks, want exactly 1", path, got)
+			}
+			var got outcome
+			err := testPool.QueryRow(ctx, `
+                SELECT is_leader_task, squad_id = $2::uuid, trigger_comment_id = $3::uuid,
+                       $3::uuid = ANY(coalesced_comment_ids), comment_thread_id = $4::uuid,
+                       COALESCE(originator_user_id::text, ''), COALESCE(accountable_user_id::text, ''),
+                       COALESCE(originator_source::text, ''), COALESCE(context->>'head_sha', '')
+                FROM agent_task_queue
+                WHERE issue_id = $1 AND agent_id = $5 AND status = 'queued'
+                  AND (trigger_comment_id = $3::uuid OR $3::uuid = ANY(coalesced_comment_ids))
+            `, fx.issueID, fx.squadID, fallbackID, fx.rootID, fx.leaderID).Scan(
+				&got.leader, &got.squad, &got.trigger, &got.coalesced, &got.thread,
+				&got.originator, &got.accountable, &got.attributionSource, &got.head,
+			)
+			if err != nil {
+				t.Fatalf("read %s fallback carrier: %v", path, err)
+			}
+			if !got.leader || !got.squad || !got.trigger || got.coalesced || !got.thread || got.originator != testUserID || got.accountable != testUserID || got.head != "" {
+				t.Fatalf("%s dispatch has unexpected role/ownership/attribution: %+v", path, got)
+			}
+			outcomes = append(outcomes, got)
+		})
+	}
+	if len(outcomes) != 2 || outcomes[0] != outcomes[1] {
+		t.Fatalf("callback and sweeper dispatch differ: %+v", outcomes)
+	}
+}
+
+func TestCompletionFallbackMediaPendingDeferredTaskCoversFallback(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackObligationFixture(t, "media-deferred-coverage")
+	workerTaskID := createFallbackWorkerRun(t, fx)
+	fallbackID := completeFallbackWithoutDispatch(t, workerTaskID)
+	carrierID := dbfx.Task(t, fx.leaderID, testutil.Cols{
+		"runtime_id": fx.leaderRuntimeID, "issue_id": fx.issueID, "status": "deferred",
+		"trigger_comment_id": uuidToString(fallbackID), "is_leader_task": true, "squad_id": fx.squadID,
+		"context": testutil.Raw("'{\"channel_issue_media_pending\":true}'::jsonb"),
+	})
+	covered, err := testHandler.Queries.HasTaskCoveringCompletionFallback(ctx, db.HasTaskCoveringCompletionFallbackParams{
+		IssueID: parseUUID(fx.issueID), AgentID: parseUUID(fx.leaderID), CommentID: fallbackID, ExcludeTaskID: parseUUID(workerTaskID),
+	})
+	if err != nil || !covered {
+		t.Fatalf("media-pending deferred carrier coverage = %v, err=%v; want true", covered, err)
+	}
+	pending, err := testHandler.Queries.ListPendingCompletionFallbacks(ctx, 100)
+	if err != nil {
+		t.Fatalf("list pending completion fallbacks: %v", err)
+	}
+	for _, row := range pending {
+		if row.FallbackID == fallbackID {
+			t.Fatal("media-pending deferred carrier remained in pending fallback scan")
+		}
+	}
+	_, _ = testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10)
+	if got := dbfx.Count(t, `SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued' AND id <> $3 AND (trigger_comment_id = $4 OR $4 = ANY(coalesced_comment_ids))`, fx.issueID, fx.leaderID, carrierID, fallbackID); got != 0 {
+		t.Fatalf("deferred carrier caused %d duplicate fallback dispatches", got)
+	}
 }
 
 // TestCompletionFallbackReassignedSquadDoesNotWake pins Blocker 3 (GH #8719

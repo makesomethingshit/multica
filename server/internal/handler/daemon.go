@@ -4557,15 +4557,11 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 		}
 		parentComment = &parent
 	}
-	routed, provenInvalid, err := h.routeCompletionFallbackCoordinator(ctx, issue, *task, comment, parentComment)
+	routed, provenInvalid, err := h.TaskService.DispatchCompletionFallbackByLineage(ctx, issue, *task, comment, parentComment)
 	if err != nil {
 		return false, false, err
 	}
-	if provenInvalid {
-		h.settleInvalidCompletionFallback(ctx, task.ID, fallbackCommentID)
-		return false, true, nil
-	}
-	return routed, false, nil
+	return routed, provenInvalid, nil
 }
 
 // reconcileCommentsOnCompletion closes the at-least-once gap for input the
@@ -4627,7 +4623,7 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 	// completing agent under CURRENT state, without enqueueing anything. The
 	// retry replay shares this helper, so "would have routed" has exactly one
 	// implementation (GH #8719).
-	scopedReplayableTriggers := func(c db.Comment) []commentAgentTrigger {
+	scopedReplayableTriggers := func(c db.Comment) ([]commentAgentTrigger, error) {
 		return h.scopedReplayableTriggersForAgent(ctx, issue, agentID, plannedCommentIDs, c)
 	}
 
@@ -4756,7 +4752,12 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		if err := h.recordCompletionReconcileRetry(ctx, task.ID, c.ID); err != nil {
 			return err
 		}
-		scoped := scopedReplayableTriggers(c)
+		scoped, routeErr := scopedReplayableTriggers(c)
+		if routeErr != nil {
+			slog.Warn("completion reconcile routing is indeterminate; retry obligation remains owed",
+				"comment_id", uuidToString(c.ID), "error", routeErr)
+			continue
+		}
 		if len(scoped) == 0 {
 			continue
 		}
@@ -4848,16 +4849,17 @@ func (h *Handler) recordCompletionReconcileRetry(ctx context.Context, taskID, co
 // creation path already accepted and recorded in the run's input plan
 // (plannedCommentIDs). Recomputed routing still checks current permissions and
 // the self-trigger guard.
-func (h *Handler) scopedReplayableTriggersForAgent(ctx context.Context, issue db.Issue, agentID string, plannedCommentIDs []pgtype.UUID, c db.Comment) []commentAgentTrigger {
+func (h *Handler) scopedReplayableTriggersForAgent(ctx context.Context, issue db.Issue, agentID string, plannedCommentIDs []pgtype.UUID, c db.Comment) ([]commentAgentTrigger, error) {
 	var parentComment *db.Comment
 	if c.ParentID.Valid {
-		// Scope to the issue's workspace; a comment's parent is always in the
-		// same workspace, so this only fails closed against a stray foreign
-		// UUID rather than changing behavior (MUL-4252).
-		if parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
+		parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
 			ID:          c.ParentID,
 			WorkspaceID: issue.WorkspaceID,
-		}); err == nil {
+		})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("load retry parent: %w", err)
+		}
+		if err == nil {
 			parentComment = &parent
 		}
 	}
@@ -4865,13 +4867,22 @@ func (h *Handler) scopedReplayableTriggersForAgent(ctx context.Context, issue db
 	actorID := uuidToString(c.AuthorID)
 	originatorUserID := actorID
 	if actorType != "member" {
-		originatorUserID = uuidToString(h.TaskService.ResolveOriginatorFromTriggerComment(ctx, issue.WorkspaceID, c.ID))
+		originator, err := h.TaskService.ResolveOriginatorFromCommentChecked(ctx, c)
+		if err != nil {
+			return nil, fmt.Errorf("resolve retry originator: %w", err)
+		}
+		originatorUserID = uuidToString(originator)
 	}
+	var routingReadErr error
 	triggers, _ := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, actorType, actorID, commentTriggerComputeOptions{
 		ExcludeTriggerCommentID: c.ID,
 		AuthoringTaskID:         c.SourceTaskID,
 		OriginatorUserID:        originatorUserID,
+		routingReadError:        &routingReadErr,
 	})
+	if routingReadErr != nil {
+		return nil, fmt.Errorf("resolve current retry routing: %w", routingReadErr)
+	}
 	if actorType != "member" {
 		triggers = keepReplayableAgentTriggers(triggers, slices.Contains(plannedCommentIDs, c.ID))
 	}
@@ -4883,7 +4894,7 @@ func (h *Handler) scopedReplayableTriggersForAgent(ctx context.Context, issue db
 			scoped = append(scoped, trigger)
 		}
 	}
-	return scoped
+	return scoped, nil
 }
 
 // commentCoveredForAgent reports whether an undelivered reconcile candidate is
@@ -5089,7 +5100,10 @@ func (h *Handler) replayOneCompletionReconcileRetry(ctx context.Context, issue d
 	// archived or unready target, reassigned squad leader, demoted thread-parent
 	// role, deleted topology. The obligation is settled without an enqueue,
 	// exactly as fresh comment routing would decide now.
-	scoped := h.scopedReplayableTriggersForAgent(ctx, issue, uuidToString(agentID), plannedCommentIDs, comment)
+	scoped, err := h.scopedReplayableTriggersForAgent(ctx, issue, uuidToString(agentID), plannedCommentIDs, comment)
+	if err != nil {
+		return false, err
+	}
 	if len(scoped) == 0 {
 		return true, nil
 	}

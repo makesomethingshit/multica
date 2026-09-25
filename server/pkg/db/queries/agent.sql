@@ -2057,7 +2057,11 @@ WHERE issue_id = @issue_id
       @comment_id::uuid = ANY(delivered_comment_ids)
       OR (
           id IS DISTINCT FROM sqlc.narg('exclude_task_id')::uuid
-          AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+          AND (
+              status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+              OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
+          )
+          AND (COALESCE(sqlc.narg('head_sha')::text, '') = '' OR context->>'head_sha' = sqlc.narg('head_sha')::text)
           AND (trigger_comment_id = @comment_id::uuid OR @comment_id::uuid = ANY(coalesced_comment_ids))
       )
   );
@@ -2084,6 +2088,7 @@ WHERE id = (
           t.status = 'queued'
           OR (t.status = 'deferred' AND t.context->>'channel_issue_media_pending' = 'true')
       )
+      AND (COALESCE(sqlc.narg('head_sha')::text, '') = '' OR t.context->>'head_sha' = sqlc.narg('head_sha')::text)
       AND t.trigger_comment_id IS DISTINCT FROM @comment_id::uuid
       AND NOT (@comment_id::uuid = ANY(t.coalesced_comment_ids))
     ORDER BY t.created_at DESC
@@ -2113,9 +2118,12 @@ WHERE fallback.author_type = 'agent'
       SELECT 1
       FROM agent_task_queue AS covering
       WHERE covering.issue_id = fallback.issue_id
-        AND (fallback.id = ANY(covering.delivered_comment_ids)
-            OR (covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
-                AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids))))
+        AND (
+            fallback.id = ANY(covering.delivered_comment_ids)
+            OR ((covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+                OR (covering.status = 'deferred' AND covering.context->>'channel_issue_media_pending' = 'true'))
+                AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids)))
+        )
   )
 ORDER BY fallback.created_at ASC, fallback.id ASC
 LIMIT @max_per_tick::int;

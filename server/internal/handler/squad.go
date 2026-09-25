@@ -1145,17 +1145,22 @@ func (h *Handler) RecordSquadLeaderEvaluation(w http.ResponseWriter, r *http.Req
 // same-squad worker task; generic agent tasks such as direct mentions and
 // thread-parent replies are not worker-role proof and must not self-trigger.
 func (h *Handler) shouldSuppressSquadLeaderSelfTrigger(ctx context.Context, issueID, leaderID, squadID pgtype.UUID) bool {
+	suppress, _ := h.shouldSuppressSquadLeaderSelfTriggerChecked(ctx, issueID, leaderID, squadID)
+	return suppress
+}
+
+func (h *Handler) shouldSuppressSquadLeaderSelfTriggerChecked(ctx context.Context, issueID, leaderID, squadID pgtype.UUID) (bool, error) {
 	latest, err := h.Queries.GetLatestTaskRoleForIssueAndAgent(ctx, db.GetLatestTaskRoleForIssueAndAgentParams{
 		IssueID: issueID,
 		AgentID: leaderID,
 	})
 	if err != nil {
-		return false
+		return false, err
 	}
 	if latest.IsLeaderTask {
-		return true
+		return true, nil
 	}
-	return !latest.SquadID.Valid || uuidToString(latest.SquadID) != uuidToString(squadID)
+	return !latest.SquadID.Valid || uuidToString(latest.SquadID) != uuidToString(squadID), nil
 }
 
 // commentMentionsAnyone returns true when the comment body contains at least

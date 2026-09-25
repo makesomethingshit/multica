@@ -5284,7 +5284,11 @@ WHERE issue_id = $1
       $3::uuid = ANY(delivered_comment_ids)
       OR (
           id IS DISTINCT FROM $4::uuid
-          AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+          AND (
+              status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+              OR (status = 'deferred' AND context->>'channel_issue_media_pending' = 'true')
+          )
+          AND (COALESCE($5::text, '') = '' OR context->>'head_sha' = $5::text)
           AND (trigger_comment_id = $3::uuid OR $3::uuid = ANY(coalesced_comment_ids))
       )
   )
@@ -5295,6 +5299,7 @@ type HasTaskCoveringCompletionFallbackParams struct {
 	AgentID       pgtype.UUID `json:"agent_id"`
 	CommentID     pgtype.UUID `json:"comment_id"`
 	ExcludeTaskID pgtype.UUID `json:"exclude_task_id"`
+	HeadSha       pgtype.Text `json:"head_sha"`
 }
 
 // Durable idempotency check for a synthesized completion fallback (GH #8719).
@@ -5311,6 +5316,7 @@ func (q *Queries) HasTaskCoveringCompletionFallback(ctx context.Context, arg Has
 		arg.AgentID,
 		arg.CommentID,
 		arg.ExcludeTaskID,
+		arg.HeadSha,
 	)
 	var covered bool
 	err := row.Scan(&covered)
@@ -6183,9 +6189,12 @@ WHERE fallback.author_type = 'agent'
       SELECT 1
       FROM agent_task_queue AS covering
       WHERE covering.issue_id = fallback.issue_id
-        AND (fallback.id = ANY(covering.delivered_comment_ids)
-            OR (covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
-                AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids))))
+        AND (
+            fallback.id = ANY(covering.delivered_comment_ids)
+            OR ((covering.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+                OR (covering.status = 'deferred' AND covering.context->>'channel_issue_media_pending' = 'true'))
+                AND (covering.trigger_comment_id = fallback.id OR fallback.id = ANY(covering.coalesced_comment_ids)))
+        )
   )
 ORDER BY fallback.created_at ASC, fallback.id ASC
 LIMIT $1::int
@@ -7642,6 +7651,7 @@ WHERE id = (
           t.status = 'queued'
           OR (t.status = 'deferred' AND t.context->>'channel_issue_media_pending' = 'true')
       )
+      AND (COALESCE($5::text, '') = '' OR t.context->>'head_sha' = $5::text)
       AND t.trigger_comment_id IS DISTINCT FROM $1::uuid
       AND NOT ($1::uuid = ANY(t.coalesced_comment_ids))
     ORDER BY t.created_at DESC
@@ -7655,6 +7665,7 @@ type MergeCompletionFallbackIntoPendingTaskParams struct {
 	TriggerSummary pgtype.Text `json:"trigger_summary"`
 	IssueID        pgtype.UUID `json:"issue_id"`
 	AgentID        pgtype.UUID `json:"agent_id"`
+	HeadSha        pgtype.Text `json:"head_sha"`
 }
 
 // Fold an uncovered completion fallback (GH #8719) into the coordinator's
@@ -7667,6 +7678,7 @@ func (q *Queries) MergeCompletionFallbackIntoPendingTask(ctx context.Context, ar
 		arg.TriggerSummary,
 		arg.IssueID,
 		arg.AgentID,
+		arg.HeadSha,
 	)
 	var i AgentTaskQueue
 	err := row.Scan(
