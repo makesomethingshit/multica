@@ -4331,35 +4331,16 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !transitioned {
-		// The terminal CAS already ran on an earlier attempt, but that attempt
-		// may have failed its post-completion reconciliation AFTER the commit
-		// (GH #8719), and the daemon replays a terminal callback for exactly
-		// those infrastructure failures. Rerun the recoverable half of this
-		// callback here: the coverage-guarded fallback handoff, then the
-		// comment reconciliation, which re-records what the failed attempt
-		// could not durably settle. Nothing first-completion-only runs again,
-		// and every enqueue below is coverage/dedup checked, so a replay can
-		// never enqueue a second follow-up.
-		h.routeCompletionFallbackComment(r.Context(), task, task.CompletionFallbackCommentID)
-		if err := h.reconcileCommentsOnCompletion(r.Context(), task); err != nil {
-			slog.Warn("complete task: idempotent callback could not settle completion reconciliation; retryable",
-				"task_id", taskID, "error", err)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
 		writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
 		return
 	}
 
 	h.emitIssueExecutedOnFirstCompletion(r, task)
 
-	// GH #8719: a delegated member run that posts nothing still leaves a reply
-	// in the thread — CompleteTask synthesizes it above — but that comment
-	// bypasses CreateComment, so it never reaches the worker-reply routing that
-	// wakes the assigned squad leader. Route it here, through the same trigger
-	// path an explicit reply takes. The completion reconcile below only replays
-	// comments for the agent that just ran, and its timestamp-only replay filter
-	// drops this unplanned comment before it can reach the coordinator.
+	// GH #8719: a synthesized fallback is a platform-generated worker-to-
+	// coordinator lifecycle handoff, not generic comment routing. The shared
+	// service dispatcher applies trusted lineage, coverage and current-HEAD rules;
+	// the durable fallback sweeper recovers transient failures.
 	h.routeCompletionFallbackComment(r.Context(), task, fallbackCommentID)
 
 	// MUL-4195: guarantee at-least-once processing. If a member posted a
@@ -4367,7 +4348,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// it after its context was built), schedule a single follow-up so the
 	// input is not silently dropped. Agent replays are restricted to explicit
 	// mentions and recorded worker inputs; see reconcileCommentsOnCompletion.
-	reconcileErr := h.reconcileCommentsOnCompletion(r.Context(), task)
+	h.reconcileCommentsOnCompletion(r.Context(), task)
 	// The terminal transaction and completion reconciliation are committed.
 	// Wake the owning runtime now so queued work that was blocked by this
 	// task's agent capacity or serialization key is re-claimed immediately.
@@ -4384,17 +4365,6 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("task completed", "task_id", taskID, "agent_id", uuidToString(task.AgentID))
-	if reconcileErr != nil {
-		// The terminal transition is committed, but a comment this run skipped
-		// could not be left durably owed. Report a retryable failure instead of
-		// acknowledging a reconciliation this pass did not finish: the daemon
-		// replays the callback, and the replay path re-records the obligation
-		// (GH #8719). A warning log is not sufficient.
-		slog.Warn("complete task: completion reconciliation did not settle; retryable",
-			"task_id", taskID, "error", reconcileErr)
-		writeError(w, http.StatusInternalServerError, reconcileErr.Error())
-		return
-	}
 	writeJSON(w, http.StatusOK, taskToResponse(*task, workspaceID))
 }
 
@@ -4564,17 +4534,12 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 	return routed, provenInvalid, nil
 }
 
-// reconcileCommentsOnCompletion closes the at-least-once gap for input the
-// completing run did not deliver (MUL-4195). It returns an error when the
-// undelivered set cannot be read, or when an owed retry obligation cannot be
-// written: the terminal callback then reports a retryable failure and the
-// daemon replays it, re-running this pass (GH #8719). Every skipped comment is
-// either routed now, durably owed as a retry obligation, or provably covered
-// by another run -- never silently dropped. First-completion-only side effects
-// stay outside this function so a replay repeats nothing else.
-func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.AgentTaskQueue) error {
+// reconcileCommentsOnCompletion keeps the existing best-effort MUL-4195
+// follow-up routing for input this run did not deliver. Exact recorded
+// completion fallbacks are owned by the durable fallback dispatcher.
+func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.AgentTaskQueue) {
 	if task == nil || !task.IssueID.Valid || !task.AgentID.Valid || !task.CreatedAt.Valid {
-		return nil
+		return
 	}
 	// Re-read the completing row: the in-memory copy predates any delivery
 	// receipts recorded while this run was finishing (e.g. a coordinator run
@@ -4596,13 +4561,12 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		AgentID:           task.AgentID,
 	})
 	if err != nil {
-		// Nothing can be settled durably while the undelivered set is unknown:
-		// report it so the terminal callback stays retryable, and the retried
-		// callback re-runs this pass (GH #8719).
-		return fmt.Errorf("list reconcilable comments for issue %s: %w", uuidToString(task.IssueID), err)
+		slog.Warn("reconcile comments on completion: list comments failed",
+			"issue_id", uuidToString(task.IssueID), "task_id", uuidToString(task.ID), "error", err)
+		return
 	}
 	if len(comments) == 0 {
-		return nil
+		return
 	}
 	// The delivered set is the claim-time receipt, not the enqueue-time plan.
 	// Legacy tasks backfill only the primary trigger, deliberately replaying
@@ -4615,17 +4579,12 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 	}
 	issue, err := h.Queries.GetIssue(ctx, task.IssueID)
 	if err != nil {
-		return fmt.Errorf("load issue %s for completion reconcile: %w", uuidToString(task.IssueID), err)
+		slog.Warn("reconcile comments on completion: load issue failed",
+			"issue_id", uuidToString(task.IssueID), "error", err)
+		return
 	}
 	agentID := uuidToString(task.AgentID)
 	scheduled := 0
-	// scopedReplayableTriggers computes what one comment would route to the
-	// completing agent under CURRENT state, without enqueueing anything. The
-	// retry replay shares this helper, so "would have routed" has exactly one
-	// implementation (GH #8719).
-	scopedReplayableTriggers := func(c db.Comment) ([]commentAgentTrigger, error) {
-		return h.scopedReplayableTriggersForAgent(ctx, issue, agentID, plannedCommentIDs, c)
-	}
 
 	for i := range comments {
 		c := comments[i]
@@ -4636,35 +4595,12 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		if isNoteComment(c.Content) {
 			continue
 		}
-		// A synthesized completion fallback is the durable worker-to-coordinator
-		// handoff (GH #8719), not a fresh generic invocation. A fallback is
-		// the exact comment id recorded on the completing run at synthesis
-		// time — never a shape match. An explicit worker reply carries the
-		// same (agent, source run) shape but has no record, so it is never
-		// reclassified here: it keeps whatever routing (or suppression) the
-		// creation path gave it. Replay the recorded fallback through the
-		// narrow fallback resolver — never generic mention fan-out.
-		// The narrow branch owns these rows: skip the generic routing below
-		// even when the fallback dispatch fails, so a fallback body carrying
-		// @mentions can never be re-parsed as a fresh invocation by THIS or
-		// any other completing task's reconcile pass.
-		// Completion-callback replays (transitioned == false) never reach
-		// here: CompleteTask returns before routing, so replays cannot
-		// duplicate the fallback comment or the coordinator task.
+		// Exact recorded fallback identity is the only completion special case.
+		// Its callback and service sweeper share the durable fallback dispatcher;
+		// never feed its body or mentions into generic comment routing.
 		if c.AuthorType == "agent" && c.SourceTaskID.Valid &&
 			task.CompletionFallbackCommentID.Valid &&
-			uuidToString(c.ID) == uuidToString(task.CompletionFallbackCommentID) &&
-			!slices.Contains(plannedCommentIDs, c.ID) {
-			if _, _, err := h.dispatchCompletionFallback(ctx, task, c.ID); err != nil {
-				slog.Warn("reconcile comments on completion: completion fallback replay failed, fallback comment remains the durable obligation",
-					"issue_id", uuidToString(task.IssueID),
-					"task_id", uuidToString(task.ID),
-					"comment_id", uuidToString(c.ID),
-					"error", err,
-				)
-			} else {
-				scheduled++
-			}
+			uuidToString(c.ID) == uuidToString(task.CompletionFallbackCommentID) {
 			continue
 		}
 		// A delegated failure recovery signal is platform-authored and targets
@@ -4701,18 +4637,8 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 					// fallback sweeper. Skip it here.
 					continue
 				}
-				// Transient infrastructure failure: fail closed (no generic
-				// routing for an unverifiable comment -- a recorded fallback
-				// mentioning this agent must never generic-enqueue), but the
-				// comment itself must not be lost. The durable obligation is
-				// recorded BEFORE anything source-dependent runs: originator
-				// resolution reads this same source row, so asking routing here
-				// would collapse the outage into "nothing was owed" and silently
-				// drop a restricted explicit mention (GH #8719). Lineage and
-				// permission are re-proven at replay instead.
-				if err := h.recordCompletionReconcileRetry(ctx, task.ID, c.ID); err != nil {
-					return err
-				}
+				// Source lineage cannot be verified, so keep this agent-authored
+				// comment out of generic mention routing.
 				continue
 			}
 			if srcTask.CompletionFallbackCommentID.Valid &&
@@ -4724,75 +4650,51 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 				continue
 			}
 		}
-		// Coverage first: a comment another run of THIS agent already carries
-		// is durably covered -- a recorded delivery receipt (any status), a
-		// runnable run that carries it as trigger or planned input, or a
-		// COMPLETED run created for it (its trigger). This is what keeps a
-		// repeated pass idempotent: the daemon replays a terminal callback
-		// after a post-completion infrastructure failure (GH #8719), and that
-		// replay must never enqueue a second follow-up for input one took. A
-		// completed run that merely PLANNED the comment is not coverage -- that
-		// is exactly the state a blocked hand-off leaves behind, and the owed
-		// comment still has to be discharged.
-		covered, err := h.commentCoveredForAgent(ctx, task.IssueID, agentID, c.ID, task.ID)
-		if err != nil {
-			return fmt.Errorf("check reconcilable comment %s coverage: %w", uuidToString(c.ID), err)
+		var parentComment *db.Comment
+		if c.ParentID.Valid {
+			if parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
+				ID:          c.ParentID,
+				WorkspaceID: issue.WorkspaceID,
+			}); err == nil {
+				parentComment = &parent
+			}
 		}
-		if covered {
-			continue
+		actorType := c.AuthorType
+		actorID := uuidToString(c.AuthorID)
+		originatorUserID := actorID
+		if actorType != "member" {
+			originatorUserID = uuidToString(h.TaskService.ResolveOriginatorFromTriggerComment(ctx, issue.WorkspaceID, c.ID))
 		}
-		// The obligation is recorded BEFORE any routing runs (GH #8719).
-		// Routing reads source lineage, invocation permission, squad
-		// leadership and readiness state, and ANY of those reads can fail or
-		// deny for reasons that say nothing about whether this comment is
-		// owed: recording afterwards would let a failed or empty computation
-		// erase a promised follow-up. A settled outcome clears the obligation
-		// again below; anything this pass cannot settle stays owed for the
-		// runtime sweep, which re-decides from current state.
-		if err := h.recordCompletionReconcileRetry(ctx, task.ID, c.ID); err != nil {
-			return err
+		triggers, _ := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, actorType, actorID, commentTriggerComputeOptions{
+			ExcludeTriggerCommentID: c.ID,
+			AuthoringTaskID:         c.SourceTaskID,
+			OriginatorUserID:        originatorUserID,
+		})
+		if actorType != "member" {
+			triggers = keepReplayableAgentTriggers(triggers, slices.Contains(plannedCommentIDs, c.ID))
 		}
-		scoped, routeErr := scopedReplayableTriggers(c)
-		if routeErr != nil {
-			slog.Warn("completion reconcile routing is indeterminate; retry obligation remains owed",
-				"comment_id", uuidToString(c.ID), "error", routeErr)
-			continue
+		scoped := make([]commentAgentTrigger, 0, 1)
+		for _, trigger := range triggers {
+			if uuidToString(trigger.Agent.ID) == agentID {
+				scoped = append(scoped, trigger)
+			}
 		}
 		if len(scoped) == 0 {
 			continue
 		}
 		// The first qualifying comment enqueues the follow-up task; later ones
-		// find it AlreadyPending and merge in, so all undelivered comments end
-		// up covered by a single bounded run.
-		//
-		// A BLOCKED replay must not be discarded (#5914, Elon round 8): the slot
-		// can be held by a task that will never see this comment (it predates that
-		// task and is not in its planned ids), so dropping the failure here is
-		// exactly how a promised follow-up is lost. Hand the obligation to that
-		// blocker instead, keeping it alive until some run provably covers it.
-		// The durable retry obligation recorded above stays in place on this
-		// path as well, so even a failed hand-off cannot drop the comment: the
-		// runtime sweep re-decides it once the blocker changes state.
+		// merge into it.
 		res := h.enqueueCommentAgentTriggers(ctx, issue, c.ID, scoped)[agentID]
 		if res.status == DispatchBlocked {
 			headSha := h.TaskService.ResolveIssueReviewSHAParam(ctx, task.IssueID)
 			if h.propagateUncoveredCommentObligation(ctx, issue, scoped[0], c.ID, headSha) {
-				slog.Info("reconcile comments on completion: replay blocked, obligation handed to the active task",
+				slog.Info("reconcile comments on completion: blocked input handed to the active task",
 					"issue_id", uuidToString(task.IssueID), "agent_id", agentID, "comment_id", uuidToString(c.ID))
 			} else {
-				// The slot is held by a DIFFERENT-head queued task: it can neither
-				// cover this comment nor accept it (merging would let an old-head
-				// run consume a new-head request — TEN-356). The durable retry
-				// obligation keeps the comment owed until that changes, so this is
-				// a loud trace rather than a lost promise.
-				slog.Error("reconcile comments on completion: replay blocked and hand-off refused; the durable retry obligation keeps it owed",
+				slog.Error("reconcile comments on completion: blocked input could not be handed off",
 					"issue_id", uuidToString(task.IssueID), "agent_id", agentID, "comment_id", uuidToString(c.ID),
 					"reason", res.reason)
 			}
-		} else {
-			// Success-shaped (queued / coalesced / deferred): a run now owns this
-			// comment, so the obligation recorded above is discharged.
-			h.clearResolvedCompletionReconcileRetry(ctx, task.ID, uuidToString(c.ID))
 		}
 		scheduled++
 	}
@@ -4803,321 +4705,7 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 			"agent_id", agentID,
 			"undelivered_comments", scheduled)
 	}
-	return nil
-}
-
-// recordCompletionReconcileRetry persists ONE durable obligation for a comment
-// this completing pass could not route because a source-dependent read failed
-// (GH #8719). It runs BEFORE any source-dependent authorization: originator
-// resolution reads the same source row, so computing routing during such an
-// outage collapses "unreadable" into "nothing was owed" and drops a restricted
-// explicit mention. What is stored is the comment IDENTITY -- the obligation
-// to reconsider this comment for this agent -- never a cached authorization or
-// routing decision. A write failure is returned, never swallowed, so the
-// completion callback reports a retryable failure instead of acknowledging a
-// reconciliation it did not durably leave owed.
-func (h *Handler) recordCompletionReconcileRetry(ctx context.Context, taskID, commentID pgtype.UUID) error {
-	if err := h.Queries.RecordCompletionReconcileRetryComment(ctx, db.RecordCompletionReconcileRetryCommentParams{
-		TaskID:    taskID,
-		CommentID: commentID,
-	}); err != nil {
-		slog.Warn("recording completion reconcile retry failed",
-			"task_id", uuidToString(taskID),
-			"comment_id", uuidToString(commentID),
-			"error", err,
-		)
-		return fmt.Errorf("record completion reconcile retry for comment %s: %w", uuidToString(commentID), err)
-	}
-	return nil
-}
-
-// scopedReplayableTriggersForAgent computes what one comment currently routes
-// to `agentID`, WITHOUT enqueueing anything. Completion reconciliation and the
-// retry replay both go through it, so "would this reach the agent" has exactly
-// one implementation (GH #8719): the same invoke gate (canInvokeAgent), the
-// same squad-leader resolution, the same thread-parent role demotion, and the
-// same readiness verdicts a freshly posted comment takes.
-//
-// The comment is routed under its OWN author_type. A member is its own
-// originator. For an agent author, the originator is the human at the top of
-// that agent's trigger chain (resolved from the comment's source task);
-// canInvokeAgent judges an agent-to-agent (A2A) mention by that originator,
-// not by the immediate agent principal (MUL-3963).
-//
-// Agent replies discovered only by timestamp must not start a new
-// conversation: only explicit mentions are replayed, plus a worker reply the
-// creation path already accepted and recorded in the run's input plan
-// (plannedCommentIDs). Recomputed routing still checks current permissions and
-// the self-trigger guard.
-func (h *Handler) scopedReplayableTriggersForAgent(ctx context.Context, issue db.Issue, agentID string, plannedCommentIDs []pgtype.UUID, c db.Comment) ([]commentAgentTrigger, error) {
-	var parentComment *db.Comment
-	if c.ParentID.Valid {
-		parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
-			ID:          c.ParentID,
-			WorkspaceID: issue.WorkspaceID,
-		})
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("load retry parent: %w", err)
-		}
-		if err == nil {
-			parentComment = &parent
-		}
-	}
-	actorType := c.AuthorType
-	actorID := uuidToString(c.AuthorID)
-	originatorUserID := actorID
-	if actorType != "member" {
-		originator, err := h.TaskService.ResolveOriginatorFromCommentChecked(ctx, c)
-		if err != nil {
-			return nil, fmt.Errorf("resolve retry originator: %w", err)
-		}
-		originatorUserID = uuidToString(originator)
-	}
-	var routingReadErr error
-	triggers, _ := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, actorType, actorID, commentTriggerComputeOptions{
-		ExcludeTriggerCommentID: c.ID,
-		AuthoringTaskID:         c.SourceTaskID,
-		OriginatorUserID:        originatorUserID,
-		routingReadError:        &routingReadErr,
-	})
-	if routingReadErr != nil {
-		return nil, fmt.Errorf("resolve current retry routing: %w", routingReadErr)
-	}
-	if actorType != "member" {
-		triggers = keepReplayableAgentTriggers(triggers, slices.Contains(plannedCommentIDs, c.ID))
-	}
-	// Keep ONLY the agent that just completed -- never the full fan-out (that
-	// would re-wake unrelated `@other-agent` targets).
-	scoped := make([]commentAgentTrigger, 0, 1)
-	for _, trigger := range triggers {
-		if uuidToString(trigger.Agent.ID) == agentID {
-			scoped = append(scoped, trigger)
-		}
-	}
-	return scoped, nil
-}
-
-// commentCoveredForAgent reports whether an undelivered reconcile candidate is
-// already owned by ANOTHER run of this agent on this issue (see
-// HasTaskCarryingCommentForAgent). excludeTaskID is the completing run itself:
-// an undelivered planned input of that run is exactly what a reconcile
-// candidate is, so it must never count as its own carrier. Shared by the
-// completion pass and the retry replay so a repeated pass can never enqueue a
-// second follow-up for input a run already carries.
-func (h *Handler) commentCoveredForAgent(ctx context.Context, issueID pgtype.UUID, agentID string, commentID, excludeTaskID pgtype.UUID) (bool, error) {
-	var agentUUID pgtype.UUID
-	if err := agentUUID.Scan(agentID); err != nil {
-		return false, fmt.Errorf("parse coverage-check agent id %q: %w", agentID, err)
-	}
-	return h.Queries.HasTaskCarryingCommentForAgent(ctx, db.HasTaskCarryingCommentForAgentParams{
-		IssueID:       issueID,
-		AgentID:       agentUUID,
-		CommentID:     commentID,
-		ExcludeTaskID: excludeTaskID,
-	})
-}
-
-// CompletionReconcileRetrySweepResult reports one bounded replay round of the
-// completion-reconcile outbox (GH #8719).
-type CompletionReconcileRetrySweepResult struct {
-	// Scanned is how many runs carried obligations this round.
-	Scanned int
-	// Replayed is how many of them had at least one obligation settled.
-	Replayed int
-}
-
-// ReplayCompletionReconcileRetries is the runtime sweep's entry point for the
-// durable obligations completion reconciliation left behind (GH #8719). Every
-// element is re-routed through CURRENT comment routing -- the same computation
-// a freshly posted comment takes -- so the CURRENT invocation permission,
-// squad leadership, thread-parent role and readiness decide the outcome, not
-// what happened to hold when the skip was recorded. It runs inside the
-// existing sweep tick; it adds no loop of its own.
-func (h *Handler) ReplayCompletionReconcileRetries(ctx context.Context, maxPerTick int32) (CompletionReconcileRetrySweepResult, error) {
-	result := CompletionReconcileRetrySweepResult{}
-	if maxPerTick <= 0 {
-		return result, nil
-	}
-	rows, err := h.Queries.ListCompletionReconcileRetryObligations(ctx, maxPerTick)
-	if err != nil {
-		return result, fmt.Errorf("list completion reconcile retries: %w", err)
-	}
-	result.Scanned = len(rows)
-	errs := make([]error, 0, len(rows))
-	for _, row := range rows {
-		resolved, err := h.replayCompletionReconcileRetryRow(ctx, row)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("replay completion reconcile retry %s: %w", uuidToString(row.ID), err))
-			continue
-		}
-		if resolved > 0 {
-			result.Replayed++
-		}
-	}
-	return result, errors.Join(errs...)
-}
-
-// replayCompletionReconcileRetryRow replays one run's obligations. Resolution
-// is per element: a missing comment, a provably-gone source row, an exact
-// recorded completion fallback, a delegated-failure recovery signal, a
-// comment another run already carries, or current routing that no longer
-// addresses this agent all settle (drop) the element; anything transient stays
-// owed for the next sweep. It returns how many elements resolved.
-func (h *Handler) replayCompletionReconcileRetryRow(ctx context.Context, row db.ListCompletionReconcileRetryObligationsRow) (int, error) {
-	var raw []json.RawMessage
-	if err := json.Unmarshal(row.CompletionReconcileRetryObligations, &raw); err != nil {
-		slog.Warn("completion reconcile retry obligations unreadable; skipping tick",
-			"task_id", uuidToString(row.ID),
-			"error", err,
-		)
-		return 0, nil
-	}
-	issue, err := h.Queries.GetIssue(ctx, row.IssueID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// The issue is gone: nothing can ever be routed for these
-			// elements, so settle them instead of reselecting them every tick.
-			for _, r := range raw {
-				if id := reconcileRetryCommentID(r); id != "" {
-					h.clearResolvedCompletionReconcileRetry(ctx, row.ID, id)
-				}
-			}
-			return len(raw), nil
-		}
-		return 0, fmt.Errorf("load retry issue: %w", err)
-	}
-	// The run's own planned inputs travel with the row: the same accepted-worker-
-	// reply filter the completing pass applied is applied here, so an owed worker
-	// reply stays replayable while a timestamp-only agent reply stays excluded.
-	plannedCommentIDs := append([]pgtype.UUID{}, row.CoalescedCommentIds...)
-	if row.TriggerCommentID.Valid {
-		plannedCommentIDs = append(plannedCommentIDs, row.TriggerCommentID)
-	}
-	resolved := 0
-	for _, r := range raw {
-		commentID := reconcileRetryCommentID(r)
-		if commentID == "" {
-			slog.Warn("completion reconcile retry element unreadable; dropping",
-				"task_id", uuidToString(row.ID),
-			)
-			continue
-		}
-		done, err := h.replayOneCompletionReconcileRetry(ctx, issue, row.ID, row.AgentID, plannedCommentIDs, commentID)
-		if err != nil {
-			return resolved, err
-		}
-		if done {
-			h.clearResolvedCompletionReconcileRetry(ctx, row.ID, commentID)
-			resolved++
-		}
-	}
-	return resolved, nil
-}
-
-// reconcileRetryCommentID leniently extracts the comment id from a stored
-// obligation element so a partially malformed element can still be dropped.
-// Writers emit strict JSON, so this is defensive-only.
-func reconcileRetryCommentID(r json.RawMessage) string {
-	var probe map[string]any
-	if err := json.Unmarshal(r, &probe); err != nil {
-		return ""
-	}
-	id, _ := probe["comment_id"].(string)
-	return id
-}
-
-// clearResolvedCompletionReconcileRetry drops one settled element by comment
-// id, leaving obligations recorded concurrently by another pass untouched.
-// Failures only warn: the element settles again on the next sweep.
-func (h *Handler) clearResolvedCompletionReconcileRetry(ctx context.Context, taskID pgtype.UUID, commentID string) {
-	if err := h.Queries.ClearResolvedCompletionReconcileRetry(ctx, db.ClearResolvedCompletionReconcileRetryParams{
-		TaskID:    taskID,
-		CommentID: commentID,
-	}); err != nil {
-		slog.Warn("clearing resolved completion reconcile retry failed",
-			"task_id", uuidToString(taskID),
-			"comment_id", commentID,
-			"error", err,
-		)
-	}
-}
-
-// replayOneCompletionReconcileRetry re-decides ONE owed comment for the
-// completing agent. True settles the obligation (routed, covered, or
-// permanently unroutable); a transient failure returns an error so the
-// obligation survives to the next sweep. A blocked dispatch settles nothing:
-// the comment stays owed and is re-evaluated on the next tick.
-func (h *Handler) replayOneCompletionReconcileRetry(ctx context.Context, issue db.Issue, taskID, agentID pgtype.UUID, plannedCommentIDs []pgtype.UUID, commentID string) (bool, error) {
-	cid, err := util.ParseUUID(commentID)
-	if err != nil {
-		slog.Warn("completion reconcile retry comment id unparseable; dropping",
-			"comment_id", commentID,
-			"error", err,
-		)
-		return true, nil
-	}
-	comment, err := h.Queries.GetComment(ctx, cid)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return true, nil
-		}
-		return false, fmt.Errorf("load retry comment: %w", err)
-	}
-	// Source lineage is re-proven now that reads recovered: an exact recorded
-	// completion fallback is a narrow handoff owned by the fallback path, never
-	// generic input, even when its body carries a mention (GH #8719).
-	if comment.AuthorType == "agent" && comment.SourceTaskID.Valid {
-		srcTask, err := h.Queries.GetAgentTask(ctx, comment.SourceTaskID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				// The authoring run is provably gone: its lineage can never be
-				// proven, and generic routing of an unattributable agent
-				// comment would fail closed anyway.
-				return true, nil
-			}
-			return false, fmt.Errorf("load retry source task: %w", err)
-		}
-		if srcTask.CompletionFallbackCommentID.Valid &&
-			uuidToString(srcTask.CompletionFallbackCommentID) == uuidToString(comment.ID) {
-			return true, nil
-		}
-	}
-	// A delegated-failure recovery signal is platform-owned input: its own
-	// durable outbox delivers it, and generic routing treats system authors as
-	// unattributed by design.
-	if service.IsDelegatedFailureRecoveryComment(comment) {
-		return true, nil
-	}
-	covered, err := h.commentCoveredForAgent(ctx, issue.ID, uuidToString(agentID), cid, taskID)
-	if err != nil {
-		return false, fmt.Errorf("check retry coverage: %w", err)
-	}
-	if covered {
-		return true, nil
-	}
-	// Current routing, scoped to the completing agent. No trigger resolved here
-	// means the comment no longer addresses this agent -- revoked permission,
-	// archived or unready target, reassigned squad leader, demoted thread-parent
-	// role, deleted topology. The obligation is settled without an enqueue,
-	// exactly as fresh comment routing would decide now.
-	scoped, err := h.scopedReplayableTriggersForAgent(ctx, issue, uuidToString(agentID), plannedCommentIDs, comment)
-	if err != nil {
-		return false, err
-	}
-	if len(scoped) == 0 {
-		return true, nil
-	}
-	res := h.enqueueCommentAgentTriggers(ctx, issue, comment.ID, scoped)[uuidToString(agentID)]
-	if res.status == DispatchBlocked {
-		slog.Warn("completion reconcile retry blocked; obligation stays owed for the next sweep",
-			"issue_id", uuidToString(issue.ID),
-			"agent_id", uuidToString(agentID),
-			"comment_id", uuidToString(comment.ID),
-			"reason", res.reason,
-		)
-		return false, nil
-	}
-	return true, nil
+	return
 }
 
 // keepReplayableAgentTriggers preserves explicit mentions (MUL-4304) and

@@ -277,32 +277,6 @@ func (s *TaskService) ResolveOriginatorFromTriggerComment(ctx context.Context, w
 	return s.resolveOriginatorFromTriggerComment(ctx, workspaceID, commentID)
 }
 
-// ResolveOriginatorFromCommentChecked resolves the current comment authoring run
-// without hiding transient source-task lookup failures from durable retries.
-func (s *TaskService) ResolveOriginatorFromCommentChecked(ctx context.Context, comment db.Comment) (pgtype.UUID, error) {
-	if s == nil || s.Queries == nil {
-		return pgtype.UUID{}, nil
-	}
-	facts := attribution.CommentFacts{
-		CommentID:  comment.ID,
-		AuthorType: comment.AuthorType,
-		AuthorID:   comment.AuthorID,
-	}
-	if comment.AuthorType == "agent" && comment.SourceTaskID.Valid {
-		facts.SourceTaskID = comment.SourceTaskID
-		parent, err := s.Queries.GetAgentTask(ctx, comment.SourceTaskID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return pgtype.UUID{}, nil
-			}
-			return pgtype.UUID{}, err
-		}
-		facts.ParentOriginator = parent.OriginatorUserID
-		facts.ParentAccountable = parent.AccountableUserID
-	}
-	return attribution.ClassifyComment(facts, attribution.SourceCommentSource).UserID, nil
-}
-
 // AttributionForMergedComment resolves the FULL attribution snapshot for a comment
 // being coalesced into an already-queued task (MUL-4302). A merge re-attributes the
 // run to the newly-arrived comment's human, so the whole snapshot — source, evidence,

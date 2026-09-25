@@ -1557,20 +1557,8 @@ type commentTriggerComputeOptions struct {
 	// A2A invocation token (GH #8719). The fallback resolver copies the
 	// worker's delegation lineage directly instead.
 	OriginatorUserID string
-	routingReadError *error
 }
 
-func (opts commentTriggerComputeOptions) recordRoutingReadError(err error) {
-	if opts.routingReadError != nil && err != nil && !errors.Is(err, pgx.ErrNoRows) && *opts.routingReadError == nil {
-		*opts.routingReadError = err
-	}
-}
-
-func (h *Handler) canInvokeCommentTarget(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string, opts commentTriggerComputeOptions) bool {
-	allowed, err := h.canInvokeAgentChecked(ctx, agent, actorType, actorID, originatorUserID, workspaceID)
-	opts.recordRoutingReadError(err)
-	return allowed
-}
 func commentAgentTriggerReason(trigger commentAgentTrigger) string {
 	switch trigger.Source {
 	case commentTriggerSourceIssueAssignee:
@@ -2692,8 +2680,8 @@ func (h *Handler) enqueueSingleCommentTrigger(ctx context.Context, issue db.Issu
 		// the conversation path, the replied-to comment's own authoring task
 		// for the thread-parent path. Gating on the source as well would keep
 		// the thread-parent path demoted for no reason (MUL-7006).
-		// The completion fallback uses the shared service dispatcher instead of
-		// this generic comment enqueue path.
+		// Completion fallbacks use the TaskService dispatcher, not this generic
+		// comment enqueue path.
 		if trigger.Squad != nil {
 			_, err = h.TaskService.EnqueueTaskForSquadLeader(ctx, issue, trigger.Agent.ID, trigger.Squad.ID, triggerCommentID, service.OriginNamed)
 		} else {
@@ -2835,20 +2823,18 @@ func (h *Handler) routeReplyToParentAuthor(ctx context.Context, issue db.Issue, 
 		ID:          parent.AuthorID,
 		WorkspaceID: issue.WorkspaceID,
 	})
-	opts.recordRoutingReadError(err)
 	if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
 		return commentAgentTrigger{}, false
 	}
-	if !h.canInvokeCommentTarget(ctx, agent, authorType, authorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID), opts) {
+	if !h.canInvokeAgent(ctx, agent, authorType, authorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID)) {
 		return commentAgentTrigger{}, false
 	}
 	hasPending, err := h.hasPendingTaskForIssueAndAgent(ctx, issue.ID, parent.AuthorID, opts)
 	if err != nil {
-		opts.recordRoutingReadError(err)
 		return commentAgentTrigger{}, false
 	}
 	trigger := commentAgentTrigger{Agent: agent, Source: commentTriggerSourceThreadParent, AlreadyPending: hasPending}
-	if squad, ok := h.squadLeaderRoleOfAuthoringTask(ctx, issue, *parent, agent, opts); ok {
+	if squad, ok := h.squadLeaderRoleOfAuthoringTask(ctx, issue, *parent, agent); ok {
 		trigger.Squad = squad
 	}
 	return trigger, true
@@ -2886,27 +2872,19 @@ func (h *Handler) routeReplyToParentAuthor(ctx context.Context, issue db.Issue, 
 // both outlive the deletion. GetSquadInWorkspace does not filter archived_at —
 // reviving a deleted squad from a stale comment would be a role this issue no
 // longer has any assignment for — so the archived check belongs here.
-func (h *Handler) squadLeaderRoleOfAuthoringTask(ctx context.Context, issue db.Issue, parent db.Comment, agent db.Agent, opts commentTriggerComputeOptions) (*db.Squad, bool) {
+func (h *Handler) squadLeaderRoleOfAuthoringTask(ctx context.Context, issue db.Issue, parent db.Comment, agent db.Agent) (*db.Squad, bool) {
 	if !parent.SourceTaskID.Valid {
 		return nil, false
 	}
 	task, err := h.Queries.GetAgentTask(ctx, parent.SourceTaskID)
-	if err != nil {
-		opts.recordRoutingReadError(err)
-		return nil, false
-	}
-	if !task.IsLeaderTask || !task.SquadID.Valid {
+	if err != nil || !task.IsLeaderTask || !task.SquadID.Valid {
 		return nil, false
 	}
 	squad, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{
 		ID:          task.SquadID,
 		WorkspaceID: issue.WorkspaceID,
 	})
-	if err != nil {
-		opts.recordRoutingReadError(err)
-		return nil, false
-	}
-	if squad.ArchivedAt.Valid || uuidToString(squad.LeaderID) != uuidToString(agent.ID) {
+	if err != nil || squad.ArchivedAt.Valid || uuidToString(squad.LeaderID) != uuidToString(agent.ID) {
 		return nil, false
 	}
 	return &squad, true
@@ -2935,7 +2913,6 @@ func (h *Handler) routeGuestSquadLeaderFallback(ctx context.Context, issue db.Is
 	if err != nil || workerTask.IsLeaderTask || !workerTask.AgentID.Valid ||
 		uuidToString(workerTask.AgentID) != authorID || !workerTask.IssueID.Valid ||
 		uuidToString(workerTask.IssueID) != uuidToString(issue.ID) || !taskCoversReplyParent(workerTask, parent.ID) {
-		opts.recordRoutingReadError(err)
 		return nil, false
 	}
 	if !parent.SourceTaskID.Valid {
@@ -2944,7 +2921,6 @@ func (h *Handler) routeGuestSquadLeaderFallback(ctx context.Context, issue db.Is
 	leaderTask, err := h.Queries.GetAgentTask(ctx, parent.SourceTaskID)
 	if err != nil || !leaderTask.IsLeaderTask || !leaderTask.SquadID.Valid ||
 		!leaderTask.AgentID.Valid || leaderTask.AgentID != parent.AuthorID {
-		opts.recordRoutingReadError(err)
 		return nil, false
 	}
 	// Preserve the established assigned-squad path when this delegation came
@@ -2970,7 +2946,6 @@ func (h *Handler) routeThreadRootOwners(ctx context.Context, issue db.Issue, par
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil || !root.ID.Valid || root.AuthorType != "member" {
-		opts.recordRoutingReadError(err)
 		return nil, false
 	}
 	return h.routeConversationOwnersForRoot(ctx, issue, root, memberID, opts)
@@ -2994,7 +2969,6 @@ func (h *Handler) routeConversationOwnersForRoot(ctx context.Context, issue db.I
 		IssueID: issue.ID, TriggerCommentID: root.ID,
 	})
 	if err != nil {
-		opts.recordRoutingReadError(err)
 		return nil, false
 	}
 	if len(owners) == 0 {
@@ -3031,7 +3005,6 @@ func (h *Handler) routeFirstExplicitRootMentionOwner(ctx context.Context, issue 
 				WorkspaceID: issue.WorkspaceID,
 			})
 			if err != nil {
-				opts.recordRoutingReadError(err)
 				return commentAgentTrigger{}, true, false
 			}
 			trigger, ok := h.routeConversationContinuationToAgent(ctx, issue, squad.LeaderID, squadID, memberID, opts)
@@ -3050,15 +3023,13 @@ func (h *Handler) routeConversationContinuationToAgent(ctx context.Context, issu
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
-		opts.recordRoutingReadError(err)
 		return commentAgentTrigger{}, false
 	}
-	if !h.canInvokeCommentTarget(ctx, agent, "member", memberID, memberID, uuidToString(issue.WorkspaceID), opts) {
+	if !h.canInvokeAgent(ctx, agent, "member", memberID, memberID, uuidToString(issue.WorkspaceID)) {
 		return commentAgentTrigger{}, false
 	}
 	hasPending, err := h.hasPendingTaskForIssueAndAgent(ctx, issue.ID, agentID, opts)
 	if err != nil {
-		opts.recordRoutingReadError(err)
 		return commentAgentTrigger{}, false
 	}
 	trigger := commentAgentTrigger{Agent: agent, Source: commentTriggerSourceConversation, AlreadyPending: hasPending}
@@ -3068,8 +3039,6 @@ func (h *Handler) routeConversationContinuationToAgent(ctx context.Context, issu
 			WorkspaceID: issue.WorkspaceID,
 		}); err == nil {
 			trigger.Squad = &squad
-		} else {
-			opts.recordRoutingReadError(err)
 		}
 	}
 	return trigger, true
@@ -3115,30 +3084,24 @@ func (h *Handler) routeAssignedSquadLeaderFallback(ctx context.Context, issue db
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil {
-		opts.recordRoutingReadError(err)
 		return commentAgentTrigger{}, false
 	}
-	if authorType == "agent" && authorID == uuidToString(squad.LeaderID) {
-		suppress, suppressErr := h.shouldSuppressSquadLeaderSelfTriggerChecked(ctx, issue.ID, squad.LeaderID, squad.ID)
-		opts.recordRoutingReadError(suppressErr)
-		if suppress {
-			return commentAgentTrigger{}, false
-		}
+	if authorType == "agent" && authorID == uuidToString(squad.LeaderID) &&
+		h.shouldSuppressSquadLeaderSelfTrigger(ctx, issue.ID, squad.LeaderID, squad.ID) {
+		return commentAgentTrigger{}, false
 	}
 	agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
 		ID:          squad.LeaderID,
 		WorkspaceID: issue.WorkspaceID,
 	})
 	if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
-		opts.recordRoutingReadError(err)
 		return commentAgentTrigger{}, false
 	}
-	if !h.canInvokeCommentTarget(ctx, agent, authorType, authorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID), opts) {
+	if !h.canInvokeAgent(ctx, agent, authorType, authorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID)) {
 		return commentAgentTrigger{}, false
 	}
 	hasPending, err := h.hasPendingTaskForIssueAndAgent(ctx, issue.ID, squad.LeaderID, opts)
 	if err != nil {
-		opts.recordRoutingReadError(err)
 		return commentAgentTrigger{}, false
 	}
 	return commentAgentTrigger{Agent: agent, Source: commentTriggerSourceIssueAssignee, Squad: &squad, AlreadyPending: hasPending}, true
@@ -3150,17 +3113,7 @@ func (h *Handler) hasPendingTaskForIssueAndAgent(ctx context.Context, issueID, a
 	}
 	// Key dedup on the reviewed head so re-pushing to the PR mid-review
 	// invalidates dedup and a fresh run enqueues against the new HEAD (TEN-356).
-	var headSha pgtype.Text
-	if opts.routingReadError != nil {
-		sha, err := h.TaskService.ResolveIssueReviewSHAChecked(ctx, issueID)
-		if err != nil {
-			opts.recordRoutingReadError(err)
-			return false, err
-		}
-		headSha = pgtype.Text{String: sha, Valid: sha != ""}
-	} else {
-		headSha = h.TaskService.ResolveIssueReviewSHAParam(ctx, issueID)
-	}
+	headSha := h.TaskService.ResolveIssueReviewSHAParam(ctx, issueID)
 	if opts.ExcludeTriggerCommentID.Valid {
 		return h.Queries.HasPendingTaskForIssueAndAgentExcludingTriggerCommentInThread(ctx, db.HasPendingTaskForIssueAndAgentExcludingTriggerCommentInThreadParams{
 			ThreadCommentID:         opts.ThreadCommentID,
@@ -3297,7 +3250,6 @@ func (h *Handler) resolveMentionedAgentCommentTriggers(ctx context.Context, issu
 				WorkspaceID: issue.WorkspaceID,
 			})
 			if err != nil {
-				opts.recordRoutingReadError(err)
 				blockTarget("squad", m.ID, ReasonTargetUnavailable)
 				continue
 			}
@@ -3310,29 +3262,24 @@ func (h *Handler) resolveMentionedAgentCommentTriggers(ctx context.Context, issu
 			// task is still active (its reconcile covers this comment); a query
 			// failure is a non-success internal_error, never a fabricated
 			// deferred; otherwise nothing runs → self_trigger_suppressed.
-			if authorType == "agent" && authorID == uuidToString(leaderID) {
-				suppress, suppressErr := h.shouldSuppressSquadLeaderSelfTriggerChecked(ctx, issue.ID, leaderID, squad.ID)
-				opts.recordRoutingReadError(suppressErr)
-				if suppress {
-					active, activeErr := h.hasActiveTaskForIssueAndAgent(ctx, issue.ID, leaderID, opts.ThreadCommentID)
-					opts.recordRoutingReadError(activeErr)
-					status, reason := decideSuppressedLeaderOutcome(active, activeErr)
-					addTarget(commentMentionTarget{TargetType: "squad", TargetID: m.ID, Status: status, ReasonCode: reason})
-					continue
-				}
+			if authorType == "agent" && authorID == uuidToString(leaderID) &&
+				h.shouldSuppressSquadLeaderSelfTrigger(ctx, issue.ID, leaderID, squad.ID) {
+				active, activeErr := h.hasActiveTaskForIssueAndAgent(ctx, issue.ID, leaderID, opts.ThreadCommentID)
+				status, reason := decideSuppressedLeaderOutcome(active, activeErr)
+				addTarget(commentMentionTarget{TargetType: "squad", TargetID: m.ID, Status: status, ReasonCode: reason})
+				continue
 			}
 			agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
 				ID:          leaderID,
 				WorkspaceID: issue.WorkspaceID,
 			})
 			if err != nil {
-				opts.recordRoutingReadError(err)
 				blockTarget("squad", m.ID, ReasonTargetUnavailable)
 				continue
 			}
 			// Private-leader gate first (enumeration-safe: a caller who cannot
 			// invoke the leader never learns its archived/runtime state).
-			if !h.canInvokeCommentTarget(ctx, agent, authorType, authorID, opts.OriginatorUserID, wsID, opts) {
+			if !h.canInvokeAgent(ctx, agent, authorType, authorID, opts.OriginatorUserID, wsID) {
 				blockTarget("squad", m.ID, ReasonInvocationNotAllowed)
 				continue
 			}
@@ -3341,15 +3288,12 @@ func (h *Handler) resolveMentionedAgentCommentTriggers(ctx context.Context, issu
 				continue
 			}
 			// Same shared verdict as the direct-agent branch below.
-			verdict, readinessErr := service.AgentReadiness(ctx, h.runtimeLookup(obsmetrics.RuntimeLookupSourceComment), agent)
-			opts.recordRoutingReadError(readinessErr)
-			if readinessErr == nil && verdict.Blocked() {
+			if verdict, err := service.AgentReadiness(ctx, h.runtimeLookup(obsmetrics.RuntimeLookupSourceComment), agent); err == nil && verdict.Blocked() {
 				blockUnusableTarget("squad", m.ID, agent, verdict)
 				continue
 			}
 			hasPending, err := h.hasPendingTaskForIssueAndAgent(ctx, issue.ID, leaderID, opts)
 			if err != nil {
-				opts.recordRoutingReadError(err)
 				blockTarget("squad", m.ID, ReasonInternalError)
 				continue
 			}
@@ -3383,14 +3327,13 @@ func (h *Handler) resolveMentionedAgentCommentTriggers(ctx context.Context, issu
 			WorkspaceID: issue.WorkspaceID,
 		})
 		if err != nil {
-			opts.recordRoutingReadError(err)
 			// Do not reveal whether the id exists (it may be a private agent in
 			// another workspace): the generic invocation_not_allowed is returned.
 			blockTarget("agent", m.ID, ReasonInvocationNotAllowed)
 			continue
 		}
 		// Private-agent gate first, before any archived/runtime state is read.
-		if !h.canInvokeCommentTarget(ctx, agent, authorType, authorID, opts.OriginatorUserID, wsID, opts) {
+		if !h.canInvokeAgent(ctx, agent, authorType, authorID, opts.OriginatorUserID, wsID) {
 			blockTarget("agent", m.ID, ReasonInvocationNotAllowed)
 			continue
 		}
@@ -3404,15 +3347,12 @@ func (h *Handler) resolveMentionedAgentCommentTriggers(ctx context.Context, issu
 		// will not start doing so on its own (MUL-6164). A merely offline
 		// runtime keeps queueing — that wait ends by itself when the machine
 		// returns, and taking it away would remove a behaviour people rely on.
-		verdict, readinessErr := service.AgentReadiness(ctx, h.runtimeLookup(obsmetrics.RuntimeLookupSourceComment), agent)
-		opts.recordRoutingReadError(readinessErr)
-		if readinessErr == nil && verdict.Blocked() {
+		if verdict, err := service.AgentReadiness(ctx, h.runtimeLookup(obsmetrics.RuntimeLookupSourceComment), agent); err == nil && verdict.Blocked() {
 			blockUnusableTarget("agent", m.ID, agent, verdict)
 			continue
 		}
 		hasPending, err := h.hasPendingTaskForIssueAndAgent(ctx, issue.ID, agentUUID, opts)
 		if err != nil {
-			opts.recordRoutingReadError(err)
 			blockTarget("agent", m.ID, ReasonInternalError)
 			continue
 		}

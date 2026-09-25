@@ -173,18 +173,9 @@ func runRuntimeSweeper(ctx context.Context, queries *db.Queries, liveness handle
 	})
 }
 
-// completionReconcileRetryReplayer replays the durable obligations completion
-// reconciliation left behind (GH #8719). It is implemented by the handler,
-// because deciding whether an owed comment still reaches its completing agent
-// means re-running the comment-routing policy that lives there. The sweep tick
-// itself stays here.
-type completionReconcileRetryReplayer interface {
-	ReplayCompletionReconcileRetries(ctx context.Context, maxPerTick int32) (handler.CompletionReconcileRetrySweepResult, error)
-}
-
-func runDelegatedFailureRecoverySweeper(ctx context.Context, taskSvc *service.TaskService, reconcileRetries completionReconcileRetryReplayer) {
+func runDelegatedFailureRecoverySweeper(ctx context.Context, taskSvc *service.TaskService) {
 	runPeriodicSweep(ctx, delegatedFailureRecoverySweepInterval, func() {
-		sweepPendingDelegatedFailureRecoveries(ctx, taskSvc, reconcileRetries)
+		sweepPendingDelegatedFailureRecoveries(ctx, taskSvc)
 	})
 }
 
@@ -198,7 +189,7 @@ func runRuntimeGCSweeper(ctx context.Context, txStarter runtimeGCTxStarter, quer
 // that were not acquired by an executable task. It runs independently of
 // stale-task discovery, which is what repairs a recovery dispatch lost before
 // a server restart.
-func sweepPendingDelegatedFailureRecoveries(ctx context.Context, taskSvc *service.TaskService, reconcileRetries completionReconcileRetryReplayer) (stats runtimeSweepStageStats) {
+func sweepPendingDelegatedFailureRecoveries(ctx context.Context, taskSvc *service.TaskService) (stats runtimeSweepStageStats) {
 	startedAt := time.Now()
 	defer func() {
 		observeRuntimeSweepStage(taskServiceMetrics(taskSvc), obsmetrics.RuntimeSweepStageDelegatedFailureRecovery, startedAt, stats)
@@ -220,27 +211,6 @@ func sweepPendingDelegatedFailureRecoveries(ctx context.Context, taskSvc *servic
 		if result.Exhausted > 0 {
 			slog.Warn("delegated failure recovery sweeper: automatic attempts exhausted", "count", result.Exhausted)
 		}
-	}
-	// Completion-reconcile obligations share this tick but not this outbox:
-	// the handler replays each owed comment through CURRENT comment routing, so
-	// a permission, squad-role or readiness change since the skip decides the
-	// outcome (GH #8719). A failure in one outbox never stalls the other.
-	if reconcileRetries == nil {
-		return
-	}
-	retryResult, retryErr := reconcileRetries.ReplayCompletionReconcileRetries(ctx, delegatedFailureRecoveryBatchSize)
-	stats.candidates += retryResult.Scanned
-	stats.changed += retryResult.Replayed
-	if retryErr != nil {
-		slog.Warn("completion reconcile retry sweeper: replay failed",
-			"scanned", retryResult.Scanned,
-			"replayed", retryResult.Replayed,
-			"error", retryErr,
-		)
-		return
-	}
-	if retryResult.Replayed > 0 {
-		slog.Info("completion reconcile retry sweeper: replayed owed comments", "runs", retryResult.Replayed)
 	}
 	return
 }

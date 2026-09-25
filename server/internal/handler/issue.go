@@ -4226,17 +4226,15 @@ func (h *Handler) assigneeFallbackAgent(ctx context.Context, issue db.Issue, act
 	}
 	agent, err := h.Queries.GetAgent(ctx, issue.AssigneeID)
 	if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
-		opts.recordRoutingReadError(err)
 		return db.Agent{}, false, false
 	}
-	if !h.canInvokeCommentTarget(ctx, agent, actorType, actorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID), opts) {
+	if !h.canInvokeAgent(ctx, agent, actorType, actorID, opts.OriginatorUserID, uuidToString(issue.WorkspaceID)) {
 		return db.Agent{}, false, false
 	}
 	// Coalescing queue: pending is still a valid route target, but callers
 	// that actually enqueue tasks use this flag to avoid piling on duplicates.
 	hasPending, err := h.hasPendingTaskForIssueAndAgent(ctx, issue.ID, issue.AssigneeID, opts)
 	if err != nil {
-		opts.recordRoutingReadError(err)
 		return db.Agent{}, false, false
 	}
 	return agent, hasPending, true

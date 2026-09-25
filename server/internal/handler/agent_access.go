@@ -2,11 +2,9 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -49,12 +47,7 @@ import (
 // agent/system principals, but member/team targets fail closed without a
 // matching human.
 func (h *Handler) canInvokeAgent(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
-	allowed, _ := h.canInvokeAgentChecked(ctx, agent, actorType, actorID, originatorUserID, workspaceID)
-	return allowed
-}
-
-func (h *Handler) canInvokeAgentChecked(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) (bool, error) {
-	allowed, err := h.invokeAgentDecisionChecked(ctx, agent, actorType, actorID, originatorUserID, workspaceID)
+	allowed := h.invokeAgentDecision(ctx, agent, actorType, actorID, originatorUserID, workspaceID)
 	if !allowed && actorType != "member" && originatorUserID == "" {
 		// MUL-6490: the wire reason stays the deliberately generic
 		// invocation_not_allowed (dispatch/reason.go — it must not reveal whether a
@@ -72,17 +65,12 @@ func (h *Handler) canInvokeAgentChecked(ctx context.Context, agent db.Agent, act
 			"workspace_id", workspaceID,
 		)
 	}
-	return allowed, err
+	return allowed
 }
 
 // invokeAgentDecision is canInvokeAgent's pure verdict, split out so the gate has
 // exactly one place to observe a denial from.
 func (h *Handler) invokeAgentDecision(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) bool {
-	allowed, _ := h.invokeAgentDecisionChecked(ctx, agent, actorType, actorID, originatorUserID, workspaceID)
-	return allowed
-}
-
-func (h *Handler) invokeAgentDecisionChecked(ctx context.Context, agent db.Agent, actorType, actorID, originatorUserID, workspaceID string) (bool, error) {
 	effectiveUser := actorID
 	if actorType != "member" {
 		// agent / system: never trust the immediate principal, only the
@@ -92,18 +80,18 @@ func (h *Handler) invokeAgentDecisionChecked(ctx context.Context, agent db.Agent
 
 	// The agent owner may always invoke their own agent.
 	if effectiveUser != "" && uuidToString(agent.OwnerID) == effectiveUser {
-		return true, nil
+		return true
 	}
 
 	if agent.PermissionMode != "public_to" {
 		// private (or any unknown mode) is deny-by-default: no admin bypass,
 		// no A2A bypass. Only the owner branch above passes.
-		return false, nil
+		return false
 	}
 
 	targets, err := h.Queries.ListAgentInvocationTargets(ctx, agent.ID)
 	if err != nil {
-		return false, err
+		return false
 	}
 
 	// Agents and system triggers are workspace-internal principals: a
@@ -118,12 +106,9 @@ func (h *Handler) invokeAgentDecisionChecked(ctx context.Context, agent db.Agent
 	// onto someone's specific-people grant.
 	workspaceBroad := actorType == "agent" || actorType == "system"
 	isWorkspaceMember := false
-	var membershipErr error
 	if effectiveUser != "" {
 		if _, err := h.getWorkspaceMember(ctx, effectiveUser, workspaceID); err == nil {
 			isWorkspaceMember = true
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			membershipErr = err
 		}
 	}
 
@@ -131,20 +116,20 @@ func (h *Handler) invokeAgentDecisionChecked(ctx context.Context, agent db.Agent
 		switch t.TargetType {
 		case "workspace":
 			if isWorkspaceMember || workspaceBroad {
-				return true, nil
+				return true
 			}
 		case "member":
 			// Requires a resolved human. agent/system triggers with no
 			// originator (effectiveUser == "") never match here — fail closed.
 			if effectiveUser != "" && uuidToString(t.TargetID) == effectiveUser {
-				return true, nil
+				return true
 			}
 		case "team":
 			// Reserved: team membership does not exist yet in V1, so team
 			// targets never admit anyone (also fail-closed for system/agent).
 		}
 	}
-	return false, membershipErr
+	return false
 }
 
 // canAccessPrivateAgent gates the VIEW surfaces (list/detail navigation, chat
