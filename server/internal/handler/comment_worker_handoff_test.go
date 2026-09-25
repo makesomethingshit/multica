@@ -859,14 +859,14 @@ func TestCompletionFallbackAtomicBoundary(t *testing.T) {
 // acquires GetAgentTaskForUpdate, confirms NULL, then holds the lock while
 // the sweeper blocks on the same row. Releasing the callback lets it commit;
 // the sweeper then replays the recorded winner instead of inserting again.
+// The release gate is an observed pg_stat_activity tuple-lock wait, never a
+// timer: waitSweeperRowLockWait must see the sweeper queued on the row first.
 type lockRendezvousTxStarter struct {
-	delegate    *pgxpool.Pool
-	started     chan struct{}
-	release     chan struct{}
-	entered     chan struct{}
-	enteredOnce atomic.Bool
-	calls       atomic.Int32
-	timedOut    atomic.Bool
+	delegate *pgxpool.Pool
+	started  chan struct{}
+	release  chan struct{}
+	calls    atomic.Int32
+	timedOut atomic.Bool
 }
 
 func (s *lockRendezvousTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -887,9 +887,6 @@ func (t *lockRendezvousTx) QueryRow(ctx context.Context, sql string, args ...any
 		return t.Tx.QueryRow(ctx, sql, args...)
 	}
 	if t.starter.calls.Add(1) != 1 {
-		if t.starter.enteredOnce.CompareAndSwap(false, true) {
-			close(t.starter.entered)
-		}
 		return t.Tx.QueryRow(ctx, sql, args...)
 	}
 	return &lockHoldRow{Row: t.Tx.QueryRow(ctx, sql, args...), starter: t.starter}
@@ -919,6 +916,30 @@ func (r *lockHoldRow) Scan(dest ...any) error {
 		r.starter.timedOut.Store(true)
 	}
 	return nil
+}
+
+// waitSweeperRowLockWait blocks until pg_stat_activity shows an active backend
+// waiting on a lock while running the synthesis lock query, i.e. the sweeper
+// is genuinely queued on the run row the callback holds (empirically a
+// transactionid lock wait for SELECT ... FOR UPDATE on this server). It polls
+// observable DB state with a hard timeout and fails instead of releasing
+// early, so the callback release can never precede the actual lock wait.
+func waitSweeperRowLockWait(t *testing.T, ctx context.Context) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var waiting int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE '%GetAgentTaskForUpdate%'`).Scan(&waiting); err != nil {
+			t.Fatalf("poll sweeper row-lock wait: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sweeper never blocked on the contended run row lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // TestCompletionFallbackSingleWinner pins the synthesis race (GH #8719): when
@@ -958,7 +979,6 @@ func TestCompletionFallbackSingleWinner(t *testing.T) {
 		delegate: testPool,
 		started:  make(chan struct{}),
 		release:  make(chan struct{}),
-		entered:  make(chan struct{}),
 	}
 	originalTxStarter := testHandler.TaskService.TxStarter
 	testHandler.TaskService.TxStarter = starter
@@ -984,11 +1004,12 @@ func TestCompletionFallbackSingleWinner(t *testing.T) {
 		_, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10)
 		sweeperDone <- err
 	}()
-	select {
-	case <-starter.entered:
-	case <-time.After(30 * time.Second):
-		t.Fatal("sweeper never reached the contended row lock")
-	}
+	// Release only after the sweeper is observably queued on the same row:
+	// waitSweeperRowLockWait polls pg_stat_activity for a backend waiting on
+	// the tuple lock while running the synthesis lock query. The 20ms pacing
+	// is poll granularity only; the release gate is the observed lock wait,
+	// so a timeout fails loudly instead of degenerating to a sequential run.
+	waitSweeperRowLockWait(t, ctx)
 	close(starter.release)
 	select {
 	case err := <-sweeperDone:
