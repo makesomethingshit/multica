@@ -4656,21 +4656,18 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		if c.AuthorType == "agent" && c.SourceTaskID.Valid {
 			srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID)
 			if err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					// Permanently unverifiable lineage: the source run is
-					// gone, so this comment can neither be
-					// originator-resolved through it nor owned by the
-					// fallback sweeper. Skip it here.
-					continue
-				}
-				// Transient infrastructure failure: the comment may be an
-				// explicit worker reply, which -- unlike a recorded fallback
-				// owned by the sweeper replay -- has no durable redelivery.
-				// Fall through to normal reconciliation rather than
-				// dropping it. The scoped replay below still requires an
-				// explicit mention of this agent or a planned input, so an
-				// unreadable fallback body cannot fan out (GH #8719).
-			} else if srcTask.CompletionFallbackCommentID.Valid &&
+				// Fail closed on any lookup failure: without the source row
+				// the comment's lineage is unverifiable, and an unverified
+				// comment must never enter generic mention parsing -- a
+				// recorded fallback whose body mentions this agent would
+				// otherwise be generic-enqueued here (GH #8719). Skipping
+				// is lossless for explicit replies: nothing marks the
+				// comment delivered, so a later reconcile pass recovers it
+				// once the source row reads again. Only a provably-gone
+				// (no-rows) source stays skipped permanently.
+				continue
+			}
+			if srcTask.CompletionFallbackCommentID.Valid &&
 				uuidToString(srcTask.CompletionFallbackCommentID) == uuidToString(c.ID) {
 				// Fallback identity is the exact recorded comment id -- never a
 				// shape match on completed non-leader authorship. An explicit

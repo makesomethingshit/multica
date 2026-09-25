@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -994,31 +993,32 @@ func TestCompletionReconcileSkipsRecordedFallback(t *testing.T) {
 	}
 }
 
-// failSourceTaskLookupDB fails the first GetAgentTask read of one source
-// task, standing in for a transient source-task lookup failure during
-// completion reconcile. All other statements use the real pool.
+// failSourceTaskLookupDB fails GetAgentTask reads for the listed source
+// tasks, standing in for a transient source-task lookup outage during
+// completion reconcile. Reads for any other task (notably the completing
+// task itself) use the real pool, so the completion endpoint stays healthy
+// while the reconcile branch lookups fail.
 type failSourceTaskLookupDB struct {
 	db.DBTX
-	sourceTaskID string
-	failed       atomic.Bool
+	missing map[string]bool
 }
 
 func (d *failSourceTaskLookupDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
-	if !d.failed.Load() && strings.Contains(query, "-- name: GetAgentTask") && len(args) > 0 {
-		if id, ok := args[0].(pgtype.UUID); ok && uuidToString(id) == d.sourceTaskID {
-			d.failed.Store(true)
+	if strings.Contains(query, "-- name: GetAgentTask") && len(args) > 0 {
+		if id, ok := args[0].(pgtype.UUID); ok && d.missing[uuidToString(id)] {
 			return errRow{err: errors.New("injected source task lookup failure")}
 		}
 	}
 	return d.DBTX.QueryRow(ctx, query, args...)
 }
 
-// TestCompleteTask_ReconcilesExplicitMentionWhenSourceLookupFails pins the
-// transient half of the reconcile lookup contract (GH #8719): an explicit
-// worker mention whose source-task read fails transiently must still be
-// reconciled -- unlike a recorded fallback, it has no durable sweeper
-// replay. Dropping the comment on any lookup error would lose it here.
-func TestCompleteTask_ReconcilesExplicitMentionWhenSourceLookupFails(t *testing.T) {
+// TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure pins the
+// combined lookup contract (GH #8719): while the source-task read fails,
+// nothing may enter generic routing -- neither the explicit mention nor a
+// recorded fallback mentioning the completing agent. On retry with reads
+// restored, the explicit mention is recovered exactly once through its own
+// trigger while the recorded fallback stays out via its exact ID.
+func TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -1087,20 +1087,60 @@ func TestCompleteTask_ReconcilesExplicitMentionWhenSourceLookupFails(t *testing.
 		t.Fatalf("CompleteTask W: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
+	// A second worker's recorded fallback mentioning B, sharing B's
+	// reconcilable thread: the combined case the transient branch must never
+	// generic-enqueue.
+	workerW2 := createHandlerTestAgent(t, "Reconcile LookupFail Worker W2", nil)
+	var w2TaskID string
+	dbfx.QueryRow(t, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, started_at, originator_user_id, accountable_user_id)
+		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'running', 0, now() - interval '10 minutes', now() - interval '9 minutes', $5, $5)
+		RETURNING id
+	`, workerW2, runtimeID, issueID, bTriggerCommentID, testUserID).Scan(&w2TaskID)
+	if w := completeTaskViaHandler(t, w2TaskID, "Processed the inputs delivered to this run"); w.Code != http.StatusOK {
+		t.Fatalf("CompleteTask W2: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var w2FallbackID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, w2TaskID, workerW2).Scan(&w2FallbackID)
+	if w2FallbackID == "" {
+		t.Fatal("W2 fallback was not synthesized")
+	}
+	dbfx.Exec(t, `UPDATE comment SET content = $2 WHERE id = $1`, w2FallbackID,
+		"Done. [@B](mention://agent/"+agentB+") please review as well")
+
 	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running', started_at = now() - interval '1 minute' WHERE id = $1`, bTaskID)
+	// Phase 1: the source-task outage. Nothing may enter generic routing:
+	// neither the explicit mention nor the recorded fallback wakes anyone.
 	originalQueries := testHandler.Queries
-	testHandler.Queries = db.New(&failSourceTaskLookupDB{DBTX: testPool, sourceTaskID: wTaskID})
+	testHandler.Queries = db.New(&failSourceTaskLookupDB{DBTX: testPool, missing: map[string]bool{wTaskID: true, w2TaskID: true}})
 	w := completeTaskViaHandler(t, bTaskID, "done")
 	testHandler.Queries = originalQueries
 	if w.Code != http.StatusOK {
 		t.Fatalf("CompleteTask B: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-
+	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 0 {
+		t.Fatalf("transient outage woke %d B task(s), want 0 (fail closed)", n)
+	}
+	// Phase 2: retry with reads restored. The explicit mention is recovered
+	// exactly once through its own trigger; the recorded fallback stays out.
+	bTask, err := testHandler.Queries.GetAgentTask(ctx, util.MustParseUUID(bTaskID))
+	if err != nil {
+		t.Fatalf("retry: load B task: %v", err)
+	}
+	testHandler.reconcileCommentsOnCompletion(ctx, &bTask)
 	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 1 {
-		t.Fatalf("expected exactly 1 follow-up for B despite the transient source lookup failure, got %d", n)
+		t.Fatalf("retry recovered %d B follow-up(s), want exactly 1", n)
+	}
+	var followTrigger string
+	dbfx.QueryRow(t, `SELECT COALESCE(trigger_comment_id::text, '') FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`, issueID, agentB).Scan(&followTrigger)
+	if followTrigger != mentionCommentID {
+		t.Fatalf("retry follow-up trigger = %q, want the explicit mention %q (fallback mention must never generic-enqueue)", followTrigger, mentionCommentID)
 	}
 	if n := pendingTaskCountForAgentIssue(t, issueID, workerW); n != 0 {
 		t.Fatalf("comment author W must not be enqueued, got %d W task(s)", n)
+	}
+	if n := pendingTaskCountForAgentIssue(t, issueID, workerW2); n != 0 {
+		t.Fatalf("fallback author W2 must not be enqueued, got %d W2 task(s)", n)
 	}
 }
 
