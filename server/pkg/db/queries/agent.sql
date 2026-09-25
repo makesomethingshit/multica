@@ -2183,25 +2183,70 @@ LIMIT @max_per_tick::int;
 
 -- name: RecordCompletionReconcileRetryComment :exec
 -- Records one durable retry obligation for a completion-reconcile comment
--- skipped on transient source-task lookup failure (GH #8719). The element
--- carries the routing the completing pass already resolved
--- (comment/target shape only -- exact fallback identity is re-proven at
--- replay, when reads are healthy). Deduplicated by comment id so repeated
--- skips of the same comment never stack.
+-- skipped on transient source-task lookup failure (GH #8719). The element is
+-- the comment IDENTITY and nothing else: it says "this comment still has to be
+-- reconsidered for the completing agent", never "this comment was authorized
+-- to invoke this target in this role". Source lineage, invocation permission,
+-- squad leadership and readiness are all re-proven at replay from current
+-- state, so a stale routing snapshot can never be replayed. Deduplicated by
+-- comment id so repeated skips of the same comment never stack.
 UPDATE agent_task_queue
-SET completion_reconcile_retry_obligations = COALESCE(completion_reconcile_retry_obligations, '[]'::jsonb) || jsonb_build_object('comment_id', @comment_id::uuid, 'is_leader', @is_leader::boolean, 'squad_id', @squad_id::uuid)
+SET completion_reconcile_retry_obligations = COALESCE(completion_reconcile_retry_obligations, '[]'::jsonb) || jsonb_build_object('comment_id', @comment_id::uuid)
 WHERE id = @task_id::uuid
   AND NOT EXISTS (
     SELECT 1 FROM jsonb_array_elements(COALESCE(completion_reconcile_retry_obligations, '[]'::jsonb)) AS e
     WHERE e->>'comment_id' = @comment_id::text
   );
 
+-- name: HasTaskCarryingCommentForAgent :one
+-- Coverage check for a replayed completion-reconcile comment (GH #8719): the
+-- obligation is settled when a run of this agent on this issue already carries
+-- the comment. Coverage is one of:
+--   * a recorded delivery receipt -- the run provably embedded the comment
+--     (any status, since a terminal receipt is still proof);
+--   * a still-runnable run that carries the comment as its trigger or planned
+--     input -- it will see it;
+--   * a COMPLETED run created FOR this comment (trigger), which is the state a
+--     coalesced follow-up reaches after it finishes;
+-- A completed run that merely PLANNED the comment (coalesced, never delivered)
+-- is deliberately NOT coverage: that is exactly the state a hand-off leaves
+-- behind, and it is what the replay exists to discharge. Failed or cancelled
+-- carriers are not coverage either -- that run never answered the comment.
+-- Replaying through this predicate is how a repeated completion pass and the
+-- retry sweeper stay idempotent after a follow-up already ran.
+-- The completing run itself is excluded: an undelivered planned input of that
+-- very run is exactly what a reconcile candidate is, so counting it as its own
+-- carrier would settle every obligation it needs to discharge.
+SELECT count(*) > 0 AS covered
+FROM agent_task_queue
+WHERE issue_id = @issue_id
+  AND agent_id = @agent_id
+  AND id IS DISTINCT FROM sqlc.narg('exclude_task_id')::uuid
+  AND (
+      @comment_id::uuid = ANY(delivered_comment_ids)
+      OR (
+          status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
+          AND (
+              trigger_comment_id = @comment_id::uuid
+              OR @comment_id::uuid = ANY(coalesced_comment_ids)
+          )
+      )
+      OR (status = 'completed' AND trigger_comment_id = @comment_id::uuid)
+  );
+
 -- name: ListCompletionReconcileRetryObligations :many
 -- Bounded scan for completion-reconcile retry obligations (GH #8719): runs
--- that skipped comments on transient source-task lookup failure. The
--- existing delegated-failure sweeper replays them through the normal mention
--- enqueue once reads recover. NULL or empty arrays are never obligations.
-SELECT id, agent_id, issue_id, completion_reconcile_retry_obligations
+-- that skipped comments on transient source-task lookup failure. The existing
+-- runtime sweep replays each element through CURRENT comment routing (the same
+-- trigger computation a fresh comment takes), so a permission, squad-role or
+-- readiness change since the skip decides the outcome. NULL or empty arrays
+-- are never obligations.
+-- The run's own planned inputs travel with the row so the replay can apply the
+-- same "accepted worker reply" filter the completing pass had: a worker reply
+-- recorded in this run's plan is replayable, a timestamp-only agent reply is
+-- not.
+SELECT id, agent_id, issue_id, completion_reconcile_retry_obligations,
+       coalesced_comment_ids, trigger_comment_id
 FROM agent_task_queue
 WHERE completion_reconcile_retry_obligations IS NOT NULL
   AND completion_reconcile_retry_obligations <> '[]'::jsonb
@@ -2210,9 +2255,9 @@ LIMIT @max_per_tick::int;
 
 -- name: ClearResolvedCompletionReconcileRetry :exec
 -- Drops one resolved retry obligation element by comment id (GH #8719):
--- routed, exact-recorded, or provably-gone. Only the resolved element is
--- removed, so obligations recorded concurrently by another pass survive the
--- write-back.
+-- routed, covered by an existing run, exact-recorded fallback, or
+-- provably-gone. Only the resolved element is removed, so obligations
+-- recorded concurrently by another pass survive the write-back.
 UPDATE agent_task_queue
 SET completion_reconcile_retry_obligations = (
   SELECT COALESCE(jsonb_agg(e), '[]'::jsonb)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -993,170 +994,6 @@ func TestCompletionReconcileSkipsRecordedFallback(t *testing.T) {
 	}
 }
 
-// failSourceTaskLookupDB fails GetAgentTask reads for the listed source
-// tasks, standing in for a transient source-task lookup outage during
-// completion reconcile. Reads for any other task (notably the completing
-// task itself) use the real pool, so the completion endpoint stays healthy
-// while the reconcile branch lookups fail.
-type failSourceTaskLookupDB struct {
-	db.DBTX
-	missing map[string]bool
-}
-
-func (d *failSourceTaskLookupDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
-	if strings.Contains(query, "-- name: GetAgentTask") && len(args) > 0 {
-		if id, ok := args[0].(pgtype.UUID); ok && d.missing[uuidToString(id)] {
-			return errRow{err: errors.New("injected source task lookup failure")}
-		}
-	}
-	return d.DBTX.QueryRow(ctx, query, args...)
-}
-
-// TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure pins the
-// combined lookup contract (GH #8719): while the source-task read fails,
-// nothing may enter generic routing -- neither the explicit mention nor a
-// recorded fallback mentioning the completing agent. The skip leaves a
-// durable retry obligation, and the existing recovery sweeper replays it
-// once reads recover: the explicit mention is recovered exactly once
-// through its own trigger while the recorded fallback stays out via its
-// exact ID. Both phases drive production entry points only (CompleteTask
-// endpoint, RecoverPendingDelegatedFailures); the reconcile helper is never
-// called directly.
-func TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	ctx := context.Background()
-
-	var runtimeID string
-	dbfx.QueryRow(t,
-		`SELECT runtime_id FROM agent WHERE workspace_id = $1 AND runtime_id IS NOT NULL LIMIT 1`,
-		testWorkspaceID).Scan(&runtimeID)
-	workerW := createHandlerTestAgent(t, "Reconcile LookupFail Worker W", nil)
-	agentB := createHandlerTestAgent(t, "Reconcile LookupFail Target B", nil)
-
-	issueID := dbfx.Issue(t, "reconcile-explicit-source-lookup-fails fixture", testutil.Cols{
-		"status":        "in_progress",
-		"number":        999015,
-		"assignee_type": "agent",
-		"assignee_id":   agentB,
-	})
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issueID) })
-
-	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
-	if err != nil {
-		t.Fatalf("setup: load issue: %v", err)
-	}
-
-	bTriggerCommentID := dbfx.Comment(t, issueID, "initial request for B", testutil.Cols{
-		"created_at": testutil.Raw("now() - interval '10 minutes'"),
-	})
-	var bTaskID string
-	dbfx.QueryRow(t, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, dispatched_at)
-		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'dispatched', 0, now() - interval '10 minutes', now() - interval '5 minutes')
-		RETURNING id
-	`, agentB, runtimeID, issueID, bTriggerCommentID).Scan(&bTaskID)
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID) })
-
-	wTriggerCommentID := dbfx.Comment(t, issueID, "initial request for W", testutil.Cols{
-		"created_at": testutil.Raw("now() - interval '10 minutes'"),
-	})
-	var wTaskID string
-	dbfx.QueryRow(t, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, started_at, originator_user_id, accountable_user_id)
-		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'running', 0, now() - interval '10 minutes', now() - interval '9 minutes', $5, $5)
-		RETURNING id
-	`, workerW, runtimeID, issueID, wTriggerCommentID, testUserID).Scan(&wTaskID)
-
-	var mentionCommentID string
-	mention := "[@B](mention://agent/" + agentB + ") please also handle this"
-	dbfx.QueryRow(t, `
-		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, source_task_id, content, type)
-		VALUES ($1, $2, 'agent', $3, $4, $5, 'comment')
-		RETURNING id
-	`, issueID, testWorkspaceID, workerW, wTaskID, mention).Scan(&mentionCommentID)
-	dbfx.Exec(t, `UPDATE comment SET parent_id=$2 WHERE id=$1`, mentionCommentID, bTriggerCommentID)
-	mentionComment, err := testHandler.Queries.GetComment(ctx, util.MustParseUUID(mentionCommentID))
-	if err != nil {
-		t.Fatalf("setup: load mention comment: %v", err)
-	}
-	testHandler.triggerTasksForComment(ctx, issue, mentionComment, nil, "agent", workerW, "", nil, nil)
-
-	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 0 {
-		t.Fatalf("expected the mention to be dropped at creation (0 queued follow-up), got %d", n)
-	}
-
-	if w := completeTaskViaHandler(t, wTaskID, "done"); w.Code != http.StatusOK {
-		t.Fatalf("CompleteTask W: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// A second worker's recorded fallback mentioning B, sharing B's
-	// reconcilable thread: the combined case the transient branch must never
-	// generic-enqueue.
-	workerW2 := createHandlerTestAgent(t, "Reconcile LookupFail Worker W2", nil)
-	var w2TaskID string
-	dbfx.QueryRow(t, `
-		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, started_at, originator_user_id, accountable_user_id)
-		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'running', 0, now() - interval '10 minutes', now() - interval '9 minutes', $5, $5)
-		RETURNING id
-	`, workerW2, runtimeID, issueID, bTriggerCommentID, testUserID).Scan(&w2TaskID)
-	if w := completeTaskViaHandler(t, w2TaskID, "Processed the inputs delivered to this run"); w.Code != http.StatusOK {
-		t.Fatalf("CompleteTask W2: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	var w2FallbackID string
-	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, w2TaskID, workerW2).Scan(&w2FallbackID)
-	if w2FallbackID == "" {
-		t.Fatal("W2 fallback was not synthesized")
-	}
-	dbfx.Exec(t, `UPDATE comment SET content = $2 WHERE id = $1`, w2FallbackID,
-		"Done. [@B](mention://agent/"+agentB+") please review as well")
-
-	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running', started_at = now() - interval '1 minute' WHERE id = $1`, bTaskID)
-	// Phase 1: the source-task outage. Nothing may enter generic routing:
-	// neither the explicit mention nor the recorded fallback wakes anyone.
-	originalQueries := testHandler.Queries
-	testHandler.Queries = db.New(&failSourceTaskLookupDB{DBTX: testPool, missing: map[string]bool{wTaskID: true, w2TaskID: true}})
-	w := completeTaskViaHandler(t, bTaskID, "done")
-	testHandler.Queries = originalQueries
-	if w.Code != http.StatusOK {
-		t.Fatalf("CompleteTask B: expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 0 {
-		t.Fatalf("transient outage woke %d B task(s), want 0 (fail closed)", n)
-	}
-	// The skip left a durable retry obligation on the completing run.
-	var retryCount int
-	dbfx.QueryRow(t, `SELECT COALESCE(jsonb_array_length(completion_reconcile_retry_obligations), 0) FROM agent_task_queue WHERE id = $1`, bTaskID).Scan(&retryCount)
-	if retryCount == 0 {
-		t.Fatal("transient skip left no retry obligation")
-	}
-	// Phase 2: the existing recovery sweeper replays the obligation with
-	// reads restored. The explicit mention is recovered exactly once through
-	// its own trigger; the recorded fallback stays out via its exact ID.
-	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
-		t.Fatalf("sweeper recovery failed: %v", err)
-	}
-	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 1 {
-		t.Fatalf("retry recovered %d B follow-up(s), want exactly 1", n)
-	}
-	var followTrigger string
-	dbfx.QueryRow(t, `SELECT COALESCE(trigger_comment_id::text, '') FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`, issueID, agentB).Scan(&followTrigger)
-	if followTrigger != mentionCommentID {
-		t.Fatalf("retry follow-up trigger = %q, want the explicit mention %q (fallback mention must never generic-enqueue)", followTrigger, mentionCommentID)
-	}
-	if n := pendingTaskCountForAgentIssue(t, issueID, workerW); n != 0 {
-		t.Fatalf("comment author W must not be enqueued, got %d W task(s)", n)
-	}
-	if n := pendingTaskCountForAgentIssue(t, issueID, workerW2); n != 0 {
-		t.Fatalf("fallback author W2 must not be enqueued, got %d W2 task(s)", n)
-	}
-	// The replay settled every obligation it touched.
-	dbfx.QueryRow(t, `SELECT COALESCE(jsonb_array_length(completion_reconcile_retry_obligations), 0) FROM agent_task_queue WHERE id = $1`, bTaskID).Scan(&retryCount)
-	if retryCount != 0 {
-		t.Fatalf("sweeper left %d retry obligation(s), want 0", retryCount)
-	}
-}
 
 // TestCompleteTask_SkipsExplicitMentionWhenSourceGone pins the permanent half
 // of the reconcile lookup contract (GH #8719): an agent comment whose source
@@ -1228,3 +1065,608 @@ func TestCompleteTask_SkipsExplicitMentionWhenSourceGone(t *testing.T) {
 		t.Fatalf("source-gone comment must stay skipped, got %d queued follow-up(s)", n)
 	}
 }
+// retryObligationCount reads how many durable completion-reconcile retry
+// obligations a run currently carries (GH #8719).
+func retryObligationCount(t *testing.T, taskID string) int {
+	t.Helper()
+	var n int
+	dbfx.QueryRow(t,
+		`SELECT COALESCE(jsonb_array_length(completion_reconcile_retry_obligations), 0) FROM agent_task_queue WHERE id = $1`,
+		taskID).Scan(&n)
+	return n
+}
+
+// fallbackCommentCountForTask counts the synthesized completion fallbacks a run
+// produced; the completion contract allows exactly one per run.
+func fallbackCommentCountForTask(t *testing.T, taskID string) int {
+	t.Helper()
+	var n int
+	dbfx.QueryRow(t, `SELECT count(*) FROM comment WHERE source_task_id = $1`, taskID).Scan(&n)
+	return n
+}
+
+// failQueriesDB injects read/write failures by query name below ONE database
+// handle, standing in for a transient infrastructure outage.
+//
+// missingTasks fails the GetAgentTask read for those task ids; failQueryRow and
+// failExec fail any statement whose text contains the substring. A failure that
+// has to land below EVERY call site installs the same wrapper on both handles
+// through withFailingQueries.
+type failQueriesDB struct {
+	db.DBTX
+	missingTasks map[string]bool
+	failQueryRow string
+	failExec     string
+}
+
+func (d *failQueriesDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	if d.failQueryRow != "" && strings.Contains(query, d.failQueryRow) {
+		return errRow{err: errors.New("injected query failure: " + d.failQueryRow)}
+	}
+	if strings.Contains(query, "-- name: GetAgentTask") && len(args) > 0 {
+		if id, ok := args[0].(pgtype.UUID); ok && d.missingTasks[uuidToString(id)] {
+			return errRow{err: errors.New("injected source task lookup failure")}
+		}
+	}
+	return d.DBTX.QueryRow(ctx, query, args...)
+}
+
+func (d *failQueriesDB) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	if d.failExec != "" && strings.Contains(query, d.failExec) {
+		return pgconn.CommandTag{}, errors.New("injected exec failure: " + d.failExec)
+	}
+	return d.DBTX.Exec(ctx, query, args...)
+}
+
+// withFailingQueries swaps BOTH query handles for the duration of fn.
+// Completion reconciliation reads source rows through h.Queries and resolves the
+// originator chain through TaskService.Queries, so an outage that wraps only one
+// of them does not reproduce the failure the retry contract is about (GH #8719
+// review, Blocker 1).
+func withFailingQueries(t *testing.T, wrapper *failQueriesDB, fn func()) {
+	t.Helper()
+	originalQueries := testHandler.Queries
+	originalServiceQueries := testHandler.TaskService.Queries
+	testHandler.Queries = db.New(wrapper)
+	testHandler.TaskService.Queries = db.New(wrapper)
+	defer func() {
+		testHandler.Queries = originalQueries
+		testHandler.TaskService.Queries = originalServiceQueries
+	}()
+	fn()
+}
+
+// mentionAgentBody is the explicit @agent mention the retry fixtures post.
+func mentionAgentBody(agentID string) string {
+	return "[@B](mention://agent/" + agentID + ") please also handle this"
+}
+
+// retryFixture is the shape every completion-reconcile retry test acts on: agent
+// B has a running task on the issue, and worker agent W posted one comment while
+// B was running, so B's completion reconcile owns it.
+type retryFixture struct {
+	issueID   string
+	agentB    string
+	workerW   string
+	bTaskID   string
+	wTaskID   string
+	commentID string
+}
+
+// seedRetryFixture builds the fixture above. mentionFor receives the created
+// agent ids and returns the comment body (an explicit @B / @S mention), which
+// lets a test seed routing topology -- a squad led by B, say -- before the
+// comment exists. The comment then goes through the production creation trigger,
+// so the run starts exactly where a real comment starts.
+func seedRetryFixture(t *testing.T, issueNumber int, label string, mentionFor func(agentB, workerW string) string) retryFixture {
+	t.Helper()
+	ctx := context.Background()
+
+	var runtimeID string
+	dbfx.QueryRow(t,
+		`SELECT runtime_id FROM agent WHERE workspace_id = $1 AND runtime_id IS NOT NULL LIMIT 1`,
+		testWorkspaceID).Scan(&runtimeID)
+	workerW := createHandlerTestAgent(t, label+" Worker W", nil)
+	agentB := createHandlerTestAgent(t, label+" Target B", nil)
+
+	issueID := dbfx.Issue(t, label+" fixture", testutil.Cols{
+		"status":        "in_progress",
+		"number":        issueNumber,
+		"assignee_type": "agent",
+		"assignee_id":   agentB,
+	})
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issueID) })
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID) })
+	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(issueID))
+	if err != nil {
+		t.Fatalf("setup: load issue: %v", err)
+	}
+
+	// B's run: a claim receipt (dispatched), so the creation path defers the
+	// mention to it instead of enqueueing a second run. Both runs anchor ten
+	// minutes back, so the comment under test lands inside the reconcile window.
+	bTriggerCommentID := dbfx.Comment(t, issueID, "initial request for B", testutil.Cols{
+		"created_at": testutil.Raw("now() - interval '10 minutes'"),
+	})
+	var bTaskID string
+	dbfx.QueryRow(t, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, dispatched_at)
+		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'dispatched', 0, now() - interval '10 minutes', now() - interval '9 minutes')
+		RETURNING id
+	`, agentB, runtimeID, issueID, bTriggerCommentID).Scan(&bTaskID)
+
+	// W's run: the authoring run of the comment under test. Its originator is the
+	// test member, so a healthy read admits member-scoped targets while an
+	// unreadable one does not.
+	wTriggerCommentID := dbfx.Comment(t, issueID, "initial request for W", testutil.Cols{
+		"created_at": testutil.Raw("now() - interval '10 minutes'"),
+	})
+	var wTaskID string
+	dbfx.QueryRow(t, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, started_at, originator_user_id, accountable_user_id)
+		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'running', 0, now() - interval '10 minutes', now() - interval '9 minutes', $5, $5)
+		RETURNING id
+	`, workerW, runtimeID, issueID, wTriggerCommentID, testUserID).Scan(&wTaskID)
+
+	var commentID string
+	dbfx.QueryRow(t, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, source_task_id, parent_id, content, type)
+		VALUES ($1, $2, 'agent', $3, $4, $5, $6, 'comment')
+		RETURNING id
+	`, issueID, testWorkspaceID, workerW, wTaskID, bTriggerCommentID, mentionFor(agentB, workerW)).Scan(&commentID)
+	mentionComment, err := testHandler.Queries.GetComment(ctx, util.MustParseUUID(commentID))
+	if err != nil {
+		t.Fatalf("setup: load mention comment: %v", err)
+	}
+	testHandler.triggerTasksForComment(ctx, issue, mentionComment, nil, "agent", workerW, "", nil, nil)
+
+	// The run then starts: the completion callback below has to win the
+	// running -> completed CAS.
+	dbfx.Exec(t, `UPDATE agent_task_queue SET status = 'running', started_at = now() - interval '9 minutes' WHERE id = $1`, bTaskID)
+
+	return retryFixture{
+		issueID:   issueID,
+		agentB:    agentB,
+		workerW:   workerW,
+		bTaskID:   bTaskID,
+		wTaskID:   wTaskID,
+		commentID: commentID,
+	}
+}
+
+// TestCompleteTask_RecordsRestrictedMentionDuringSourceOutage pins Blocker 1 of
+// the GH #8719 review: the durable retry obligation is recorded BEFORE any
+// source-dependent authorization runs. Target B here is reachable only through
+// the delegation chain's human (a member allow-list entry), so an empty
+// originator -- exactly what the same source-task outage collapses originator
+// resolution to -- denies it. Asking routing first returned an empty answer,
+// recorded nothing, and lost the mention permanently.
+func TestCompleteTask_RecordsRestrictedMentionDuringSourceOutage(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := seedRetryFixture(t, 999020, "Reconcile Retry Restricted", func(agentB, _ string) string {
+		return mentionAgentBody(agentB)
+	})
+	// B is invocable only by the human at the top of the comment's chain.
+	dbfx.Exec(t, `DELETE FROM agent_invocation_target WHERE agent_id = $1`, fx.agentB)
+	dbfx.Exec(t, `INSERT INTO agent_invocation_target (agent_id, target_type, target_id) VALUES ($1, 'member', $2)`, fx.agentB, testUserID)
+
+	// The source read fails below BOTH call sites: the reconcile's own lookup and
+	// the originator resolution the permission gate depends on.
+	withFailingQueries(t, &failQueriesDB{DBTX: testPool, missingTasks: map[string]bool{fx.wTaskID: true}}, func() {
+		if w := completeTaskViaHandler(t, fx.bTaskID, "done"); w.Code != http.StatusOK {
+			t.Fatalf("CompleteTask under outage: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("source outage woke %d B task(s), want 0 (fail closed)", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 1 {
+		t.Fatalf("retry obligations after the outage = %d, want exactly 1", n)
+	}
+
+	// Reads recovered: the runtime sweep re-decides the owed comment through
+	// CURRENT routing -- still admissible, so exactly one follow-up.
+	result, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10)
+	if err != nil {
+		t.Fatalf("ReplayCompletionReconcileRetries: %v", err)
+	}
+	if result.Scanned == 0 {
+		t.Fatal("sweeper scanned no retry obligations")
+	}
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 1 {
+		t.Fatalf("retry recovered %d B follow-up(s), want exactly 1", n)
+	}
+	var followTrigger string
+	dbfx.QueryRow(t, `SELECT COALESCE(trigger_comment_id::text, '') FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`, fx.issueID, fx.agentB).Scan(&followTrigger)
+	if followTrigger != fx.commentID {
+		t.Fatalf("recovered follow-up trigger = %q, want the explicit mention %q", followTrigger, fx.commentID)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
+		t.Fatalf("sweeper left %d retry obligation(s), want 0", n)
+	}
+}
+
+// TestCompletionReconcileRetryKeepsRecordedFallbackOut pins acceptance
+// criterion 5: a synthesized completion fallback is identified by its EXACT
+// recorded id, never by shape or body, on the retry path too. During the outage
+// the fallback is unclassifiable (its own source run cannot be read), so it is
+// obligated alongside the mention; at replay the exact-ID check keeps it out of
+// generic routing while the mention is recovered through its own trigger.
+func TestCompletionReconcileRetryKeepsRecordedFallbackOut(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	var runtimeID string
+	dbfx.QueryRow(t,
+		`SELECT runtime_id FROM agent WHERE workspace_id = $1 AND runtime_id IS NOT NULL LIMIT 1`,
+		testWorkspaceID).Scan(&runtimeID)
+	fx := seedRetryFixture(t, 999021, "Reconcile Retry Fallback", func(agentB, _ string) string {
+		return mentionAgentBody(agentB)
+	})
+
+	// A second worker's completion fallback, in B's reconcilable thread, whose
+	// body mentions B: shape-shared with an explicit worker reply but recorded as
+	// a fallback on its own run.
+	workerW2 := createHandlerTestAgent(t, "Reconcile Retry Fallback Worker W2", nil)
+	var w2TaskID string
+	dbfx.QueryRow(t, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, started_at, originator_user_id, accountable_user_id)
+		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'running', 0, now() - interval '10 minutes', now() - interval '9 minutes', $5, $5)
+		RETURNING id
+	`, workerW2, runtimeID, fx.issueID, fx.commentID, testUserID).Scan(&w2TaskID)
+	if w := completeTaskViaHandler(t, w2TaskID, "Processed the inputs delivered to this run"); w.Code != http.StatusOK {
+		t.Fatalf("CompleteTask W2: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var w2Fallbacks int
+	dbfx.QueryRow(t, `SELECT count(*) FROM comment WHERE source_task_id = $1`, w2TaskID).Scan(&w2Fallbacks)
+	if w2Fallbacks != 1 {
+		t.Fatalf("W2 fallback count = %d, want exactly 1", w2Fallbacks)
+	}
+
+	dbfx.Exec(t, `
+		UPDATE comment SET content = 'Done. [@B](mention://agent/' || $2 || ') please review as well'
+		WHERE source_task_id = $1 AND author_id = $3
+	`, w2TaskID, fx.agentB, workerW2)
+
+	// The outage leaves both comments unclassifiable, so both are owed.
+	withFailingQueries(t, &failQueriesDB{DBTX: testPool, missingTasks: map[string]bool{fx.wTaskID: true, w2TaskID: true}}, func() {
+		if w := completeTaskViaHandler(t, fx.bTaskID, "done"); w.Code != http.StatusOK {
+			t.Fatalf("CompleteTask under outage: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("source outage woke %d B task(s), want 0 (fail closed)", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 2 {
+		t.Fatalf("retry obligations = %d, want the mention and the recorded fallback", n)
+	}
+
+	if _, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10); err != nil {
+		t.Fatalf("ReplayCompletionReconcileRetries: %v", err)
+	}
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 1 {
+		t.Fatalf("retry recovered %d B follow-up(s), want exactly 1", n)
+	}
+	var followTrigger string
+	dbfx.QueryRow(t, `SELECT COALESCE(trigger_comment_id::text, '') FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`, fx.issueID, fx.agentB).Scan(&followTrigger)
+	if followTrigger != fx.commentID {
+		t.Fatalf("recovered follow-up trigger = %q, want the explicit mention %q (the fallback body must never generic-enqueue)", followTrigger, fx.commentID)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
+		t.Fatalf("sweeper left %d retry obligation(s), want 0", n)
+	}
+}
+
+// TestCompletionReconcileRetryRechecksInvocationPermission pins Blocker 2: a
+// permission change between the skip and the replay decides the replay. The
+// obligation is recorded while B is workspace-invocable; B's allow-list is then
+// replaced by a member target that does not name the delegation chain's human.
+// Current comment routing denies that, so the retry must not enqueue B either.
+func TestCompletionReconcileRetryRechecksInvocationPermission(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := seedRetryFixture(t, 999022, "Reconcile Retry Permission", func(agentB, _ string) string {
+		return mentionAgentBody(agentB)
+	})
+	withFailingQueries(t, &failQueriesDB{DBTX: testPool, missingTasks: map[string]bool{fx.wTaskID: true}}, func() {
+		if w := completeTaskViaHandler(t, fx.bTaskID, "done"); w.Code != http.StatusOK {
+			t.Fatalf("CompleteTask under outage: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	if n := retryObligationCount(t, fx.bTaskID); n != 1 {
+		t.Fatalf("retry obligations after the outage = %d, want exactly 1", n)
+	}
+
+	// Revoked: the comment's delegation chain now points at a human who is
+	// neither B's owner nor on B's allow-list -- the shape a revoked mention
+	// reaches.
+	dbfx.Exec(t, `UPDATE agent_task_queue SET originator_user_id = u.id, accountable_user_id = u.id FROM (SELECT gen_random_uuid() AS id) u WHERE agent_task_queue.id = $1`, fx.wTaskID)
+	dbfx.Exec(t, `DELETE FROM agent_invocation_target WHERE agent_id = $1`, fx.agentB)
+	dbfx.Exec(t, `INSERT INTO agent_invocation_target (agent_id, target_type, target_id) VALUES ($1, 'member', $2)`, fx.agentB, testUserID)
+
+	if _, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10); err != nil {
+		t.Fatalf("ReplayCompletionReconcileRetries: %v", err)
+	}
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("retry bypassed the invoke gate: %d B task(s), want 0", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
+		t.Fatalf("revoked obligation left %d element(s), want 0 (settled by current routing)", n)
+	}
+}
+
+// TestCompletionReconcileRetryDoesNotResurrectSquadLeader pins Blocker 4 case 1:
+// the stored obligation carries no role, so an @squad retry resolves the squad's
+// CURRENT leader. Leadership moves from B to C before the replay, and current
+// routing no longer addresses B at all -- and never fans out to C either.
+func TestCompletionReconcileRetryDoesNotResurrectSquadLeader(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	var squadID string
+	fx := seedRetryFixture(t, 999023, "Reconcile Retry Squad", func(agentB, _ string) string {
+		squadID = dbfx.Squad(t, "Reconcile Retry Squad", agentB)
+		return "[@Squad](mention://squad/" + squadID + ") please coordinate this"
+	})
+	leaderC := createHandlerTestAgent(t, "Reconcile Retry Squad Leader C", nil)
+
+	withFailingQueries(t, &failQueriesDB{DBTX: testPool, missingTasks: map[string]bool{fx.wTaskID: true}}, func() {
+		if w := completeTaskViaHandler(t, fx.bTaskID, "done"); w.Code != http.StatusOK {
+			t.Fatalf("CompleteTask under outage: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	if n := pendingTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("source outage woke %d B task(s), want 0 (fail closed)", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 1 {
+		t.Fatalf("retry obligations after the outage = %d, want exactly 1", n)
+	}
+
+	// Leadership moves to C before the sweep runs.
+	dbfx.Exec(t, `UPDATE squad SET leader_id = $2 WHERE id = $1`, squadID, leaderC)
+
+	if _, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10); err != nil {
+		t.Fatalf("ReplayCompletionReconcileRetries: %v", err)
+	}
+	if n := pendingTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("obsolete squad leader resurrected: %d B task(s), want 0", n)
+	}
+	if n := pendingTaskCountForAgentIssue(t, fx.issueID, leaderC); n != 0 {
+		t.Fatalf("retry fanned the owed comment out to the new leader: %d C task(s), want 0", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
+		t.Fatalf("stale-role obligation left %d element(s), want 0", n)
+	}
+}
+
+// TestCompletionReconcileRetryDemotesLostThreadParentLeader pins Blocker 4 case
+// 2: a thread-parent retry reconstructs the CURRENT role. The replied-to comment
+// was authored by B's leader run; by replay time leadership has moved to C, so
+// current routing addresses B as an ordinary direct/thread-parent target. The
+// retry must enqueue exactly that -- no is_leader_task, no stale squad_id.
+func TestCompletionReconcileRetryDemotesLostThreadParentLeader(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	var runtimeID string
+	dbfx.QueryRow(t,
+		`SELECT runtime_id FROM agent WHERE workspace_id = $1 AND runtime_id IS NOT NULL LIMIT 1`,
+		testWorkspaceID).Scan(&runtimeID)
+	agentB := createHandlerTestAgent(t, "Reconcile Retry Demote B", nil)
+	leaderC := createHandlerTestAgent(t, "Reconcile Retry Demote C", nil)
+	squadID := dbfx.Squad(t, "Reconcile Retry Demote Squad", agentB)
+
+	issueID := dbfx.Issue(t, "reconcile-retry-demote fixture", testutil.Cols{
+		"status":        "in_progress",
+		"number":        999024,
+		"assignee_type": "agent",
+		"assignee_id":   agentB,
+	})
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM comment WHERE issue_id = $1`, issueID) })
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, issueID) })
+
+	rootID := dbfx.Comment(t, issueID, "initial request", testutil.Cols{
+		"created_at": testutil.Raw("now() - interval '10 minutes'"),
+	})
+	// B's terminal leader run: it authored the comment the member replies to.
+	var leaderTaskID string
+	dbfx.QueryRow(t, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, completed_at, is_leader_task, squad_id)
+		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'completed', 0, now() - interval '30 minutes', now() - interval '20 minutes', true, $5)
+		RETURNING id
+	`, agentB, runtimeID, issueID, rootID, squadID).Scan(&leaderTaskID)
+	parentID := dbfx.Comment(t, issueID, "leader summary", testutil.Cols{
+		"author_type":    "agent",
+		"author_id":      agentB,
+		"source_task_id": leaderTaskID,
+		"parent_id":      rootID,
+		"created_at":     testutil.Raw("now() - interval '20 minutes'"),
+	})
+	// B's running run, same thread.
+	var bTaskID string
+	dbfx.QueryRow(t, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, trigger_comment_id, delivered_comment_ids, status, priority, created_at, started_at)
+		VALUES ($1, $2, $3, $4, ARRAY[$4::uuid], 'running', 0, now() - interval '10 minutes', now() - interval '9 minutes')
+		RETURNING id
+	`, agentB, runtimeID, issueID, rootID).Scan(&bTaskID)
+	replyID := dbfx.Comment(t, issueID, "member reply to the leader", testutil.Cols{
+		"parent_id": parentID,
+	})
+
+	// The dedup read fails, so the completing pass cannot prove the routing and
+	// leaves the obligation owed instead of dropping it or guessing a role.
+	withFailingQueries(t, &failQueriesDB{DBTX: testPool, failQueryRow: "-- name: HasPendingTaskForIssueAndAgentExcludingTriggerCommentInThread"}, func() {
+		if w := completeTaskViaHandler(t, bTaskID, "done"); w.Code != http.StatusOK {
+			t.Fatalf("CompleteTask with unprovable routing: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	if n := retryObligationCount(t, bTaskID); n != 1 {
+		t.Fatalf("retry obligations = %d, want the owed thread-parent reply", n)
+	}
+	if n := pendingTaskCountForAgentIssue(t, issueID, agentB); n != 0 {
+		t.Fatalf("unprovable routing still enqueued %d B task(s), want 0", n)
+	}
+
+	// Leadership moves before the sweep runs.
+	dbfx.Exec(t, `UPDATE squad SET leader_id = $2 WHERE id = $1`, squadID, leaderC)
+	if _, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10); err != nil {
+		t.Fatalf("ReplayCompletionReconcileRetries: %v", err)
+	}
+	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 1 {
+		t.Fatalf("thread-parent retry enqueued %d B task(s), want exactly 1", n)
+	}
+	var trigger string
+	var isLeader bool
+	var squadText string
+	dbfx.QueryRow(t, `SELECT COALESCE(trigger_comment_id::text, ''), is_leader_task, COALESCE(squad_id::text, '') FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`, issueID, agentB).Scan(&trigger, &isLeader, &squadText)
+	if trigger != replyID {
+		t.Fatalf("retry follow-up trigger = %q, want the member reply %q", trigger, replyID)
+	}
+	if isLeader {
+		t.Fatal("retry restored the obsolete squad-leader role (is_leader_task = true)")
+	}
+	if squadText != "" {
+		t.Fatalf("retry restored the stale squad_id %q", squadText)
+	}
+	if n := queuedTaskCountForAgentIssue(t, issueID, leaderC); n != 0 {
+		t.Fatalf("retry fanned the owed reply out to the new leader: %d C task(s), want 0", n)
+	}
+	if n := retryObligationCount(t, bTaskID); n != 0 {
+		t.Fatalf("stale-role obligation left %d element(s), want 0", n)
+	}
+}
+
+// TestCompletionReconcileRetryWriteFailureIsRetryable pins Blocker 3: the
+// durable obligation is not best-effort. When even the obligation write fails,
+// the terminal callback reports a retryable failure; the daemon's replay of that
+// callback is what repairs it -- the existing idempotent terminal callback, no
+// new watchdog. The transition is already committed by then, so the replay must
+// reconcile WITHOUT repeating first-completion-only side effects, and every
+// durable id (fallback, follow-up) stays unique.
+func TestCompletionReconcileRetryWriteFailureIsRetryable(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := seedRetryFixture(t, 999025, "Reconcile Retry WriteFail", func(agentB, _ string) string {
+		return mentionAgentBody(agentB)
+	})
+
+	withFailingQueries(t, &failQueriesDB{
+		DBTX:         testPool,
+		missingTasks: map[string]bool{fx.wTaskID: true},
+		failExec:     "-- name: RecordCompletionReconcileRetryComment",
+	}, func() {
+		if w := completeTaskViaHandler(t, fx.bTaskID, "Processed the inputs delivered to this run"); w.Code != http.StatusInternalServerError {
+			t.Fatalf("CompleteTask with a failed obligation write: expected 500 (retryable), got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	// The terminal transition committed before the failure, and nothing was
+	// durably recorded for the skipped comment.
+	var status string
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, fx.bTaskID).Scan(&status)
+	if status != "completed" {
+		t.Fatalf("task status = %q, want the committed 'completed'", status)
+	}
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("failed obligation write still enqueued %d B task(s), want 0", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
+		t.Fatalf("failed obligation write left %d element(s), want 0", n)
+	}
+
+	// The daemon replays the terminal callback; the retry path re-runs the
+	// reconciliation and durably covers the comment exactly once.
+	if w := completeTaskViaHandler(t, fx.bTaskID, "Processed the inputs delivered to this run"); w.Code != http.StatusOK {
+		t.Fatalf("replayed CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 1 {
+		t.Fatalf("replay covered %d comments, want exactly 1 follow-up", n)
+	}
+	if n := fallbackCommentCountForTask(t, fx.bTaskID); n != 1 {
+		t.Fatalf("replay synthesized %d fallback(s) for the run, want exactly 1", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
+		t.Fatalf("replay left %d retry obligation(s), want 0", n)
+	}
+
+	// A third callback stays a no-op.
+	if w := completeTaskViaHandler(t, fx.bTaskID, "Processed the inputs delivered to this run"); w.Code != http.StatusOK {
+		t.Fatalf("second replay: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 1 {
+		t.Fatalf("second replay enqueued a duplicate follow-up: %d B task(s), want 1", n)
+	}
+	if n := fallbackCommentCountForTask(t, fx.bTaskID); n != 1 {
+		t.Fatalf("second replay synthesized a duplicate fallback: %d, want 1", n)
+	}
+}
+
+// TestCompletionReconcileRetryHonorsCurrentReadiness pins the readiness half of
+// Blockers 2/4: a target that current comment routing refuses must be refused by
+// the retry too. B is archived between the skip and the replay, and the retry
+// must produce the same decision a fresh mention of B produces now.
+func TestCompletionReconcileRetryHonorsCurrentReadiness(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := seedRetryFixture(t, 999026, "Reconcile Retry Readiness", func(agentB, _ string) string {
+		return mentionAgentBody(agentB)
+	})
+	withFailingQueries(t, &failQueriesDB{DBTX: testPool, missingTasks: map[string]bool{fx.wTaskID: true}}, func() {
+		if w := completeTaskViaHandler(t, fx.bTaskID, "done"); w.Code != http.StatusOK {
+			t.Fatalf("CompleteTask under outage: expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+	})
+	if n := retryObligationCount(t, fx.bTaskID); n != 1 {
+		t.Fatalf("retry obligations after the outage = %d, want exactly 1", n)
+	}
+
+	// The target becomes unready: its machine reports a CLI the OS refuses to
+	// execute, which current comment routing refuses (ReasonRuntimeUnusable --
+	// the verdict a human has to repair). The retry must refuse it too instead
+	// of queueing a run that could never start.
+	var runtimeID string
+	dbfx.QueryRow(t, `SELECT COALESCE(runtime_id::text, '') FROM agent WHERE id = $1`, fx.agentB).Scan(&runtimeID)
+	var prevStatus string
+	var prevMetadata []byte
+	if err := testPool.QueryRow(ctx, `SELECT status, metadata FROM agent_runtime WHERE id = $1`, runtimeID).Scan(&prevStatus, &prevMetadata); err != nil {
+		t.Fatalf("setup: load runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `UPDATE agent_runtime SET status = $2, metadata = $3 WHERE id = $1`, runtimeID, prevStatus, prevMetadata)
+	})
+	dbfx.Exec(t, `UPDATE agent_runtime SET status = 'offline', metadata = COALESCE(metadata, '{}'::jsonb) || '{"offline_reason": {"code": "not_executable", "detail": "injected by the reconcile retry test"}}'::jsonb WHERE id = $1`, runtimeID)
+	issue, err := testHandler.Queries.GetIssue(ctx, util.MustParseUUID(fx.issueID))
+	if err != nil {
+		t.Fatalf("setup: load issue: %v", err)
+	}
+	fresh := dbfx.Comment(t, fx.issueID, mentionAgentBody(fx.agentB))
+	freshComment, err := testHandler.Queries.GetComment(ctx, util.MustParseUUID(fresh))
+	if err != nil {
+		t.Fatalf("setup: load fresh comment: %v", err)
+	}
+	testHandler.triggerTasksForComment(ctx, issue, freshComment, nil, "member", testUserID, "", nil, nil)
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("fresh routing enqueued %d task(s) for an unusable target, want 0", n)
+	}
+
+	if _, err := testHandler.ReplayCompletionReconcileRetries(ctx, 10); err != nil {
+		t.Fatalf("ReplayCompletionReconcileRetries: %v", err)
+	}
+	if n := queuedTaskCountForAgentIssue(t, fx.issueID, fx.agentB); n != 0 {
+		t.Fatalf("retry enqueued %d task(s) for an unusable target, want 0", n)
+	}
+	if n := retryObligationCount(t, fx.bTaskID); n != 0 {
+		t.Fatalf("unready obligation left %d element(s), want 0", n)
+	}
+}
+ // TestCompleteTask_SkipsExplicitMentionWhenSourceGone pins the permanent half
