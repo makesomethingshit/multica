@@ -605,6 +605,9 @@ func TestCompletionFallbackTransientHandoffFailureIsRecoverable(t *testing.T) {
 	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 1 {
 		t.Fatalf("recovery created %d runnable coordinator task(s), want exactly 1", got)
 	}
+	if state := completionFallbackState(t, workerTaskID); state != "recorded" {
+		t.Fatalf("recovered fallback state = %q, want recorded", state)
+	}
 }
 
 // TestCompletionFallbackExplicitReplyUnchanged pins §10 Test F (GH #8719): the
@@ -842,6 +845,9 @@ func TestCompletionFallbackAtomicBoundary(t *testing.T) {
 	if stored.CompletionFallbackCommentID.Valid {
 		t.Fatal("failed record left an exact id behind")
 	}
+	if state := completionFallbackState(t, workerTaskID); state != "pending" {
+		t.Fatalf("failed synthesis left state = %q, want pending (explicit obligation for the sweeper)", state)
+	}
 	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, leaderID); got != 0 {
 		t.Fatalf("failed record created %d leader task(s), want 0", got)
 	}
@@ -959,33 +965,21 @@ func (t *lockRendezvousTx) QueryRow(ctx context.Context, sql string, args ...any
 	if t.starter.calls.Add(1) != 1 {
 		return t.Tx.QueryRow(ctx, sql, args...)
 	}
-	return &lockHoldRow{Row: t.Tx.QueryRow(ctx, sql, args...), starter: t.starter}
-}
-
-type lockHoldRow struct {
-	pgx.Row
-	starter *lockRendezvousTxStarter
-}
-
-func (r *lockHoldRow) Scan(dest ...any) error {
-	err := r.Row.Scan(dest...)
-	if err != nil {
-		return err
+	// First synthesis call (the callback): acquire the row lock and confirm
+	// NULL through our own SELECT ... FOR UPDATE, then hold the lock while
+	// the test drives the sweeper into it. The check names the id column
+	// explicitly so later schema appends cannot silently shift it (a
+	// positional Scan-dest check broke exactly that way under migration 552).
+	var record pgtype.UUID
+	if err := t.Tx.QueryRow(ctx, `SELECT completion_fallback_comment_id FROM agent_task_queue WHERE id = $1 FOR UPDATE`, args...).Scan(&record); err == nil && !record.Valid {
+		close(t.starter.started)
+		select {
+		case <-t.starter.release:
+		case <-time.After(30 * time.Second):
+			t.starter.timedOut.Store(true)
+		}
 	}
-	if len(dest) == 0 {
-		return nil
-	}
-	id, ok := dest[len(dest)-1].(*pgtype.UUID)
-	if !ok || id.Valid {
-		return nil
-	}
-	close(r.starter.started)
-	select {
-	case <-r.starter.release:
-	case <-time.After(30 * time.Second):
-		r.starter.timedOut.Store(true)
-	}
-	return nil
+	return t.Tx.QueryRow(ctx, sql, args...)
 }
 
 // waitSweeperRowLockWait blocks until pg_stat_activity shows the recorded
@@ -1483,6 +1477,49 @@ type workerReplyRegistrationDB struct {
 	calls  int
 }
 
+// fallbackObligationFixture builds one leader + worker + squad + squad-assigned
+// issue + completed leader source task + delegation root comment for the GH
+// #8719 obligation-state tests.
+type fallbackObligationFixture struct {
+	leaderRuntimeID, workerRuntimeID                       string
+	leaderID, workerID, squadID, issueID, sourceID, rootID string
+}
+
+func newFallbackObligationFixture(t *testing.T, name string) fallbackObligationFixture {
+	t.Helper()
+	var fx fallbackObligationFixture
+	fx.leaderRuntimeID = dbfx.Runtime(t, "Fallback obligation leader runtime "+name)
+	fx.leaderID = dbfx.Agent(t, "Fallback obligation leader "+name, fx.leaderRuntimeID, testutil.Cols{"max_concurrent_tasks": 3})
+	fx.workerRuntimeID = dbfx.Runtime(t, "Fallback obligation worker runtime "+name)
+	fx.workerID = dbfx.Agent(t, "Fallback obligation worker "+name, fx.workerRuntimeID)
+	fx.squadID = dbfx.Squad(t, "Fallback obligation squad "+name, fx.leaderID)
+	dbfx.SquadMember(t, fx.squadID, "agent", fx.workerID)
+	fx.issueID = dbfx.Issue(t, "Fallback obligation "+name, testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": fx.squadID,
+	})
+	fx.sourceID = dbfx.Task(t, fx.leaderID, testutil.Cols{
+		"runtime_id": fx.leaderRuntimeID, "issue_id": fx.issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": fx.squadID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	fx.rootID = dbfx.Comment(t, fx.issueID, fmt.Sprintf("[@Worker](mention://agent/%s) do the work "+name, fx.workerID), testutil.Cols{
+		"author_type": "agent", "author_id": fx.leaderID, "source_task_id": fx.sourceID,
+	})
+	return fx
+}
+
+// completionFallbackState reads the durable obligation state of a worker run:
+// "" for legacy/NULL rows, otherwise pending/recorded/settled.
+func completionFallbackState(t *testing.T, taskID string) string {
+	t.Helper()
+	var state *string
+	dbfx.QueryRow(t, `SELECT completion_fallback_state FROM agent_task_queue WHERE id = $1`, taskID).Scan(&state)
+	if state == nil {
+		return ""
+	}
+	return *state
+}
+
 func (d *workerReplyRegistrationDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
 	if strings.Contains(query, "-- name: RegisterPlannedCommentForActiveTask :one") {
 		d.calls++
@@ -1494,4 +1531,368 @@ func (d *workerReplyRegistrationDB) QueryRow(ctx context.Context, query string, 
 		}
 	}
 	return d.DBTX.QueryRow(ctx, query, args...)
+}
+
+// fallbackLineageFixture builds two squads (A led by leaderA, B led by
+// leaderB), a worker member of A, and an issue assigned to assigneeSquad
+// ("A" or "B") plus a completed leader source task of squad A, for the GH
+// #8719 assigned-lineage proof tests.
+type fallbackLineageFixture struct {
+	leaderARuntime, workerRuntime, leaderBRuntime              string
+	leaderA, worker, leaderB, squadA, squadB, issueID, sourceA string
+}
+
+func newFallbackLineageFixture(t *testing.T, name, assignee string) fallbackLineageFixture {
+	t.Helper()
+	var fx fallbackLineageFixture
+	fx.leaderARuntime = dbfx.Runtime(t, "Fallback lineage A leader runtime "+name)
+	fx.leaderA = dbfx.Agent(t, "Fallback lineage A leader "+name, fx.leaderARuntime, testutil.Cols{"max_concurrent_tasks": 3})
+	fx.workerRuntime = dbfx.Runtime(t, "Fallback lineage worker runtime "+name)
+	fx.worker = dbfx.Agent(t, "Fallback lineage worker "+name, fx.workerRuntime)
+	fx.leaderBRuntime = dbfx.Runtime(t, "Fallback lineage B leader runtime "+name)
+	fx.leaderB = dbfx.Agent(t, "Fallback lineage B leader "+name, fx.leaderBRuntime, testutil.Cols{"max_concurrent_tasks": 3})
+	fx.squadA = dbfx.Squad(t, "Fallback lineage squad A "+name, fx.leaderA)
+	dbfx.SquadMember(t, fx.squadA, "agent", fx.worker)
+	fx.squadB = dbfx.Squad(t, "Fallback lineage squad B "+name, fx.leaderB)
+	assigneeID := fx.squadA
+	if assignee == "B" {
+		assigneeID = fx.squadB
+	}
+	fx.issueID = dbfx.Issue(t, "Fallback lineage "+name, testutil.Cols{
+		"status": "in_progress", "assignee_type": "squad", "assignee_id": assigneeID,
+	})
+	fx.sourceA = dbfx.Task(t, fx.leaderA, testutil.Cols{
+		"runtime_id": fx.leaderARuntime, "issue_id": fx.issueID, "status": "completed",
+		"is_leader_task": true, "squad_id": fx.squadA,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	return fx
+}
+
+func runnableTaskCount(t *testing.T, issueID, agentID string) int {
+	t.Helper()
+	return dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID, agentID)
+}
+
+// TestCompletionFallbackReassignedSquadDoesNotWake pins Blocker 3 (GH #8719
+// human spec): a worker delegated by squad A whose issue is reassigned to
+// squad B must not wake B's leader on fallback recovery. The exact parent
+// delegation still routes to the original delegator (guest path preserved).
+func TestCompletionFallbackReassignedSquadDoesNotWake(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackLineageFixture(t, "reassignment", "A")
+	rootID := dbfx.Comment(t, fx.issueID, fmt.Sprintf("[@Worker](mention://agent/%s) do the reassigned work", fx.worker), testutil.Cols{
+		"author_type": "agent", "author_id": fx.leaderA, "source_task_id": fx.sourceA,
+	})
+	workerTaskID := dbfx.Task(t, fx.worker, testutil.Cols{
+		"runtime_id": fx.workerRuntime, "issue_id": fx.issueID, "status": "running",
+		"trigger_comment_id": rootID, "squad_id": fx.squadA, "delegated_from_task_id": fx.sourceA,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + rootID + "'::uuid]"),
+	})
+	dbfx.Exec(t, `UPDATE issue SET assignee_id = $1 WHERE id = $2`, fx.squadB, fx.issueID)
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("reassigned completion = (transitioned=%v fallback_valid=%v err=%v), want synthesized fallback", transitioned, fallbackID.Valid, err)
+	}
+	if got := runnableTaskCount(t, fx.issueID, fx.leaderB); got != 0 {
+		t.Fatalf("reassignment woke %d squad B leader task(s), want 0", got)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	if got := runnableTaskCount(t, fx.issueID, fx.leaderB); got != 0 {
+		t.Fatalf("sweeper woke %d squad B leader task(s) after reassignment, want 0", got)
+	}
+	if got := runnableTaskCount(t, fx.issueID, fx.leaderA); got != 1 {
+		t.Fatalf("original delegator has %d runnable task(s), want exactly 1 (guest lineage preserved)", got)
+	}
+}
+
+// TestCompletionFallbackForeignSourceIssueDoesNotWake pins Blocker 3: a
+// DelegatedFromTaskID pointing at another issue proves nothing about this
+// issue's coordinator, so no one wakes and the row settles.
+func TestCompletionFallbackForeignSourceIssueDoesNotWake(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackLineageFixture(t, "foreign source", "B")
+	foreignIssueID := dbfx.Issue(t, "Fallback lineage foreign issue", testutil.Cols{"status": "in_progress"})
+	foreignSourceID := dbfx.Task(t, fx.leaderA, testutil.Cols{
+		"runtime_id": fx.leaderARuntime, "issue_id": foreignIssueID, "status": "completed",
+		"is_leader_task": true, "squad_id": fx.squadA,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	workerTaskID := dbfx.Task(t, fx.worker, testutil.Cols{
+		"runtime_id": fx.workerRuntime, "issue_id": fx.issueID, "status": "running",
+		"squad_id": fx.squadA, "delegated_from_task_id": foreignSourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("foreign-source completion = (transitioned=%v fallback_valid=%v err=%v), want synthesized fallback", transitioned, fallbackID.Valid, err)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	if got := runnableTaskCount(t, fx.issueID, fx.leaderB); got != 0 {
+		t.Fatalf("foreign source woke %d task(s), want 0", got)
+	}
+	if got := runnableTaskCount(t, fx.issueID, fx.leaderA); got != 0 {
+		t.Fatalf("foreign source woke %d original-squad task(s), want 0", got)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "settled" {
+		t.Fatalf("foreign-source row state = %q, want settled", state)
+	}
+}
+
+// TestCompletionFallbackNonLeaderSourceDoesNotWake pins Blocker 3: a
+// DelegatedFromTaskID pointing at a non-leader task proves no delegation
+// edge, so no one wakes and the row settles.
+func TestCompletionFallbackNonLeaderSourceDoesNotWake(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackLineageFixture(t, "non-leader source", "B")
+	nonLeaderSourceID := dbfx.Task(t, fx.worker, testutil.Cols{
+		"runtime_id": fx.workerRuntime, "issue_id": fx.issueID, "status": "completed",
+		"squad_id":           fx.squadA,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"result": testutil.Raw(`'{"output":"prior work."}'::jsonb`),
+	})
+	workerTaskID := dbfx.Task(t, fx.worker, testutil.Cols{
+		"runtime_id": fx.workerRuntime, "issue_id": fx.issueID, "status": "running",
+		"squad_id": fx.squadA, "delegated_from_task_id": nonLeaderSourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("non-leader-source completion = (transitioned=%v fallback_valid=%v err=%v), want synthesized fallback", transitioned, fallbackID.Valid, err)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status IN ('queued','dispatched','running','waiting_local_directory')", fx.issueID); got != 0 {
+		t.Fatalf("non-leader source woke %d task(s), want 0", got)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "settled" {
+		t.Fatalf("non-leader-source row state = %q, want settled", state)
+	}
+}
+
+// TestCompletionFallbackSquadMismatchDoesNotWake pins Blocker 3: a source
+// task whose squad differs from the current target squad proves no edge to
+// this coordinator, so no one wakes and the row settles.
+func TestCompletionFallbackSquadMismatchDoesNotWake(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackLineageFixture(t, "squad mismatch", "B")
+	workerTaskID := dbfx.Task(t, fx.worker, testutil.Cols{
+		"runtime_id": fx.workerRuntime, "issue_id": fx.issueID, "status": "running",
+		"squad_id": fx.squadA, "delegated_from_task_id": fx.sourceA,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("mismatch completion = (transitioned=%v fallback_valid=%v err=%v), want synthesized fallback", transitioned, fallbackID.Valid, err)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status IN ('queued','dispatched','running','waiting_local_directory')", fx.issueID); got != 0 {
+		t.Fatalf("squad mismatch woke %d task(s), want 0", got)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "settled" {
+		t.Fatalf("mismatch row state = %q, want settled", state)
+	}
+}
+
+// TestCompletionFallbackHistoricalRowNotRecovered pins Blocker 1 (GH #8719
+// human spec): a pre-migration completed delegated worker row (NULL fallback
+// state) is never a recovery obligation, even though it matches the old
+// NULL-record-id shape. The sweeper must create no fallback and wake nobody,
+// and must leave the row untouched.
+func TestCompletionFallbackHistoricalRowNotRecovered(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackObligationFixture(t, "historical row")
+	workerTaskID := dbfx.Task(t, fx.workerID, testutil.Cols{
+		"runtime_id": fx.workerRuntimeID, "issue_id": fx.issueID, "status": "completed",
+		"trigger_comment_id": fx.rootID, "squad_id": fx.squadID, "delegated_from_task_id": fx.sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + fx.rootID + "'::uuid]"),
+		"result":                testutil.Raw(`'{"output":"The delegated work is complete."}'::jsonb`),
+		"completed_at":          testutil.Raw("now() - interval '30 days'"),
+	})
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, fx.workerID); got != 0 {
+		t.Fatalf("historical row synthesized %d fallback comment(s), want 0", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", fx.issueID, fx.leaderID); got != 0 {
+		t.Fatalf("historical row woke %d coordinator task(s), want 0", got)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "" {
+		t.Fatalf("historical row state = %q, want NULL (untouched)", state)
+	}
+}
+
+// TestCompletionFallbackPendingRowLateSynthesized pins the explicit pending
+// obligation path (GH #8719 human spec Blocker 1): only a row the new
+// completion path marked pending is a late-synthesis candidate. The sweeper
+// must synthesize exactly one fallback, record its id, and wake exactly one
+// covered coordinator run.
+func TestCompletionFallbackPendingRowLateSynthesized(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackObligationFixture(t, "pending row")
+	workerTaskID := dbfx.Task(t, fx.workerID, testutil.Cols{
+		"runtime_id": fx.workerRuntimeID, "issue_id": fx.issueID, "status": "completed",
+		"trigger_comment_id": fx.rootID, "squad_id": fx.squadID, "delegated_from_task_id": fx.sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + fx.rootID + "'::uuid]"),
+		"result":                testutil.Raw(`'{"output":"The delegated work is complete."}'::jsonb`),
+	})
+	dbfx.Exec(t, `UPDATE agent_task_queue SET completion_fallback_state = 'pending' WHERE id = $1`, workerTaskID)
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	var fallbackID string
+	dbfx.QueryRow(t, `SELECT id FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, fx.workerID).Scan(&fallbackID)
+	if fallbackID == "" {
+		t.Fatal("pending row was not late-synthesized")
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, fx.workerID); got != 1 {
+		t.Fatalf("pending row left %d fallback comment(s), want exactly 1", got)
+	}
+	stored, err := testHandler.Queries.GetAgentTask(ctx, parseUUID(workerTaskID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.CompletionFallbackCommentID.Valid || uuidToString(stored.CompletionFallbackCommentID) != fallbackID {
+		t.Fatal("pending row did not record the synthesized fallback id")
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "recorded" {
+		t.Fatalf("pending row state = %q, want recorded", state)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", fx.issueID, fx.leaderID); got != 1 {
+		t.Fatalf("pending row recovery left %d runnable coordinator task(s), want exactly 1", got)
+	}
+	next := claimWorkerReplyRun(t, fx.leaderRuntimeID)
+	if next == nil || !next.IsLeaderTask || !slices.Contains(next.DeliveredCommentIDs, fallbackID) {
+		t.Fatalf("recovery did not deliver the fallback to the coordinator: task=%+v", next)
+	}
+}
+
+// TestCompletionFallbackTrivialSettlesOnce pins Blocker 1 for trivial output
+// (GH #8719 human spec): a run the completion path judges not to need a
+// fallback settles durably, so later sweeps never reselect it.
+func TestCompletionFallbackTrivialSettlesOnce(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackObligationFixture(t, "trivial settle")
+	workerTaskID := dbfx.Task(t, fx.workerID, testutil.Cols{
+		"runtime_id": fx.workerRuntimeID, "issue_id": fx.issueID, "status": "running",
+		"trigger_comment_id": fx.rootID, "squad_id": fx.squadID, "delegated_from_task_id": fx.sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + fx.rootID + "'::uuid]"),
+	})
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"done"}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || fallbackID.Valid {
+		t.Fatalf("trivial completion = (transitioned=%v fallback_valid=%v err=%v), want completed run with no fallback", transitioned, fallbackID.Valid, err)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, fx.workerID); got != 0 {
+		t.Fatalf("trivial output synthesized %d comment(s), want 0", got)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "settled" {
+		t.Fatalf("trivial row state = %q, want settled", state)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, fx.workerID); got != 0 {
+		t.Fatalf("sweeper resynthesized %d comment(s) for the settled trivial row, want 0", got)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", fx.issueID, fx.leaderID); got != 0 {
+		t.Fatalf("settled trivial row woke %d coordinator task(s), want 0", got)
+	}
+}
+
+// TestCompletionFallbackPermanentInvalidSettles pins Blocker 1 + review 2a
+// (GH #8719): a recorded fallback whose lineage proves permanently invalid
+// settles on the first sweep that discovers it, so later sweeps never
+// redispatch it and the bounded scan keeps progressing.
+func TestCompletionFallbackPermanentInvalidSettles(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	foreignWS := dbfx.Workspace(t, "Fallback invalid settle foreign workspace", "fb-8719-invalid-settle")
+	foreignIssue := dbfx.Issue(t, "Fallback invalid settle foreign issue", testutil.Cols{"workspace_id": foreignWS})
+	foreignComment := dbfx.Comment(t, foreignIssue, "foreign delegation", testutil.Cols{"workspace_id": foreignWS})
+	workerID := dbfx.Agent(t, "Fallback invalid settle worker", testRuntimeID)
+	issueID := dbfx.Issue(t, "Fallback invalid lineage settles", testutil.Cols{"status": "in_progress"})
+	workerTaskID := dbfx.Task(t, workerID, testutil.Cols{
+		"runtime_id": testRuntimeID, "issue_id": issueID, "status": "running",
+		"trigger_comment_id": foreignComment,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + foreignComment + "'::uuid]"),
+	})
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("invalid-lineage completion = (transitioned=%v fallback_valid=%v err=%v), want synthesized fallback", transitioned, fallbackID.Valid, err)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "recorded" {
+		t.Fatalf("synthesized row state = %q, want recorded", state)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("first sweeper run failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID); got != 0 {
+		t.Fatalf("invalid lineage woke %d task(s), want 0", got)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "settled" {
+		t.Fatalf("invalid row state after first sweep = %q, want settled", state)
+	}
+	rows, err := testHandler.Queries.ListPendingCompletionFallbacks(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if uuidToString(row.WorkerTaskID) == workerTaskID {
+			t.Fatal("settled invalid fallback still listed as pending")
+		}
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("second sweeper run failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status IN ('queued','dispatched','running','waiting_local_directory')", issueID); got != 0 {
+		t.Fatalf("second sweep woke %d task(s), want 0", got)
+	}
 }

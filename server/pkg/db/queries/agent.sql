@@ -2108,6 +2108,7 @@ WHERE fallback.author_type = 'agent'
   AND fallback.deleted_at IS NULL
   AND worker.status = 'completed'
   AND NOT worker.is_leader_task
+  AND worker.completion_fallback_state IS DISTINCT FROM 'settled'
   AND NOT EXISTS (
       SELECT 1
       FROM agent_task_queue AS covering
@@ -2122,10 +2123,35 @@ LIMIT @max_per_tick::int;
 -- name: RecordCompletionFallbackComment :exec
 -- Records the synthesized completion fallback (GH #8719) on its worker run so
 -- completion reconcile and the sweeper replay identify it exactly instead of
--- shape-matching every agent comment the run authored.
+-- shape-matching every agent comment the run authored. The state flips to
+-- 'recorded' in the same statement, so insert + id/state record stay atomic.
 UPDATE agent_task_queue
-SET completion_fallback_comment_id = @fallback_id::uuid
+SET completion_fallback_comment_id = @fallback_id::uuid,
+    completion_fallback_state = 'recorded'
 WHERE id = @task_id::uuid;
+
+-- name: MarkCompletionFallbackPending :exec
+-- Records an explicit pending fallback obligation (GH #8719) when the new
+-- completion path decided synthesis is needed but has not persisted it yet.
+-- Only fresh rows (no state, no recorded id) transition: historical rows
+-- stay NULL forever and recorded rows are never demoted.
+UPDATE agent_task_queue
+SET completion_fallback_state = 'pending'
+WHERE id = @task_id::uuid
+  AND completion_fallback_state IS NULL
+  AND completion_fallback_comment_id IS NULL;
+
+-- name: SettleCompletionFallback :exec
+-- Terminal state for a worker run that needs no (further) fallback recovery
+-- (GH #8719): trivial output, suppressed or explicit replies, or permanently
+-- invalid lineage. Settled rows leave the bounded sweeper scans. A recorded
+-- fallback id is never cleared; settling a recorded row requires passing its
+-- exact id, so a stray settle cannot orphan a dispatchable obligation.
+UPDATE agent_task_queue
+SET completion_fallback_state = 'settled'
+WHERE id = @task_id::uuid
+  AND (completion_fallback_comment_id IS NULL
+    OR completion_fallback_comment_id = @fallback_id::uuid);
 
 -- name: GetAgentTaskForUpdate :one
 -- FOR UPDATE variant for completion-fallback synthesis (GH #8719). Locks the
@@ -2138,27 +2164,20 @@ WHERE id = @task_id::uuid
 FOR UPDATE;
 
 -- name: ListCompletionFallbackOwedRuns :many
--- Only delegated workers with output and no explicit reply can owe a fallback.
--- Keep unrelated completed runs out of the bounded scan so they cannot starve
--- a real handoff. The service still applies the completion-time suppression
--- and trivial-output checks before synthesizing anything.
+-- Late-synthesis candidates: completed non-leader runs whose completion path
+-- explicitly recorded a pending fallback obligation (GH #8719). The predicate
+-- is the durable state -- never a NULL record id -- so pre-migration
+-- historical rows (NULL state) and settled rows (delivered, invalid, or
+-- not-needed) can never enter the bounded scan. The service replays the
+-- creation-time suppression/reply/trivial checks before synthesizing and
+-- settles rows that need no fallback, so every listed row resolves to a
+-- terminal state within bounded touches and only transient failures retry.
 SELECT worker.id FROM agent_task_queue AS worker
-JOIN agent_task_queue AS source ON source.id = worker.delegated_from_task_id
-  AND source.issue_id = worker.issue_id
 WHERE worker.status = 'completed'
   AND NOT worker.is_leader_task
-  AND source.is_leader_task
   AND worker.issue_id IS NOT NULL
-  AND worker.completion_fallback_comment_id IS NULL
+  AND worker.completion_fallback_state = 'pending'
   AND NULLIF(worker.result->>'output', '') IS NOT NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM comment AS reply
-      WHERE reply.issue_id = worker.issue_id
-        AND reply.author_type = 'agent'
-        AND reply.author_id = worker.agent_id
-        AND reply.created_at >= COALESCE(worker.started_at, worker.created_at)
-        AND reply.deleted_at IS NULL
-  )
 ORDER BY worker.completed_at DESC NULLS LAST, worker.id DESC
 LIMIT @max_per_tick::int;
 

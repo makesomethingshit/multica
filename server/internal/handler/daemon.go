@@ -4476,6 +4476,12 @@ func (h *Handler) routeCompletionFallbackComment(ctx context.Context, task *db.A
 	}
 }
 
+// settleInvalidCompletionFallback best-effort settles a permanently invalid
+// fallback so the bounded sweeper stops reselecting it (GH #8719).
+func (h *Handler) settleInvalidCompletionFallback(ctx context.Context, taskID, fallbackID pgtype.UUID) {
+	h.TaskService.SettleCompletionFallbackState(ctx, taskID, fallbackID)
+}
+
 // dispatchCompletionFallback resolves the fallback's coordinator and enqueues
 // exactly one handoff. The bool reports proven-invalid lineage (permanent
 // fail-closed); any error is transient and the persisted fallback comment
@@ -4488,6 +4494,7 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 	if err != nil {
 		// A deleted issue is permanent; a read failure stays replayable.
 		if errors.Is(err, pgx.ErrNoRows) {
+			h.settleInvalidCompletionFallback(ctx, task.ID, fallbackCommentID)
 			return false, true, nil
 		}
 		return false, false, err
@@ -4496,6 +4503,7 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 	if err != nil {
 		// A deleted fallback row is permanent; a read failure is transient.
 		if errors.Is(err, pgx.ErrNoRows) {
+			h.settleInvalidCompletionFallback(ctx, task.ID, fallbackCommentID)
 			return false, true, nil
 		}
 		return false, false, err
@@ -4515,6 +4523,7 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 		})
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				h.settleInvalidCompletionFallback(ctx, task.ID, fallbackCommentID)
 				return false, true, nil
 			}
 			return false, false, err
@@ -4526,6 +4535,7 @@ func (h *Handler) dispatchCompletionFallback(ctx context.Context, task *db.Agent
 		return false, false, err
 	}
 	if provenInvalid {
+		h.settleInvalidCompletionFallback(ctx, task.ID, fallbackCommentID)
 		return false, true, nil
 	}
 	return routed, false, nil
@@ -4652,7 +4662,12 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 				// they are not proven-invalid lineage.
 				continue
 			}
-			if !srcTask.IsLeaderTask && srcTask.Status == "completed" {
+			// Fallback identity is the exact recorded comment id -- never a
+			// shape match on completed non-leader authorship. An explicit
+			// worker reply carries the same (agent, source run) shape but has
+			// no record, so it falls through to normal reconciliation below.
+			if srcTask.CompletionFallbackCommentID.Valid &&
+				uuidToString(srcTask.CompletionFallbackCommentID) == uuidToString(c.ID) {
 				continue
 			}
 		}
