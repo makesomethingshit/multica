@@ -1896,3 +1896,130 @@ func TestCompletionFallbackPermanentInvalidSettles(t *testing.T) {
 		t.Fatalf("second sweep woke %d task(s), want 0", got)
 	}
 }
+
+// failMarkPendingTxStarter begins real transactions whose
+// MarkCompletionFallbackPending statement fails, standing in for any
+// failure while recording the pending obligation inside the completion
+// transaction. The completion must roll back atomically: the run stays
+// runnable with a NULL state instead of completing unmarked (GH #8719).
+type failMarkPendingTxStarter struct {
+	delegate *pgxpool.Pool
+}
+
+type failMarkPendingTx struct {
+	pgx.Tx
+}
+
+func (s *failMarkPendingTxStarter) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := s.delegate.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return failMarkPendingTx{Tx: tx}, nil
+}
+
+func (t failMarkPendingTx) Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
+	if strings.Contains(query, "-- name: MarkCompletionFallbackPending") {
+		return pgconn.CommandTag{}, errors.New("injected pending mark failure")
+	}
+	return t.Tx.Exec(ctx, query, args...)
+}
+
+// TestCompletionFallbackPendingMarkFailureAbortsCompletion pins the pending
+// path (GH #8719): a mark failure inside the completion transaction aborts
+// the completion itself -- the run stays runnable with a NULL state, never
+// completing unmarked and invisible to the owed scan. A retry then succeeds,
+// and a synthesis failure on the retry still leaves a pending obligation the
+// sweeper late-synthesizes into exactly one covered coordinator run.
+func TestCompletionFallbackPendingMarkFailureAbortsCompletion(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackObligationFixture(t, "mark failure aborts")
+	workerTaskID := dbfx.Task(t, fx.workerID, testutil.Cols{
+		"runtime_id": fx.workerRuntimeID, "issue_id": fx.issueID, "status": "running",
+		"trigger_comment_id": fx.rootID, "squad_id": fx.squadID, "delegated_from_task_id": fx.sourceID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+		"delivered_comment_ids": testutil.Raw("ARRAY['" + fx.rootID + "'::uuid]"),
+	})
+	originalTxStarter := testHandler.TaskService.TxStarter
+	testHandler.TaskService.TxStarter = &failMarkPendingTxStarter{delegate: testPool}
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	testHandler.TaskService.TxStarter = originalTxStarter
+	if err == nil || transitioned || fallbackID.Valid {
+		t.Fatalf("mark failure = (transitioned=%v fallback_valid=%v err=%v), want aborted completion", transitioned, fallbackID.Valid, err)
+	}
+	var status string
+	dbfx.QueryRow(t, `SELECT status FROM agent_task_queue WHERE id = $1`, workerTaskID).Scan(&status)
+	if status != "running" {
+		t.Fatalf("aborted completion left status = %q, want running", status)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "" {
+		t.Fatalf("aborted completion left state = %q, want NULL", state)
+	}
+	if got := dbfx.Count(t, `SELECT count(*) FROM comment WHERE source_task_id = $1 AND author_id = $2`, workerTaskID, fx.workerID); got != 0 {
+		t.Fatalf("aborted completion left %d comment(s), want 0", got)
+	}
+	// Retry with a synthesis failure: the run completes with a pending
+	// obligation and no fallback of its own...
+	testHandler.TaskService.TxStarter = &failRecordCompletionTxStarter{delegate: testPool}
+	_, transitioned, fallbackID, err = testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	testHandler.TaskService.TxStarter = originalTxStarter
+	if err != nil || !transitioned || fallbackID.Valid {
+		t.Fatalf("retry = (transitioned=%v fallback_valid=%v err=%v), want completed run with no fallback id", transitioned, fallbackID.Valid, err)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "pending" {
+		t.Fatalf("retry left state = %q, want pending", state)
+	}
+	// ...which the next sweep late-synthesizes into exactly one covered run.
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper recovery failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched','running','waiting_local_directory')", fx.issueID, fx.leaderID); got != 1 {
+		t.Fatalf("sweeper recovery left %d runnable coordinator task(s), want exactly 1", got)
+	}
+}
+
+// TestCompletionFallbackSameSquadNonLeaderSourceDoesNotWake pins the
+// always-verify half of the lineage proof (GH #8719 human spec): a
+// DelegatedFromTaskID edge is proven even when the worker's squad already
+// matches the target squad. A same-squad worker pointing at a non-leader
+// source task must wake nobody; skipping verification on squad equality
+// would wake the leader here.
+func TestCompletionFallbackSameSquadNonLeaderSourceDoesNotWake(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	fx := newFallbackLineageFixture(t, "same-squad nonleader source", "A")
+	nonLeaderID := dbfx.Task(t, fx.worker, testutil.Cols{
+		"runtime_id": fx.workerRuntime, "issue_id": fx.issueID, "status": "completed",
+		"is_leader_task": false, "squad_id": fx.squadA,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	workerTaskID := dbfx.Task(t, fx.worker, testutil.Cols{
+		"runtime_id": fx.workerRuntime, "issue_id": fx.issueID, "status": "running",
+		"squad_id": fx.squadA, "delegated_from_task_id": nonLeaderID,
+		"originator_user_id": testUserID, "accountable_user_id": testUserID,
+	})
+	_, transitioned, fallbackID, err := testHandler.TaskService.CompleteTaskWithTransition(
+		ctx, parseUUID(workerTaskID), []byte(`{"output":"The delegated work is complete."}`), "", "", "", false, "", "",
+	)
+	if err != nil || !transitioned || !fallbackID.Valid {
+		t.Fatalf("completion = (transitioned=%v fallback_valid=%v err=%v), want synthesized fallback", transitioned, fallbackID.Valid, err)
+	}
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper run failed: %v", err)
+	}
+	if got := dbfx.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND status IN ('queued','dispatched','running','waiting_local_directory')", fx.issueID); got != 0 {
+		t.Fatalf("same-squad non-leader source woke %d task(s), want 0", got)
+	}
+	if state := completionFallbackState(t, workerTaskID); state != "settled" {
+		t.Fatalf("row state = %q, want settled", state)
+	}
+}

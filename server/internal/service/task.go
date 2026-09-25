@@ -1580,15 +1580,13 @@ func resolveCompletionFallbackAssignedTarget(ctx context.Context, q *db.Queries,
 	if util.UUIDToString(squad.LeaderID) == util.UUIDToString(workerTask.AgentID) {
 		return invalid()
 	}
-	// Delegation edge proof: when the worker's squad does not match the target
-	// squad, DelegatedFromTaskID must point at a real source task proving this
-	// coordinator delegated the worker. The issue's current assignee alone is
-	// never enough -- e.g. after a squad reassignment the stale delegation must
-	// not wake the new squad's leader. Any mismatch fails closed (GH #8719).
-	if !workerTask.SquadID.Valid || util.UUIDToString(workerTask.SquadID) != util.UUIDToString(squad.ID) {
-		if !workerTask.DelegatedFromTaskID.Valid {
-			return invalid()
-		}
+	// Delegation edge proof: whenever DelegatedFromTaskID is set, it must point
+	// at a real source task proving this coordinator delegated the worker --
+	// even when the worker's squad already matches the target squad, since a
+	// stale or forged edge must never wake a leader on the issue's current
+	// assignee alone (e.g. after a squad reassignment, or a source row from
+	// another issue). Any mismatch fails closed (GH #8719).
+	if workerTask.DelegatedFromTaskID.Valid {
 		source, err := q.GetAgentTask(ctx, workerTask.DelegatedFromTaskID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -1608,6 +1606,10 @@ func resolveCompletionFallbackAssignedTarget(ctx context.Context, q *db.Queries,
 		if !source.AgentID.Valid || util.UUIDToString(source.AgentID) != util.UUIDToString(squad.LeaderID) {
 			return invalid()
 		}
+	} else if !workerTask.SquadID.Valid || util.UUIDToString(workerTask.SquadID) != util.UUIDToString(squad.ID) {
+		// No delegation edge and no squad membership: the issue's current
+		// assignee alone never proves this coordinator delegated the worker.
+		return invalid()
 	}
 	agent, err := q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
 		ID:          squad.LeaderID,
@@ -4759,6 +4761,20 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 			return err
 		}
 
+		// Record the fallback obligation in the same transaction as the
+		// status flip (GH #8719): a post-commit mark that fails -- or a crash
+		// before it runs -- would leave a fresh row NULL, indistinguishable
+		// from a pre-migration historical row and invisible to the owed scan.
+		// Marking every issue completion is safe: rows that need no fallback
+		// are settled by the post-commit path, or by the owed replay on the
+		// next sweep if this process dies first. Fresh-rows-only keeps
+		// historical NULLs and recorded rows untouched.
+		if t.IssueID.Valid {
+			if err := qtx.MarkCompletionFallbackPending(ctx, taskID); err != nil {
+				return fmt.Errorf("mark completion fallback pending: %w", err)
+			}
+		}
+
 		if t.ChatSessionID.Valid {
 			// Pin the chat_session's runtime_id alongside the session_id so the
 			// next claim can apply the runtime-guard. Both fields move together:
@@ -4887,12 +4903,11 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 						)
 						s.SettleCompletionFallbackState(ctx, task.ID, pgtype.UUID{})
 					} else {
-						// Mark the pending obligation durably BEFORE attempting
-						// synthesis: if the synthesis transaction fails (or the
-						// process dies), the sweeper late synthesis owns recovery.
-						// Synthesis success flips the state to 'recorded'
-						// atomically with the id (GH #8719).
-						s.markCompletionFallbackPending(ctx, task.ID)
+						// The pending obligation was recorded atomically with
+						// the status flip above: if this synthesis fails (or
+						// the process dies), the sweeper late synthesis owns
+						// recovery. Synthesis success flips the state to
+						// 'recorded' atomically with the id (GH #8719).
 						id, err := s.synthesizeCompletionFallbackComment(ctx, task, body)
 						if err != nil {
 							slog.Warn("synthesizing completion fallback failed",
@@ -7201,21 +7216,6 @@ func (s *TaskService) replayCompletionFallbackRow(ctx context.Context, row db.Li
 		parentComment = &parent
 	}
 	return s.DispatchCompletionFallbackByLineage(ctx, issue, workerTask, fallback, parentComment)
-}
-
-// markCompletionFallbackPending durably records that the new completion path
-// decided this run needs fallback synthesis (GH #8719). Only fresh rows (no
-// state, no recorded id) transition, so pre-migration historical rows stay
-// NULL forever and recorded rows are never demoted. Best-effort: if the mark
-// itself fails, synthesis is still attempted, and a synthesis failure without
-// a mark behaves like the pre-state design (warned, sweeper-unaware).
-func (s *TaskService) markCompletionFallbackPending(ctx context.Context, taskID pgtype.UUID) {
-	if err := s.Queries.MarkCompletionFallbackPending(ctx, taskID); err != nil {
-		slog.Warn("marking completion fallback pending failed",
-			"task_id", util.UUIDToString(taskID),
-			"error", err,
-		)
-	}
 }
 
 // SettleCompletionFallbackState moves a run to the terminal 'settled' state

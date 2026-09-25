@@ -4656,18 +4656,26 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		if c.AuthorType == "agent" && c.SourceTaskID.Valid {
 			srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID)
 			if err != nil {
-				// Fail closed: an unverifiable lineage claim must never
-				// fall through to generic mention parsing. Transient
-				// lookup failures stay pending for the sweeper replay;
-				// they are not proven-invalid lineage.
-				continue
-			}
-			// Fallback identity is the exact recorded comment id -- never a
-			// shape match on completed non-leader authorship. An explicit
-			// worker reply carries the same (agent, source run) shape but has
-			// no record, so it falls through to normal reconciliation below.
-			if srcTask.CompletionFallbackCommentID.Valid &&
+				if errors.Is(err, pgx.ErrNoRows) {
+					// Permanently unverifiable lineage: the source run is
+					// gone, so this comment can neither be
+					// originator-resolved through it nor owned by the
+					// fallback sweeper. Skip it here.
+					continue
+				}
+				// Transient infrastructure failure: the comment may be an
+				// explicit worker reply, which -- unlike a recorded fallback
+				// owned by the sweeper replay -- has no durable redelivery.
+				// Fall through to normal reconciliation rather than
+				// dropping it. The scoped replay below still requires an
+				// explicit mention of this agent or a planned input, so an
+				// unreadable fallback body cannot fan out (GH #8719).
+			} else if srcTask.CompletionFallbackCommentID.Valid &&
 				uuidToString(srcTask.CompletionFallbackCommentID) == uuidToString(c.ID) {
+				// Fallback identity is the exact recorded comment id -- never a
+				// shape match on completed non-leader authorship. An explicit
+				// worker reply carries the same (agent, source run) shape but has
+				// no record, so it falls through to normal reconciliation below.
 				continue
 			}
 		}
