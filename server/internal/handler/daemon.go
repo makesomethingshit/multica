@@ -4589,6 +4589,58 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 	}
 	agentID := uuidToString(task.AgentID)
 	scheduled := 0
+	// scopedReplayableTriggers computes what one comment would route to the
+	// completing agent, without enqueueing anything. The generic path below
+	// and the transient-lookup retry recording above share it so both agree
+	// on what "would have routed" (GH #8719).
+	scopedReplayableTriggers := func(c db.Comment) (*db.Comment, []commentAgentTrigger) {
+		var parentComment *db.Comment
+		if c.ParentID.Valid {
+			// Scope to the issue's workspace; a comment's parent is always in the
+			// same workspace, so this only fails closed against a stray foreign
+			// UUID rather than changing behavior (MUL-4252).
+			if parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
+				ID:          c.ParentID,
+				WorkspaceID: issue.WorkspaceID,
+			}); err == nil {
+				parentComment = &parent
+			}
+		}
+		// Compute what this comment would trigger, then keep ONLY the agent
+		// that just completed -- never the full fan-out (that would re-wake
+		// unrelated `@other-agent` targets).
+		//
+		// The comment is routed under its OWN author_type. A member is its own
+		// originator. For an agent author, the originator is the human at the
+		// top of that agent's trigger chain (resolved from the comment's source
+		// task); canInvokeAgent judges an agent-to-agent (A2A) mention by that
+		// originator, not the immediate agent principal (MUL-3963).
+		actorType := c.AuthorType
+		actorID := uuidToString(c.AuthorID)
+		originatorUserID := actorID
+		if actorType != "member" {
+			originatorUserID = uuidToString(h.TaskService.ResolveOriginatorFromTriggerComment(ctx, issue.WorkspaceID, c.ID))
+		}
+		triggers, _ := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, actorType, actorID, commentTriggerComputeOptions{
+			ExcludeTriggerCommentID: c.ID,
+			AuthoringTaskID:         c.SourceTaskID,
+			OriginatorUserID:        originatorUserID,
+		})
+		// Agent replies discovered only by timestamp must not start a new
+		// conversation. Replay explicit mentions, or a worker reply that the
+		// creation path already accepted and recorded in this run's input plan.
+		// Recomputed routing still checks current permissions and the self guard.
+		if actorType != "member" {
+			triggers = keepReplayableAgentTriggers(triggers, slices.Contains(plannedCommentIDs, c.ID))
+		}
+		scoped := make([]commentAgentTrigger, 0, 1)
+		for _, trigger := range triggers {
+			if uuidToString(trigger.Agent.ID) == agentID {
+				scoped = append(scoped, trigger)
+			}
+		}
+		return parentComment, scoped
+	}
 	for i := range comments {
 		c := comments[i]
 		if _, ok := delivered[uuidToString(c.ID)]; ok {
@@ -4656,15 +4708,21 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 		if c.AuthorType == "agent" && c.SourceTaskID.Valid {
 			srcTask, err := h.Queries.GetAgentTask(ctx, c.SourceTaskID)
 			if err != nil {
-				// Fail closed on any lookup failure: without the source row
-				// the comment's lineage is unverifiable, and an unverified
-				// comment must never enter generic mention parsing -- a
-				// recorded fallback whose body mentions this agent would
-				// otherwise be generic-enqueued here (GH #8719). Skipping
-				// is lossless for explicit replies: nothing marks the
-				// comment delivered, so a later reconcile pass recovers it
-				// once the source row reads again. Only a provably-gone
-				// (no-rows) source stays skipped permanently.
+				if errors.Is(err, pgx.ErrNoRows) {
+					// Permanently unverifiable lineage: the source run is
+					// gone, so this comment can neither be
+					// originator-resolved through it nor owned by the
+					// fallback sweeper. Skip it here.
+					continue
+				}
+				// Transient infrastructure failure: fail closed (no generic
+				// routing for an unverifiable comment -- a recorded fallback
+				// mentioning this agent must never generic-enqueue), but
+				// leave a durable retry obligation for whatever this pass
+				// already resolved, so the existing sweeper replays it once
+				// reads recover (GH #8719).
+				_, scoped := scopedReplayableTriggers(c)
+				h.recordCompletionReconcileRetries(ctx, task.ID, c.ID, scoped)
 				continue
 			}
 			if srcTask.CompletionFallbackCommentID.Valid &&
@@ -4676,51 +4734,7 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 				continue
 			}
 		}
-		var parentComment *db.Comment
-		if c.ParentID.Valid {
-			// Scope to the issue's workspace; a comment's parent is always in the
-			// same workspace, so this only fails closed against a stray foreign
-			// UUID rather than changing behavior (MUL-4252).
-			if parent, err := h.Queries.GetCommentInWorkspace(ctx, db.GetCommentInWorkspaceParams{
-				ID:          c.ParentID,
-				WorkspaceID: issue.WorkspaceID,
-			}); err == nil {
-				parentComment = &parent
-			}
-		}
-		// Compute what this comment would trigger, then keep ONLY the agent
-		// that just completed — never the full fan-out (that would re-wake
-		// unrelated `@other-agent` targets).
-		//
-		// The comment is routed under its OWN author_type. A member is its own
-		// originator. For an agent author, the originator is the human at the
-		// top of that agent's trigger chain (resolved from the comment's source
-		// task); canInvokeAgent judges an agent→agent (A2A) mention by that
-		// originator, not the immediate agent principal (MUL-3963).
-		actorType := c.AuthorType
-		actorID := uuidToString(c.AuthorID)
-		originatorUserID := actorID
-		if actorType != "member" {
-			originatorUserID = uuidToString(h.TaskService.ResolveOriginatorFromTriggerComment(ctx, issue.WorkspaceID, c.ID))
-		}
-		triggers, _ := h.computeCommentAgentTriggers(ctx, issue, c.Content, parentComment, actorType, actorID, commentTriggerComputeOptions{
-			ExcludeTriggerCommentID: c.ID,
-			AuthoringTaskID:         c.SourceTaskID,
-			OriginatorUserID:        originatorUserID,
-		})
-		// Agent replies discovered only by timestamp must not start a new
-		// conversation. Replay explicit mentions, or a worker reply that the
-		// creation path already accepted and recorded in this run's input plan.
-		// Recomputed routing still checks current permissions and the self guard.
-		if actorType != "member" {
-			triggers = keepReplayableAgentTriggers(triggers, slices.Contains(plannedCommentIDs, c.ID))
-		}
-		scoped := make([]commentAgentTrigger, 0, 1)
-		for _, trigger := range triggers {
-			if uuidToString(trigger.Agent.ID) == agentID {
-				scoped = append(scoped, trigger)
-			}
-		}
+		_, scoped := scopedReplayableTriggers(c)
 		if len(scoped) == 0 {
 			continue
 		}
@@ -4757,6 +4771,53 @@ func (h *Handler) reconcileCommentsOnCompletion(ctx context.Context, task *db.Ag
 			"completed_task_id", uuidToString(task.ID),
 			"agent_id", agentID,
 			"undelivered_comments", scheduled)
+	}
+}
+
+// recordCompletionReconcileRetries durably parks the routing a transient
+// source-task lookup failure prevented (GH #8719): for each trigger the
+// completing pass already resolved for its own agent, the existing sweeper
+// replays it through the normal mention enqueue once reads recover. Only
+// explicit mention and thread-parent shapes are recorded -- the completing
+// pass replays nothing else for agent authors, so nothing else needs a
+// retry. Recording never routes: the pass stays fail-closed here.
+func (h *Handler) recordCompletionReconcileRetries(ctx context.Context, taskID, commentID pgtype.UUID, scoped []commentAgentTrigger) {
+	for _, trigger := range scoped {
+		var isLeader bool
+		var squadID pgtype.UUID
+		switch trigger.Source {
+		case commentTriggerSourceMentionAgent:
+		case commentTriggerSourceMentionSquadLeader:
+			isLeader = true
+			if trigger.Squad != nil {
+				squadID = trigger.Squad.ID
+			}
+		case commentTriggerSourceThreadParent:
+			if trigger.Squad != nil {
+				isLeader = true
+				squadID = trigger.Squad.ID
+			}
+		default:
+			slog.Warn("reconcile retry: unsupported trigger source, not recorded",
+				"task_id", uuidToString(taskID),
+				"comment_id", uuidToString(commentID),
+				"source", string(trigger.Source),
+			)
+			continue
+		}
+		if err := h.Queries.RecordCompletionReconcileRetryComment(ctx, db.RecordCompletionReconcileRetryCommentParams{
+			TaskID:    taskID,
+			CommentID: commentID,
+			IsLeader:  isLeader,
+			SquadID:   squadID,
+		}); err != nil {
+			slog.Warn("recording completion reconcile retry failed",
+				"task_id", uuidToString(taskID),
+				"comment_id", uuidToString(commentID),
+				"error", err,
+			)
+			return
+		}
 	}
 }
 

@@ -2181,6 +2181,46 @@ WHERE worker.status = 'completed'
 ORDER BY worker.completed_at DESC NULLS LAST, worker.id DESC
 LIMIT @max_per_tick::int;
 
+-- name: RecordCompletionReconcileRetryComment :exec
+-- Records one durable retry obligation for a completion-reconcile comment
+-- skipped on transient source-task lookup failure (GH #8719). The element
+-- carries the routing the completing pass already resolved
+-- (comment/target shape only -- exact fallback identity is re-proven at
+-- replay, when reads are healthy). Deduplicated by comment id so repeated
+-- skips of the same comment never stack.
+UPDATE agent_task_queue
+SET completion_reconcile_retry_obligations = COALESCE(completion_reconcile_retry_obligations, '[]'::jsonb) || jsonb_build_object('comment_id', @comment_id::uuid, 'is_leader', @is_leader::boolean, 'squad_id', @squad_id::uuid)
+WHERE id = @task_id::uuid
+  AND NOT EXISTS (
+    SELECT 1 FROM jsonb_array_elements(COALESCE(completion_reconcile_retry_obligations, '[]'::jsonb)) AS e
+    WHERE e->>'comment_id' = @comment_id::text
+  );
+
+-- name: ListCompletionReconcileRetryObligations :many
+-- Bounded scan for completion-reconcile retry obligations (GH #8719): runs
+-- that skipped comments on transient source-task lookup failure. The
+-- existing delegated-failure sweeper replays them through the normal mention
+-- enqueue once reads recover. NULL or empty arrays are never obligations.
+SELECT id, agent_id, issue_id, completion_reconcile_retry_obligations
+FROM agent_task_queue
+WHERE completion_reconcile_retry_obligations IS NOT NULL
+  AND completion_reconcile_retry_obligations <> '[]'::jsonb
+ORDER BY completed_at DESC NULLS LAST, id DESC
+LIMIT @max_per_tick::int;
+
+-- name: ClearResolvedCompletionReconcileRetry :exec
+-- Drops one resolved retry obligation element by comment id (GH #8719):
+-- routed, exact-recorded, or provably-gone. Only the resolved element is
+-- removed, so obligations recorded concurrently by another pass survive the
+-- write-back.
+UPDATE agent_task_queue
+SET completion_reconcile_retry_obligations = (
+  SELECT COALESCE(jsonb_agg(e), '[]'::jsonb)
+  FROM jsonb_array_elements(COALESCE(completion_reconcile_retry_obligations, '[]'::jsonb)) AS e
+  WHERE e->>'comment_id' IS DISTINCT FROM @comment_id::text
+)
+WHERE id = @task_id::uuid;
+
 -- name: HasTaskCoveringDelegatedFailureComment :one
 -- Durable idempotency check for a recovery comment. The completion reconciler
 -- excludes its own just-completed task when replaying a planned-but-undelivered

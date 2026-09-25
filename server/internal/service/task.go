@@ -7154,6 +7154,26 @@ func (s *TaskService) RecoverPendingDelegatedFailures(ctx context.Context, maxPe
 		}
 		result.Replayed++
 	}
+	// Completion-reconcile comments skipped on transient source-task lookup
+	// failure (GH #8719): same outbox contract. Exact recorded fallbacks and
+	// provably-gone sources settle on first sight; explicit replies route
+	// through the normal mention enqueue; transient failures stay obligated
+	// for the next sweep.
+	retries, err := s.Queries.ListCompletionReconcileRetryObligations(ctx, maxPerTick)
+	if err != nil {
+		return result, errors.Join(append(errs, fmt.Errorf("list completion reconcile retries: %w", err))...)
+	}
+	result.Scanned += len(retries)
+	for _, retry := range retries {
+		resolved, err := s.replayCompletionReconcileRetryRow(ctx, retry)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("replay completion reconcile retry %s: %w", util.UUIDToString(retry.ID), err))
+			continue
+		}
+		if resolved > 0 {
+			result.Replayed++
+		}
+	}
 	return result, errors.Join(errs...)
 }
 
@@ -7356,6 +7376,204 @@ func (s *TaskService) HasTaskCoveringCompletionFallback(ctx context.Context, iss
 		CommentID:     commentID,
 		ExcludeTaskID: excludeTaskID,
 	})
+}
+
+// completionReconcileRetryObligation is one durable retry for a comment the
+// completion reconcile skipped on transient source-task lookup failure (GH
+// #8719). It carries only the routing the completing pass already resolved
+// for its own agent -- exact fallback identity is re-proven at replay, when
+// reads are healthy, so a recorded fallback can never be generic-enqueued
+// through this path.
+type completionReconcileRetryObligation struct {
+	CommentID string `json:"comment_id"`
+	IsLeader  bool   `json:"is_leader"`
+	SquadID   string `json:"squad_id"`
+}
+
+// replayCompletionFallbackOwedRuns is followed by the reconcile-retry phase
+// in RecoverPendingDelegatedFailures below.
+
+// replayCompletionReconcileRetryRow replays one task's retry obligations
+// through the normal mention enqueue (GH #8719). Resolution is per element:
+// a missing comment, a provably-gone source row, an exact recorded fallback,
+// a covered comment, a dead agent, or a fail-closed attribution refusal all
+// resolve (drop) the element; anything transient stays obligated for the
+// next sweep. It returns how many elements resolved.
+func (s *TaskService) replayCompletionReconcileRetryRow(ctx context.Context, row db.ListCompletionReconcileRetryObligationsRow) (int, error) {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(row.CompletionReconcileRetryObligations, &raw); err != nil {
+		slog.Warn("completion reconcile retry obligations unreadable; skipping tick",
+			"task_id", util.UUIDToString(row.ID),
+			"error", err,
+		)
+		return 0, nil
+	}
+	issue, err := s.Queries.GetIssue(ctx, row.IssueID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			for _, r := range raw {
+				if id := parseCompletionReconcileRetryCommentID(r); id != "" {
+					s.clearResolvedCompletionReconcileRetry(ctx, row.ID, id)
+				}
+			}
+			return len(raw), nil
+		}
+		return 0, fmt.Errorf("load retry issue: %w", err)
+	}
+	resolved := 0
+	for _, r := range raw {
+		var ob completionReconcileRetryObligation
+		if err := json.Unmarshal(r, &ob); err != nil || ob.CommentID == "" {
+			slog.Warn("completion reconcile retry element unreadable; dropping",
+				"task_id", util.UUIDToString(row.ID),
+				"error", err,
+			)
+			if id := parseCompletionReconcileRetryCommentID(r); id != "" {
+				s.clearResolvedCompletionReconcileRetry(ctx, row.ID, id)
+				resolved++
+			}
+			continue
+		}
+		done, err := s.replayOneCompletionReconcileRetry(ctx, issue, row.AgentID, ob)
+		if err != nil {
+			return resolved, err
+		}
+		if done {
+			s.clearResolvedCompletionReconcileRetry(ctx, row.ID, ob.CommentID)
+			resolved++
+		}
+	}
+	return resolved, nil
+}
+
+// parseCompletionReconcileRetryCommentID leniently extracts the comment id
+// from a stored obligation element so a malformed element can still be
+// dropped. Writers emit strict JSON, so this is defensive-only.
+func parseCompletionReconcileRetryCommentID(r json.RawMessage) string {
+	var probe map[string]any
+	if err := json.Unmarshal(r, &probe); err != nil {
+		return ""
+	}
+	id, _ := probe["comment_id"].(string)
+	return id
+}
+
+// clearResolvedCompletionReconcileRetry drops one resolved element by comment
+// id, leaving concurrently recorded obligations untouched. Failures only
+// warn: the element resolves again on the next sweep.
+func (s *TaskService) clearResolvedCompletionReconcileRetry(ctx context.Context, taskID pgtype.UUID, commentID string) {
+	if err := s.Queries.ClearResolvedCompletionReconcileRetry(ctx, db.ClearResolvedCompletionReconcileRetryParams{
+		TaskID:    taskID,
+		CommentID: commentID,
+	}); err != nil {
+		slog.Warn("clearing resolved completion reconcile retry failed",
+			"task_id", util.UUIDToString(taskID),
+			"comment_id", commentID,
+			"error", err,
+		)
+	}
+}
+
+// replayOneCompletionReconcileRetry routes one skipped explicit comment
+// through the normal mention enqueue. True means the obligation is settled
+// (routed, covered, or permanently unroutable); false with a nil error never
+// happens -- transient failures return an error so the obligation survives.
+func (s *TaskService) replayOneCompletionReconcileRetry(ctx context.Context, issue db.Issue, agentID pgtype.UUID, ob completionReconcileRetryObligation) (bool, error) {
+	var cid pgtype.UUID
+	if err := cid.Scan(ob.CommentID); err != nil {
+		slog.Warn("completion reconcile retry comment id unparseable; dropping",
+			"comment_id", ob.CommentID,
+			"error", err,
+		)
+		return true, nil
+	}
+	comment, err := s.Queries.GetComment(ctx, cid)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil
+		}
+		return false, fmt.Errorf("load retry comment: %w", err)
+	}
+	if !comment.SourceTaskID.Valid {
+		slog.Warn("completion reconcile retry without source task; dropping",
+			"comment_id", ob.CommentID,
+		)
+		return true, nil
+	}
+	srcTask, err := s.Queries.GetAgentTask(ctx, comment.SourceTaskID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil
+		}
+		return false, fmt.Errorf("load retry source task: %w", err)
+	}
+	if srcTask.CompletionFallbackCommentID.Valid &&
+		util.UUIDToString(srcTask.CompletionFallbackCommentID) == util.UUIDToString(comment.ID) {
+		return true, nil
+	}
+	agent, err := s.Queries.GetAgent(ctx, agentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil
+		}
+		return false, fmt.Errorf("load retry agent: %w", err)
+	}
+	if agent.ArchivedAt.Valid || !agent.RuntimeID.Valid {
+		slog.Warn("completion reconcile retry agent unavailable; dropping",
+			"agent_id", util.UUIDToString(agentID),
+		)
+		return true, nil
+	}
+	covered, err := s.Queries.HasTaskCoveringCompletionFallback(ctx, db.HasTaskCoveringCompletionFallbackParams{
+		IssueID:       issue.ID,
+		AgentID:       agentID,
+		CommentID:     cid,
+		ExcludeTaskID: pgtype.UUID{},
+	})
+	if err != nil {
+		return false, fmt.Errorf("check retry coverage: %w", err)
+	}
+	if covered {
+		return true, nil
+	}
+	var sid pgtype.UUID
+	if ob.SquadID != "" {
+		_ = sid.Scan(ob.SquadID)
+	}
+	var enqueueErr error
+	if ob.IsLeader && sid.Valid {
+		_, enqueueErr = s.EnqueueTaskForSquadLeader(ctx, issue, agentID, sid, cid, OriginNamed)
+	} else {
+		_, enqueueErr = s.EnqueueTaskForMention(ctx, issue, agentID, cid, OriginNamed)
+	}
+	if enqueueErr != nil {
+		if pendingSlotTakenErr(enqueueErr) {
+			// A sibling won the slot: register as planned on the active
+			// task (generic path (c) equivalent) or keep retrying.
+			registered, rerr := s.Queries.RegisterPlannedCommentForActiveTask(ctx, db.RegisterPlannedCommentForActiveTaskParams{
+				CommentID: cid,
+				IssueID:   issue.ID,
+				AgentID:   agentID,
+				HeadSha:   s.ResolveIssueReviewSHAParam(ctx, issue.ID),
+			})
+			if rerr != nil {
+				if errors.Is(rerr, pgx.ErrNoRows) {
+					return false, nil
+				}
+				return false, fmt.Errorf("register retry on active task: %w", rerr)
+			}
+			_ = registered
+			return true, nil
+		}
+		if errors.Is(enqueueErr, ErrAttributionFailClosed) {
+			slog.Warn("completion reconcile retry attribution fail-closed; dropping",
+				"comment_id", ob.CommentID,
+			)
+			return true, nil
+		}
+		return false, fmt.Errorf("enqueue retry task: %w", enqueueErr)
+	}
+	return true, nil
 }
 
 func (s *TaskService) dispatchDelegatedFailureRecoveryComment(ctx context.Context, comment db.Comment, completedTaskID pgtype.UUID) (delegatedFailureRecoveryDispatchOutcome, error) {

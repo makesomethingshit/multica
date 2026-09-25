@@ -1015,9 +1015,13 @@ func (d *failSourceTaskLookupDB) QueryRow(ctx context.Context, query string, arg
 // TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure pins the
 // combined lookup contract (GH #8719): while the source-task read fails,
 // nothing may enter generic routing -- neither the explicit mention nor a
-// recorded fallback mentioning the completing agent. On retry with reads
-// restored, the explicit mention is recovered exactly once through its own
-// trigger while the recorded fallback stays out via its exact ID.
+// recorded fallback mentioning the completing agent. The skip leaves a
+// durable retry obligation, and the existing recovery sweeper replays it
+// once reads recover: the explicit mention is recovered exactly once
+// through its own trigger while the recorded fallback stays out via its
+// exact ID. Both phases drive production entry points only (CompleteTask
+// endpoint, RecoverPendingDelegatedFailures); the reconcile helper is never
+// called directly.
 func TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -1121,13 +1125,18 @@ func TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure(t *testing
 	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 0 {
 		t.Fatalf("transient outage woke %d B task(s), want 0 (fail closed)", n)
 	}
-	// Phase 2: retry with reads restored. The explicit mention is recovered
-	// exactly once through its own trigger; the recorded fallback stays out.
-	bTask, err := testHandler.Queries.GetAgentTask(ctx, util.MustParseUUID(bTaskID))
-	if err != nil {
-		t.Fatalf("retry: load B task: %v", err)
+	// The skip left a durable retry obligation on the completing run.
+	var retryCount int
+	dbfx.QueryRow(t, `SELECT COALESCE(jsonb_array_length(completion_reconcile_retry_obligations), 0) FROM agent_task_queue WHERE id = $1`, bTaskID).Scan(&retryCount)
+	if retryCount == 0 {
+		t.Fatal("transient skip left no retry obligation")
 	}
-	testHandler.reconcileCommentsOnCompletion(ctx, &bTask)
+	// Phase 2: the existing recovery sweeper replays the obligation with
+	// reads restored. The explicit mention is recovered exactly once through
+	// its own trigger; the recorded fallback stays out via its exact ID.
+	if _, err := testHandler.TaskService.RecoverPendingDelegatedFailures(ctx, 10); err != nil {
+		t.Fatalf("sweeper recovery failed: %v", err)
+	}
 	if n := queuedTaskCountForAgentIssue(t, issueID, agentB); n != 1 {
 		t.Fatalf("retry recovered %d B follow-up(s), want exactly 1", n)
 	}
@@ -1141,6 +1150,11 @@ func TestCompleteTask_RecoversExplicitMentionAfterSourceLookupFailure(t *testing
 	}
 	if n := pendingTaskCountForAgentIssue(t, issueID, workerW2); n != 0 {
 		t.Fatalf("fallback author W2 must not be enqueued, got %d W2 task(s)", n)
+	}
+	// The replay settled every obligation it touched.
+	dbfx.QueryRow(t, `SELECT COALESCE(jsonb_array_length(completion_reconcile_retry_obligations), 0) FROM agent_task_queue WHERE id = $1`, bTaskID).Scan(&retryCount)
+	if retryCount != 0 {
+		t.Fatalf("sweeper left %d retry obligation(s), want 0", retryCount)
 	}
 }
 
