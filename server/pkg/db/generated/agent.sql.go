@@ -5928,22 +5928,30 @@ func (q *Queries) ListChatFinalizeDeferredExpired(ctx context.Context, arg ListC
 }
 
 const listCompletionFallbackOwedRuns = `-- name: ListCompletionFallbackOwedRuns :many
-SELECT id FROM agent_task_queue
-WHERE status = 'completed'
-  AND NOT is_leader_task
-  AND issue_id IS NOT NULL
-  AND completion_fallback_comment_id IS NULL
-ORDER BY completed_at DESC NULLS LAST, id DESC
+SELECT worker.id FROM agent_task_queue AS worker
+JOIN agent_task_queue AS source ON source.id = worker.delegated_from_task_id
+  AND source.issue_id = worker.issue_id
+WHERE worker.status = 'completed'
+  AND NOT worker.is_leader_task
+  AND source.is_leader_task
+  AND worker.issue_id IS NOT NULL
+  AND worker.completion_fallback_comment_id IS NULL
+  AND NULLIF(worker.result->>'output', '') IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM comment AS reply
+      WHERE reply.source_task_id = worker.id
+        AND reply.author_type = 'agent'
+        AND reply.author_id = worker.agent_id
+        AND reply.deleted_at IS NULL
+  )
+ORDER BY worker.completed_at DESC NULLS LAST, worker.id DESC
 LIMIT $1::int
 `
 
-// Completed non-leader issue runs that never recorded a synthesized fallback
-// (GH #8719): the atomic synthesis transaction failed before persisting
-// anything, so no comment exists and no exact id was recorded. Newest first
-// so a recent failure is retried promptly; bounded per tick like the rest of
-// the sweep. Runs that legitimately need no fallback (explicit reply,
-// trivial output, suppressed) are skipped per-row by the same decision the
-// completion path uses.
+// Only delegated workers with output and no explicit reply can owe a fallback.
+// Keep unrelated completed runs out of the bounded scan so they cannot starve
+// a real handoff. The service still applies the completion-time suppression
+// and trivial-output checks before synthesizing anything.
 func (q *Queries) ListCompletionFallbackOwedRuns(ctx context.Context, maxPerTick int32) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listCompletionFallbackOwedRuns, maxPerTick)
 	if err != nil {
@@ -6019,7 +6027,7 @@ func (q *Queries) ListPendingCompletionFallbacks(ctx context.Context, maxPerTick
 }
 
 const listPendingDelegatedFailureRecoveries = `-- name: ListPendingDelegatedFailureRecoveries :many
-SELECT recovery.id, recovery.issue_id, recovery.author_type, recovery.author_id, recovery.content, recovery.type, recovery.created_at, recovery.updated_at, recovery.parent_id, recovery.workspace_id, recovery.resolved_at, recovery.resolved_by_type, recovery.resolved_by_id, recovery.source_task_id, recovery.quick_action_id, recovery.via_plugin_id, recovery.revision, recovery.recovery_settled_at, recovery.deleted_at
+SELECT recovery.id, recovery.issue_id, recovery.author_type, recovery.author_id, recovery.content, recovery.type, recovery.created_at, recovery.updated_at, recovery.parent_id, recovery.workspace_id, recovery.resolved_at, recovery.resolved_by_type, recovery.resolved_by_id, recovery.source_task_id, recovery.quick_action_id, recovery.via_plugin_id, recovery.revision, recovery.recovery_settled_at, recovery.deleted_at, recovery.suppressed_agent_ids
 FROM comment recovery
 JOIN agent_task_queue failed ON failed.id = recovery.source_task_id
 JOIN agent_task_queue source ON source.id = failed.delegated_from_task_id
@@ -6137,6 +6145,7 @@ func (q *Queries) ListPendingDelegatedFailureRecoveries(ctx context.Context, max
 			&i.Revision,
 			&i.RecoverySettledAt,
 			&i.DeletedAt,
+			&i.SuppressedAgentIds,
 		); err != nil {
 			return nil, err
 		}

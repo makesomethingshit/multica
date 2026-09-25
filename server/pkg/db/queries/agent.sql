@@ -2138,19 +2138,27 @@ WHERE id = @task_id::uuid
 FOR UPDATE;
 
 -- name: ListCompletionFallbackOwedRuns :many
--- Completed non-leader issue runs that never recorded a synthesized fallback
--- (GH #8719): the atomic synthesis transaction failed before persisting
--- anything, so no comment exists and no exact id was recorded. Newest first
--- so a recent failure is retried promptly; bounded per tick like the rest of
--- the sweep. Runs that legitimately need no fallback (explicit reply,
--- trivial output, suppressed) are skipped per-row by the same decision the
--- completion path uses.
-SELECT id FROM agent_task_queue
-WHERE status = 'completed'
-  AND NOT is_leader_task
-  AND issue_id IS NOT NULL
-  AND completion_fallback_comment_id IS NULL
-ORDER BY completed_at DESC NULLS LAST, id DESC
+-- Only delegated workers with output and no explicit reply can owe a fallback.
+-- Keep unrelated completed runs out of the bounded scan so they cannot starve
+-- a real handoff. The service still applies the completion-time suppression
+-- and trivial-output checks before synthesizing anything.
+SELECT worker.id FROM agent_task_queue AS worker
+JOIN agent_task_queue AS source ON source.id = worker.delegated_from_task_id
+  AND source.issue_id = worker.issue_id
+WHERE worker.status = 'completed'
+  AND NOT worker.is_leader_task
+  AND source.is_leader_task
+  AND worker.issue_id IS NOT NULL
+  AND worker.completion_fallback_comment_id IS NULL
+  AND NULLIF(worker.result->>'output', '') IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM comment AS reply
+      WHERE reply.source_task_id = worker.id
+        AND reply.author_type = 'agent'
+        AND reply.author_id = worker.agent_id
+        AND reply.deleted_at IS NULL
+  )
+ORDER BY worker.completed_at DESC NULLS LAST, worker.id DESC
 LIMIT @max_per_tick::int;
 
 -- name: HasTaskCoveringDelegatedFailureComment :one
