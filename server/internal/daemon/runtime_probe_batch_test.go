@@ -67,7 +67,8 @@ type batchFixture struct {
 	// offlineReasons is the server's view of WHY each row is offline. The
 	// register upsert overwrites it (see the register handler), which is what
 	// makes "the reason survived a late healthy register" testable.
-	offlineReasons map[string]RuntimeOfflineReason
+	offlineReasons   map[string]RuntimeOfflineReason
+	ownerGenerations map[string]string
 	// registerDelay, when non-zero, makes the register handler sleep before
 	// recording the call, widening the window in which two unserialized
 	// register calls for the same workspace would overlap.
@@ -412,6 +413,10 @@ func newBatchFixture(t *testing.T) *batchFixture {
 					}
 				}
 				fx.online[id] = true
+				if fx.ownerGenerations == nil {
+					fx.ownerGenerations = make(map[string]string)
+				}
+				fx.ownerGenerations[id] = rt["owner_generation"]
 				// The real upsert overwrites metadata wholesale, so a register
 				// drops any recorded reason. This is the mechanism the revived-row
 				// cleanup has to compensate for.
@@ -428,10 +433,11 @@ func newBatchFixture(t *testing.T) *batchFixture {
 			fx.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(resp)
-		case r.URL.Path == "/api/daemon/deregister":
+		case r.URL.Path == "/api/daemon/deregister/fenced":
 			var body struct {
-				RuntimeIDs     []string                        `json:"runtime_ids"`
-				OfflineReasons map[string]RuntimeOfflineReason `json:"offline_reasons"`
+				RuntimeIDs       []string                        `json:"runtime_ids"`
+				OfflineReasons   map[string]RuntimeOfflineReason `json:"offline_reasons"`
+				OwnerGenerations map[string]string               `json:"owner_generations"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			fx.mu.Lock()
@@ -443,6 +449,9 @@ func newBatchFixture(t *testing.T) *batchFixture {
 			fx.mu.Lock()
 			fx.deregistered = append(fx.deregistered, body.RuntimeIDs...)
 			for _, id := range body.RuntimeIDs {
+				if fx.ownerGenerations[id] != body.OwnerGenerations[id] {
+					continue
+				}
 				fx.online[id] = false
 				// Mirror the server: the reason is stored on the runtime row, and
 				// a deregister without one leaves whatever was there — which is

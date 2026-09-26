@@ -240,6 +240,19 @@ func TestWorkStateScope_DifferentBackendsStaySeparate(t *testing.T) {
 	}
 }
 
+func TestWorkStateScope_DefaultPortAliasesShareTree(t *testing.T) {
+	stageWorkStateHome(t)
+	writeProfileConfig(t, "", "https://multica.example", "")
+	writeProfileConfig(t, testDesktop, "https://multica.example:443", "")
+	bare, _ := NormalizeServerBaseURL("https://multica.example")
+	port, _ := NormalizeServerBaseURL("https://multica.example:443")
+	first := resolveScope(t, bare, "", "")
+	second := resolveScope(t, port, testDesktop, "")
+	if first.Key != second.Key || first.WorkspacesRoot != second.WorkspacesRoot || first.StateRoot != second.StateRoot || first.CodexNamespace != second.CodexNamespace {
+		t.Fatalf("default port aliases selected different work state: %+v %+v", first, second)
+	}
+}
+
 // TestWorkStateScope_AdoptsExistingLegacyState is case D: a machine that already
 // has profile-scoped state keeps serving it. A daemon upgrade that switched to a
 // fresh namespace would turn every resumable conversation into a new one, which
@@ -271,6 +284,22 @@ func TestWorkStateScope_AdoptsExistingLegacyState(t *testing.T) {
 	}
 	if scope.CodexNamespace != legacyNamespace {
 		t.Fatalf("Codex namespace = %q, want the adopted legacy namespace %q", scope.CodexNamespace, legacyNamespace)
+	}
+}
+
+func TestWorkStateScope_UnreadableSiblingConfigWithLegacyStateRefusesManifest(t *testing.T) {
+	home := stageWorkStateHome(t)
+	writeProfileConfig(t, testDesktop, testBackendA, "")
+	mustWriteFile(t, filepath.Join(profileDirFor(t, ""), "config.json"), "{")
+	seedWorkspaceState(t, filepath.Join(home, workspacesRootDirName))
+
+	_, err := ResolveOrCreateWorkStateScope(WorkStateScopeParams{ServerBaseURL: testBackendA, Profile: testDesktop})
+	if err == nil || !strings.Contains(err.Error(), "unreadable config") {
+		t.Fatalf("scope creation error = %v, want unreadable sibling conflict", err)
+	}
+	manifest := filepath.Join(home, ".multica", workStateRootDirName, WorkStateKey(testBackendA), "scope.json")
+	if _, statErr := os.Stat(manifest); !os.IsNotExist(statErr) {
+		t.Fatalf("scope manifest was created despite ambiguous legacy state: %v", statErr)
 	}
 }
 

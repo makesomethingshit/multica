@@ -2368,15 +2368,13 @@ func (d *Daemon) RestartBinary() string {
 // deregisterRuntimes notifies the server that the runtimes THIS process owns are
 // going offline, then releases those ownership claims.
 //
-// Ordering is the whole point and must not be reversed: deregistering first and
-// releasing second means a sibling can never take the runtime over and bring it
-// back online before this process's late Deregister lands. Releasing first would
-// reopen exactly the race this ownership model exists to close.
+// The server compares the ownership generation before applying Deregister, so
+// a delayed request cannot take a sibling's newer registration offline.
 //
 // Only owned runtimes are reported. A process that is merely standing by for a
 // sibling's runtime must not take it offline when it exits (GH #8280).
 func (d *Daemon) deregisterRuntimes() {
-	runtimeIDs := d.ownedRuntimeIDs()
+	runtimeIDs, targets := d.ownedRuntimeIDsAndTargets()
 	if len(runtimeIDs) == 0 {
 		d.logger.Debug("deregister: no owned runtimes to deregister")
 		d.releaseAllRuntimeOwnership()
@@ -2387,13 +2385,12 @@ func (d *Daemon) deregisterRuntimes() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := d.client.Deregister(ctx, runtimeIDs, nil); err != nil {
+	if err := d.client.Deregister(ctx, runtimeIDs, nil, d.ownerGenerations(runtimeIDs, targets)); err != nil {
 		d.logger.Warn("failed to deregister runtimes on shutdown", "error", err)
 	} else {
 		d.logger.Info("deregistered runtimes", "count", len(runtimeIDs))
 	}
-	// Only now: the server has been told, so a takeover that happens after this
-	// point is a genuine new owner rather than a sibling racing a stale report.
+	// Release after the bounded attempt; any delayed server write remains fenced.
 	d.releaseAllRuntimeOwnership()
 }
 
@@ -2401,6 +2398,11 @@ func (d *Daemon) deregisterRuntimes() {
 // owner of. A runtime tracked locally but owned by a sibling process is
 // deliberately excluded - see deregisterRuntimes.
 func (d *Daemon) ownedRuntimeIDs() []string {
+	ids, _ := d.ownedRuntimeIDsAndTargets()
+	return ids
+}
+
+func (d *Daemon) ownedRuntimeIDsAndTargets() ([]string, map[string]string) {
 	d.mu.Lock()
 	type row struct {
 		id          string
@@ -2418,12 +2420,15 @@ func (d *Daemon) ownedRuntimeIDs() []string {
 	d.mu.Unlock()
 
 	ids := make([]string, 0, len(rows))
+	targets := make(map[string]string, len(rows))
 	for _, r := range rows {
-		if d.ownsTarget(runtimeOwnerTargetForRuntime(r.rt, r.workspaceID)) {
+		target := runtimeOwnerTargetForRuntime(r.rt, r.workspaceID)
+		if d.ownsTarget(target) {
 			ids = append(ids, r.id)
+			targets[r.id] = target
 		}
 	}
-	return ids
+	return ids, targets
 }
 
 // resolveAuth loads the auth token from the CLI config for the active profile.
@@ -3251,6 +3256,14 @@ func (d *Daemon) registerBuiltinRuntimesForWorkspaceLocked(ctx context.Context, 
 	if len(runtimes) == 0 {
 		return nil, ErrNoRuntimesToRegister
 	}
+	owned, _, err := d.filterOwnedRuntimeCandidates(ctx, workspaceID, runtimes)
+	if err != nil {
+		return nil, err
+	}
+	if len(owned) == 0 {
+		return nil, errAllRuntimesPeerOwned
+	}
+	runtimes = owned
 	req := map[string]any{
 		"workspace_id":      workspaceID,
 		"daemon_id":         d.cfg.DaemonID,
@@ -4699,10 +4712,8 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 	for id := range currentIDs {
 		if _, ok := apiIDs[id]; !ok {
 			// Drop the local metadata first, then tell the server, then release
-			// the ownership claims — the same order shutdown uses, and for the
-			// same reason: releasing first would let a sibling take the target
-			// over and bring the runtime back online before this process's late
-			// Deregister lands (GH #8280). The target can only be named while
+			// the ownership claims. A delayed Deregister is fenced by the server
+			// against a sibling's later owner generation. The target is named while
 			// the runtime row is still here, so it is captured inside.
 			dropped, existed := d.forgetWorkspace(id)
 			if !existed {
@@ -8911,7 +8922,6 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if resumeReachable {
 		gateCodexResumeToRolloutPresence(&task, &taskCtx, provider, env.CodexHome, taskLog)
 	}
-	d.reportResumeWarning(ctx, task, taskLog)
 
 	// Inject runtime-specific config (meta skill) so the agent discovers .agent_context/.
 	runtimeBrief, err := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx)
@@ -10666,33 +10676,6 @@ func (d *Daemon) holdEnvRootForTask(envRoot string) (release func(), err error) 
 	return func() { claim.Release() }, nil
 }
 
-// reportResumeWarning records the finalized resume decision on the runtime when
-// a prior session was expected and could not be restored.
-//
-// Placement matters, and so does the condition. It runs once per task, after both
-// resume gates have decided and before the agent process exists, and it keys off
-// the single finalized flag the gates (and the server, for a withheld rollout)
-// set — not off each gate, which would report the same task twice, and not off
-// PriorSessionID, which the gates themselves clear when they reject a session.
-// A cold start and a healthy resume both leave the flag false and report nothing.
-//
-// Best effort, always: this is observability. A failure is logged here and the
-// task continues with the fresh session it was already going to use.
-func (d *Daemon) reportResumeWarning(ctx context.Context, task Task, taskLog *slog.Logger) {
-	if !task.PriorSessionResumeUnavailable {
-		return
-	}
-	// Bounded and off the launch critical path: this is a diagnostic, and the
-	// normal client timeout is far longer than a provider launch should ever
-	// wait on one. A failure - including a 404 from a server that predates the
-	// endpoint - is logged and the run continues.
-	reportCtx, cancel := context.WithTimeout(ctx, resumeWarningReportTimeout)
-	defer cancel()
-	if err := d.client.ReportRuntimeResumeWarning(reportCtx, task.RuntimeID, task.ID); err != nil {
-		taskLog.Warn("failed to report runtime resume warning", "error", err)
-	}
-}
-
 // scopeLockTimeout is the bound a task waits for a scope claim.
 func (d *Daemon) scopeLockTimeout() time.Duration {
 	if d.scopeClaimTimeout > 0 {
@@ -11311,9 +11294,3 @@ func defaultArgsForProvider(cfg Config, provider string) []string {
 	}
 	return append([]string(nil), args...)
 }
-
-// resumeWarningReportTimeout bounds the best-effort runtime resume-warning
-// report. It is deliberately short: the report is observability, and it sits
-// before the provider launch, so a slow or unreachable server must not delay a
-// task. The client timeout is tuned for task traffic, not for this.
-const resumeWarningReportTimeout = 3 * time.Second

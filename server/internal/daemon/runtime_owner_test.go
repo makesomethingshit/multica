@@ -59,7 +59,7 @@ func newRuntimeLifecycleServer(t *testing.T, rec *runtimeLifecycleRecorder) *htt
 			trimmed := strings.TrimSuffix(r.URL.Path, "/recover-orphans")
 			rec.recordRecover(trimmed[strings.LastIndex(trimmed, "/")+1:])
 			w.WriteHeader(http.StatusOK)
-		case r.URL.Path == "/api/daemon/deregister":
+		case r.URL.Path == "/api/daemon/deregister/fenced":
 			var body struct {
 				RuntimeIDs []string `json:"runtime_ids"`
 			}
@@ -193,6 +193,10 @@ func TestRuntimeOwnership_TakeoverAfterOwnerCrash(t *testing.T) {
 
 	seedOwnedRuntime(t, owner, ownershipWorkspace, "runtime-1", "codex")
 	target := runtimeOwnerTarget(ownershipWorkspace, "codex", "")
+	oldToken := owner.runtimeOwnerToken(target)
+	if oldToken == "" {
+		t.Fatal("owner claim has no server fencing token")
+	}
 	if outcome, err := standby.acquireRuntimeOwnership(target); err != nil || outcome != runtimeOwnedByPeer {
 		t.Fatalf("standby claim before crash: outcome=%v err=%v", outcome, err)
 	}
@@ -203,6 +207,9 @@ func TestRuntimeOwnership_TakeoverAfterOwnerCrash(t *testing.T) {
 	outcome, err := standby.acquireRuntimeOwnership(target)
 	if err != nil || outcome != runtimeOwnedByThisProcess {
 		t.Fatalf("standby takeover: outcome=%v err=%v", outcome, err)
+	}
+	if next := standby.runtimeOwnerToken(target); next == "" || next == oldToken {
+		t.Fatalf("takeover token %q must differ from prior owner token %q", next, oldToken)
 	}
 	standby.recoverOrphansOncePerOwnership(t.Context(), ownershipWorkspace, Runtime{ID: "runtime-1", Provider: "codex"})
 	if got := rec.recoveredIDs(); len(got) != 1 {

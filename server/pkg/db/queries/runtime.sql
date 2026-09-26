@@ -126,20 +126,6 @@ DO UPDATE SET
     updated_at = now()
 RETURNING *, (xmax = 0) AS inserted;
 
--- name: SetAgentRuntimeResumeWarning :one
--- Merges ONE diagnostic key into a runtime's metadata, leaving every other
--- key untouched (version, cli_version, capabilities, offline_reason, runtime
--- profile metadata, ...). Used by the daemon-authenticated endpoint that
--- records a prior-session resume loss, so the runtime detail can show why a
--- task restarted cold instead of losing that fact in the daemon log. The
--- handler builds the JSON object; this query only merges it. Metadata is
--- treated as {} when NULL so a row that predates any metadata still works.
-UPDATE agent_runtime
-SET metadata = COALESCE(metadata, '{}'::jsonb)
-        || jsonb_build_object('resume_warning', @resume_warning::jsonb),
-    updated_at = now()
-WHERE id = @id
-RETURNING *;
 -- name: UpdateAgentRuntimeVisibility :one
 -- Toggles a runtime between 'private' (only owner can bind agents) and
 -- 'public' (any workspace member can). Default for new rows is 'private'
@@ -243,6 +229,17 @@ WHERE id = $1 AND status <> 'online';
 UPDATE agent_runtime
 SET status = 'offline', updated_at = now()
 WHERE id = $1;
+
+-- name: SetAgentRuntimeOfflineIfOwner :execrows
+-- A delayed deregister from a prior local owner must not take the replacement
+-- owner's registration offline. The compare and write are one DB statement.
+UPDATE agent_runtime
+SET status = 'offline',
+    metadata = COALESCE(metadata, '{}'::jsonb) ||
+        CASE WHEN sqlc.narg('offline_reason')::jsonb IS NULL THEN '{}'::jsonb
+             ELSE jsonb_build_object('offline_reason', sqlc.narg('offline_reason')::jsonb) END,
+    updated_at = now()
+WHERE id = @id AND metadata->>'owner_generation' = @owner_generation::text;
 
 -- name: SetAgentRuntimeOfflineWithReason :exec
 -- Takes a runtime offline and records WHY, for the one class of cause the user

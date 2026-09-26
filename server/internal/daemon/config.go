@@ -759,6 +759,12 @@ func NormalizeServerBaseURL(raw string) (string, error) {
 	u.Scheme = strings.ToLower(u.Scheme)
 	if u.Host != "" {
 		u.Host = strings.ToLower(u.Host)
+		if (u.Scheme == "http" && u.Port() == "80") || (u.Scheme == "https" && u.Port() == "443") {
+			u.Host = u.Hostname()
+			if strings.Contains(u.Host, ":") {
+				u.Host = "[" + u.Host + "]"
+			}
+		}
 	}
 	u.RawPath = ""
 	u.RawQuery = ""

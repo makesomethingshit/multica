@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -81,6 +83,7 @@ func runtimeOwnerTargetWorkspace(target string) string {
 type runtimeOwnerClaim struct {
 	target string
 	claim  *execenv.ScopeClaim
+	token  string
 	// generation increments on every acquisition by this process.
 	generation uint64
 	// recovered is the generation whose startup recovery has already run.
@@ -135,7 +138,12 @@ func (d *Daemon) acquireRuntimeOwnership(target string) (runtimeOwnershipOutcome
 	if !ok {
 		return runtimeOwnedByPeer, nil
 	}
-	entry := &runtimeOwnerClaim{target: target, claim: claim, generation: 1}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		claim.Release()
+		return runtimeOwnedByPeer, fmt.Errorf("runtime ownership token: %w", err)
+	}
+	entry := &runtimeOwnerClaim{target: target, claim: claim, token: hex.EncodeToString(nonce[:]), generation: 1}
 	if previous, existed := d.ownerState().byTarget[target]; existed {
 		entry.generation = previous.generation + 1
 	}
@@ -202,6 +210,25 @@ func (d *Daemon) ownsTarget(target string) bool {
 	return ok && claim.claim != nil
 }
 
+func (d *Daemon) runtimeOwnerToken(target string) string {
+	d.ownerState().mu.Lock()
+	defer d.ownerState().mu.Unlock()
+	if claim := d.ownerState().byTarget[target]; claim != nil && claim.claim != nil {
+		return claim.token
+	}
+	return ""
+}
+
+func (d *Daemon) ownerGenerations(runtimeIDs []string, targets map[string]string) map[string]string {
+	generations := make(map[string]string, len(runtimeIDs))
+	for _, id := range runtimeIDs {
+		if token := d.runtimeOwnerToken(targets[id]); token != "" {
+			generations[id] = token
+		}
+	}
+	return generations
+}
+
 // markOwnershipRecovered records that startup orphan recovery has run for the
 // target current ownership generation, and reports whether this call is the one
 // that should run it.
@@ -223,10 +250,8 @@ func (d *Daemon) markOwnershipRecovered(target string) bool {
 	return true
 }
 
-// releaseRuntimeOwnership drops the claim for target. The caller must already
-// have told the server the runtime is going away: releasing first would let a
-// sibling take over and bring the runtime back online before this process late
-// Deregister arrives, which is the same race in the other direction.
+// releaseRuntimeOwnership drops the claim for target. The server fences any
+// delayed deregistration by this claim's owner token after a sibling takes over.
 func (d *Daemon) releaseRuntimeOwnership(target string) {
 	d.ownerState().mu.Lock()
 	claim, ok := d.ownerState().byTarget[target]
@@ -306,6 +331,10 @@ func (d *Daemon) filterOwnedRuntimeCandidates(ctx context.Context, workspaceID s
 			continue
 		}
 		d.clearRuntimeStandby(target)
+		entry["owner_generation"] = d.runtimeOwnerToken(target)
+		if entry["owner_generation"] == "" {
+			return nil, nil, fmt.Errorf("runtime ownership claim %s disappeared before registration", target)
+		}
 		owned = append(owned, entry)
 	}
 	d.pruneRuntimeStandby(workspaceID, seen)

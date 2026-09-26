@@ -465,12 +465,16 @@ A daemon registers with the server as one runtime per machine and backend, so it
 
 ```text
 Multica profile     auth / token / CLI config / daemon log, pid, health port
-daemon work state   physical machine + normalized backend
+daemon work state   physical machine + canonical server URL
 ```
 
 That shared work state is the workspaces root (task workdirs and the repo cache), the Codex per-conversation session stores, and the Hermes/Reasonix/DSH memory, transcript and state stores. Sharing it is what lets a task created by one profile be resumed by the other; a task whose workdir or provider session belonged to a profile the running daemon cannot see restarts with no memory.
 
 Profiles pointed at different backends stay fully separate, as before. So do the profile-scoped files listed above, which are visible in the directory layout under `~/.multica/profiles/<name>/`.
+
+URL identity folds scheme and host case, WebSocket `/ws`, and default HTTP(S) ports. It does not resolve DNS aliases or treat `localhost` and `127.0.0.1` as equivalent. Profiles for one physical server must use the same canonical URL to share work state and runtime ownership.
+
+Current daemons send a per-ownership token when they register and use the fenced deregistration route. A delayed offline request cannot retire a newer owner's registration. The older deregistration route remains for older daemons but cannot retire a row carrying a current owner token; on an older server without the fenced route, cleanup waits for its stale-heartbeat sweep.
 
 Upgrading does not move anything. A machine that already has profile-scoped work state keeps using it: the resolver adopts the existing tree, so a conversation that was resumable before the upgrade still is. If two profiles on one backend both hold non-empty work state (the shape a machine affected by the Desktop takeover bug is left in), the daemon refuses to start rather than picking one or merging them, and the error names both trees. Resolve it by keeping the one you want: set `MULTICA_WORKSPACES_ROOT` (or `workspaces_root` in that profile's config) to it — every profile on that backend then follows that choice — and archive or remove the other. The same refusal covers a profile that holds non-empty work state but never recorded which backend it belongs to: nothing can prove whether that tree is this backend's, so the daemon asks you to start or migrate that profile (or persist its `server_url`) first.
 

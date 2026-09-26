@@ -41,10 +41,11 @@ import (
 // device name - and every persistent-state path the daemon owns hangs off it:
 //
 //	Multica profile   auth / config / log / pid / health-port boundary
-//	work-state scope  physical machine + normalized backend boundary
+//	work-state scope  physical machine + canonical server URL boundary
 //
-// Two profiles on one machine pointing at one backend resolve one scope and
-// therefore one tree. Different backends never share a tree.
+// Two profiles on one machine using the same canonical URL resolve one scope
+// and one tree. DNS and loopback aliases cannot be proved equivalent locally;
+// operators must use one URL spelling for profiles targeting the same server.
 //
 // Scope is resolved by *adoption*, never by a silent cutover: an installation
 // that already has state in a profile-scoped location keeps using that location,
@@ -839,19 +840,19 @@ func rejectAmbiguousLegacyState(multicaRoot, key, currentProfile, backend string
 		if name == currentProfile {
 			continue
 		}
-		cfg, err := cli.LoadCLIConfigForProfile(name)
-		if err != nil {
-			continue
-		}
-		if strings.TrimSpace(cfg.ServerURL) != "" {
+		cfg, configErr := cli.LoadCLIConfigForProfile(name)
+		if configErr == nil && strings.TrimSpace(cfg.ServerURL) != "" {
 			continue // attributable: the candidate scan already handles it
 		}
 		owner, err := newWorkStateOwner(name, "")
 		if err != nil {
-			continue
+			return err
 		}
 		if workStateRootHasState(owner.legacyWorkspacesRoot()) || profileDirHasProviderState(owner.profileDir) ||
 			execenv.CodexSessionNamespaceHasState(execenv.CodexSessionNamespaceForProfile(name)) {
+			if configErr != nil {
+				return fmt.Errorf("daemon work state is ambiguous: %s has non-empty legacy state and unreadable config: %w", owner.label(), configErr)
+			}
 			ambiguous = append(ambiguous, name)
 		}
 	}

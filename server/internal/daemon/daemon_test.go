@@ -59,6 +59,28 @@ func TestNormalizeServerBaseURL(t *testing.T) {
 	}
 }
 
+func TestNormalizeServerBaseURLDefaultPorts(t *testing.T) {
+	t.Parallel()
+	for _, pair := range [][2]string{
+		{"https://multica.example", "https://multica.example:443"},
+		{"http://multica.example", "http://multica.example:80"},
+		{"wss://MULTICA.EXAMPLE:443/ws", "https://multica.example"},
+		{"https://[::1]", "https://[::1]:443"},
+	} {
+		left, err := NormalizeServerBaseURL(pair[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		right, err := NormalizeServerBaseURL(pair[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if left != right || WorkStateKey(left) != WorkStateKey(right) {
+			t.Errorf("%q and %q resolved to different work state: %q, %q", pair[0], pair[1], left, right)
+		}
+	}
+}
+
 func TestTriggerRestart_BrewLinuxCellarDeleted(t *testing.T) {
 	originalIsBrewInstall := isBrewInstall
 	originalGetBrewPrefix := getBrewPrefix

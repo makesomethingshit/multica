@@ -754,24 +754,6 @@ func (c *Client) ReportModelListResult(ctx context.Context, runtimeID, requestID
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/models/%s/result", runtimeID, requestID), result, nil)
 }
 
-// ReportRuntimeResumeWarning records, on the runtime, that this run expected to
-// resume a prior provider session and proved locally that it could not.
-//
-// The daemon already tells the agent through the task context and the resume
-// decision already reaches the server with the task payload; this is the
-// user-facing half, so an operator looking at the runtime can see why a task
-// restarted cold. Best effort by contract: callers log and continue, including
-// when an older server answers 404 because it does not have the endpoint.
-func (c *Client) ReportRuntimeResumeWarning(ctx context.Context, runtimeID, taskID string) error {
-	if strings.TrimSpace(runtimeID) == "" || strings.TrimSpace(taskID) == "" {
-		return nil
-	}
-	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/resume-warning", runtimeID), map[string]any{
-		"code":    "prior_session_resume_unavailable",
-		"task_id": taskID,
-	}, nil)
-}
-
 // ReportLocalSkillListResult sends the runtime-local-skill inventory back to the server.
 func (c *Client) ReportLocalSkillListResult(ctx context.Context, runtimeID, requestID string, result map[string]any) error {
 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/runtimes/%s/local-skills/%s/result", runtimeID, requestID), result, nil)
@@ -1081,12 +1063,14 @@ type RuntimeOfflineReason struct {
 // Deregister takes runtimes offline. reasons is optional and keyed by runtime
 // id: a daemon shutting down has nothing to explain, while one that condemned a
 // broken CLI does.
-func (c *Client) Deregister(ctx context.Context, runtimeIDs []string, reasons map[string]RuntimeOfflineReason) error {
-	body := map[string]any{"runtime_ids": runtimeIDs}
+func (c *Client) Deregister(ctx context.Context, runtimeIDs []string, reasons map[string]RuntimeOfflineReason, ownerGenerations map[string]string) error {
+	body := map[string]any{"runtime_ids": runtimeIDs, "owner_generations": ownerGenerations}
 	if len(reasons) > 0 {
 		body["offline_reasons"] = reasons
 	}
-	return c.postJSON(ctx, "/api/daemon/deregister", body, nil)
+	// A distinct route fails closed against a server that predates the fence:
+	// the legacy endpoint would ignore owner_generations and mutate the new owner.
+	return c.postJSON(ctx, "/api/daemon/deregister/fenced", body, nil)
 }
 
 // RegisterResponse holds the server's response to a daemon registration.
