@@ -656,7 +656,9 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			h.mergeLegacyRuntimes(r, registered, provider, req.LegacyDaemonIDs)
 		}
 
-		resp = append(resp, runtimeToResponse(registered))
+		registeredResponse := runtimeToResponse(registered)
+		registeredResponse.OwnerGeneration = runtime.OwnerGeneration
+		resp = append(resp, registeredResponse)
 	}
 	for _, failed := range req.FailedProfiles {
 		profileID := strings.TrimSpace(failed.ProfileID)

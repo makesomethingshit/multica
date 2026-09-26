@@ -422,11 +422,12 @@ func newBatchFixture(t *testing.T) *batchFixture {
 				// cleanup has to compensate for.
 				delete(fx.offlineReasons, id)
 				resp.Runtimes = append(resp.Runtimes, Runtime{
-					ID:        id,
-					Name:      rt["name"],
-					Provider:  rt["type"],
-					Status:    "online",
-					ProfileID: rt["profile_id"],
+					ID:              id,
+					OwnerGeneration: rt["owner_generation"],
+					Name:            rt["name"],
+					Provider:        rt["type"],
+					Status:          "online",
+					ProfileID:       rt["profile_id"],
 				})
 			}
 			fx.registered = append(fx.registered, call)

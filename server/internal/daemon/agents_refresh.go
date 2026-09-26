@@ -745,7 +745,7 @@ func (d *Daemon) deregisterRevivedRuntimes(ctx context.Context, workspaceID stri
 	// metadata, so the reason the demotion stored is gone and the server would
 	// otherwise be left with a bare "offline" — which reads as "wait for the
 	// machine" on every admission path (MUL-6164).
-	if err := d.client.Deregister(ctx, runtimeIDs, revived.reasonsFor(runtimeIDs), d.ownerGenerations(runtimeIDs, revived.targets)); err != nil {
+	if err := d.client.Deregister(ctx, runtimeIDs, revived.reasonsFor(runtimeIDs), revived.ownerGenerations); err != nil {
 		d.logger.Warn("deregister of revived demoted runtimes failed",
 			"workspace_id", workspaceID, "runtime_ids", runtimeIDs, "error", err)
 	}

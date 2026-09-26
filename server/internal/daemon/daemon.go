@@ -1831,8 +1831,9 @@ func (d *Daemon) demotedOfflineReasonLocked(provider string) *RuntimeOfflineReas
 // the daemon has already condemned: the ids to take offline again, and the
 // cause to re-attach per row because that register's upsert just overwrote it.
 type revivedRuntimes struct {
-	ids     []string
-	reasons map[string]RuntimeOfflineReason
+	ids              []string
+	reasons          map[string]RuntimeOfflineReason
+	ownerGenerations map[string]string
 	// targets is the ownership claim each of those rows belongs to. The row is
 	// refused locally, so this process must not keep claiming the logical
 	// runtime it just declined to serve (GH #8280).
@@ -1876,6 +1877,10 @@ func (r revivedRuntimes) reasonsFor(runtimeIDs []string) map[string]RuntimeOffli
 // rows still need deregistering, they just have nothing to re-attach.
 func (r *revivedRuntimes) add(d *Daemon, workspaceID string, rt Runtime) {
 	r.ids = append(r.ids, rt.ID)
+	if r.ownerGenerations == nil {
+		r.ownerGenerations = make(map[string]string)
+	}
+	r.ownerGenerations[rt.ID] = rt.OwnerGeneration
 	if target := runtimeOwnerTargetForRuntime(rt, workspaceID); target != "" {
 		if r.targets == nil {
 			r.targets = make(map[string]string, 1)

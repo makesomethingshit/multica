@@ -128,7 +128,7 @@ const (
 func (d *Daemon) acquireRuntimeOwnership(target string) (runtimeOwnershipOutcome, error) {
 	d.ownerState().mu.Lock()
 	defer d.ownerState().mu.Unlock()
-	if claim, ok := d.ownerState().byTarget[target]; ok && claim.claim != nil {
+	if claim, ok := d.ownerState().byTarget[target]; ok && (claim.claim != nil || !d.scopeLocks.Enabled()) {
 		return runtimeOwnedByThisProcess, nil
 	}
 	claim, ok, err := d.scopeLocks.TryAcquireTargetDelete(target)

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -164,10 +165,18 @@ func TestDaemonDeregisterLateOldOwnerCannotOfflineNewOwner(t *testing.T) {
 	}
 	// A has released its local claim after an uncertain response; B registers
 	// the same runtime row while the old request is paused before its write.
-	testutil.Call(t, testHandler.DaemonRegister, newDaemonTokenRequest("POST", "/api/daemon/register", map[string]any{
+	register := testutil.Call(t, testHandler.DaemonRegister, newDaemonTokenRequest("POST", "/api/daemon/register", map[string]any{
 		"workspace_id": testWorkspaceID, "daemon_id": daemonID,
 		"runtimes": []map[string]any{{"name": "codex", "type": "codex", "status": "online", "owner_generation": "owner-B"}},
 	}, testWorkspaceID, daemonID)).Want(http.StatusOK)
+	var registered struct {
+		Runtimes []struct {
+			OwnerGeneration string `json:"owner_generation"`
+		} `json:"runtimes"`
+	}
+	if err := json.Unmarshal(register.Body.Bytes(), &registered); err != nil || len(registered.Runtimes) != 1 || registered.Runtimes[0].OwnerGeneration != "owner-B" {
+		t.Fatalf("register response did not echo owner generation: %s (%v)", register.Body.String(), err)
+	}
 	close(gate.release)
 	select {
 	case <-done:
