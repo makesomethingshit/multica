@@ -335,6 +335,7 @@ func (h *Handler) inheritMachineCustomName(ctx context.Context, rt db.AgentRunti
 }
 
 var errRuntimeProfileDisabled = errors.New("runtime profile is disabled")
+var errStaleRuntimeRegistration = errors.New("runtime ownership has changed")
 
 // upsertRuntimeWithProfile serializes custom-runtime registration with profile
 // deletion. The profile row remains KEY SHARE locked until the runtime upsert
@@ -369,6 +370,9 @@ func (h *Handler) upsertRuntimeWithProfile(
 
 	row, err = qtx.UpsertAgentRuntimeWithProfile(ctx, build(profile))
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return row, profile, errStaleRuntimeRegistration
+		}
 		return row, profile, fmt.Errorf("upsert profile runtime: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -532,6 +536,10 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, "runtime profile is disabled: "+runtime.ProfileID)
 				return
 			}
+			if errors.Is(err, errStaleRuntimeRegistration) {
+				writeError(w, http.StatusConflict, err.Error())
+				return
+			}
 			if err != nil {
 				obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.RuntimeFailed(
 					uuidToString(ownerID),
@@ -578,6 +586,10 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				Metadata:    metadata,
 				OwnerID:     ownerID,
 			})
+			if errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusConflict, errStaleRuntimeRegistration.Error())
+				return
+			}
 			if err != nil {
 				obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.RuntimeFailed(
 					uuidToString(ownerID),

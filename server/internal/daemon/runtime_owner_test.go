@@ -281,8 +281,8 @@ func TestRuntimeOwnership_TakeoverAfterOwnerCrash(t *testing.T) {
 	if err != nil || outcome != runtimeOwnedByThisProcess {
 		t.Fatalf("standby takeover: outcome=%v err=%v", outcome, err)
 	}
-	if next := standby.runtimeOwnerToken(target); next == "" || next == oldToken {
-		t.Fatalf("takeover token %q must differ from prior owner token %q", next, oldToken)
+	if next := standby.runtimeOwnerToken(target); next <= oldToken {
+		t.Fatalf("takeover token %q must be newer than prior owner token %q", next, oldToken)
 	}
 	standby.recoverOrphansOncePerOwnership(t.Context(), ownershipWorkspace, Runtime{ID: "runtime-1", Provider: "codex"})
 	if got := rec.recoveredIDs(); len(got) != 1 {

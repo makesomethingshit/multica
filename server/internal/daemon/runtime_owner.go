@@ -3,9 +3,15 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -136,10 +142,50 @@ func (d *Daemon) acquireRuntimeOwnership(target string) (runtimeOwnershipOutcome
 		claim.Release()
 		return runtimeOwnedByPeer, fmt.Errorf("runtime ownership token: %w", err)
 	}
-	entry := &runtimeOwnerClaim{claim: claim, token: hex.EncodeToString(nonce[:])}
+	token := hex.EncodeToString(nonce[:])
+	if d.scopeLocks.Enabled() {
+		generation, err := nextRuntimeOwnerGeneration(d.scopeLocks.Dir(), target)
+		if err != nil {
+			claim.Release()
+			return runtimeOwnedByPeer, fmt.Errorf("runtime ownership generation: %w", err)
+		}
+		token = fmt.Sprintf("g%020d:%s", generation, token)
+	}
+	entry := &runtimeOwnerClaim{claim: claim, token: token}
 	d.ownerState().byTarget[target] = entry
 	delete(d.ownerState().standbyTargets, target)
 	return runtimeOwnedByThisProcess, nil
+}
+
+// nextRuntimeOwnerGeneration runs while the caller holds target's OS claim.
+// Persisting before Register makes a later claimant's generation strictly newer
+// even if the previous process dies with a request still in flight.
+func nextRuntimeOwnerGeneration(lockDir, target string) (uint64, error) {
+	sum := sha256.Sum256([]byte(filepath.Clean(target)))
+	path := filepath.Join(lockDir, hex.EncodeToString(sum[:8])+".generation")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var buf [8]byte
+	n, err := f.ReadAt(buf[:], 0)
+	if !(n == 0 && err == io.EOF || n == len(buf) && err == nil) {
+		return 0, fmt.Errorf("invalid runtime ownership generation file %s: read %d bytes: %w", path, n, err)
+	}
+	generation := binary.BigEndian.Uint64(buf[:])
+	if generation == math.MaxUint64 {
+		return 0, fmt.Errorf("runtime ownership generation exhausted for %s", target)
+	}
+	generation++
+	binary.BigEndian.PutUint64(buf[:], generation)
+	if _, err := f.WriteAt(buf[:], 0); err != nil {
+		return 0, err
+	}
+	if err := f.Sync(); err != nil {
+		return 0, err
+	}
+	return generation, nil
 }
 
 // noteRuntimeStandby records that a sibling owns target, so the workspace keeps
@@ -329,7 +375,7 @@ func (d *Daemon) filterOwnedRuntimeCandidates(ctx context.Context, workspaceID s
 			seen[target] = true
 			outcome, err := d.acquireRuntimeOwnership(target)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, ownedFailures, nil, err
 			}
 			if outcome == runtimeOwnedByPeer {
 				d.noteRuntimeStandby(target)
@@ -343,7 +389,7 @@ func (d *Daemon) filterOwnedRuntimeCandidates(ctx context.Context, workspaceID s
 			d.clearRuntimeStandby(target)
 			entry["owner_generation"] = d.runtimeOwnerToken(target)
 			if entry["owner_generation"] == "" {
-				return nil, nil, nil, fmt.Errorf("runtime ownership claim %s disappeared before registration", target)
+				return nil, ownedFailures, nil, fmt.Errorf("runtime ownership claim %s disappeared before registration", target)
 			}
 			if failure {
 				ownedFailures = append(ownedFailures, entry)

@@ -90,6 +90,10 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE COALESCE(agent_runtime.metadata->>'owner_generation', '') NOT LIKE 'g%'
+   OR EXCLUDED.metadata->>'owner_generation' = agent_runtime.metadata->>'owner_generation'
+   OR (EXCLUDED.metadata->>'owner_generation' LIKE 'g%'
+       AND split_part(EXCLUDED.metadata->>'owner_generation', ':', 1) > split_part(agent_runtime.metadata->>'owner_generation', ':', 1))
 RETURNING *, (xmax = 0) AS inserted;
 
 -- name: UpsertAgentRuntimeWithProfile :one
@@ -124,6 +128,10 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE COALESCE(agent_runtime.metadata->>'owner_generation', '') NOT LIKE 'g%'
+   OR EXCLUDED.metadata->>'owner_generation' = agent_runtime.metadata->>'owner_generation'
+   OR (EXCLUDED.metadata->>'owner_generation' LIKE 'g%'
+       AND split_part(EXCLUDED.metadata->>'owner_generation', ':', 1) > split_part(agent_runtime.metadata->>'owner_generation', ':', 1))
 RETURNING *, (xmax = 0) AS inserted;
 
 -- name: UpdateAgentRuntimeVisibility :one

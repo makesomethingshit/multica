@@ -1616,6 +1616,10 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE COALESCE(agent_runtime.metadata->>'owner_generation', '') NOT LIKE 'g%'
+   OR EXCLUDED.metadata->>'owner_generation' = agent_runtime.metadata->>'owner_generation'
+   OR (EXCLUDED.metadata->>'owner_generation' LIKE 'g%'
+       AND split_part(EXCLUDED.metadata->>'owner_generation', ':', 1) > split_part(agent_runtime.metadata->>'owner_generation', ':', 1))
 RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name, (xmax = 0) AS inserted
 `
 
@@ -1720,6 +1724,10 @@ DO UPDATE SET
     owner_id = COALESCE(EXCLUDED.owner_id, agent_runtime.owner_id),
     last_seen_at = now(),
     updated_at = now()
+WHERE COALESCE(agent_runtime.metadata->>'owner_generation', '') NOT LIKE 'g%'
+   OR EXCLUDED.metadata->>'owner_generation' = agent_runtime.metadata->>'owner_generation'
+   OR (EXCLUDED.metadata->>'owner_generation' LIKE 'g%'
+       AND split_part(EXCLUDED.metadata->>'owner_generation', ':', 1) > split_part(agent_runtime.metadata->>'owner_generation', ':', 1))
 RETURNING id, workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at, created_at, updated_at, owner_id, legacy_daemon_id, visibility, profile_id, custom_name, (xmax = 0) AS inserted
 `
 

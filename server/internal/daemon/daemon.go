@@ -3192,6 +3192,11 @@ func (d *Daemon) registerRuntimesForWorkspaceBatchLocked(ctx context.Context, wo
 	// server. A sibling process in the same work-state scope that already serves a
 	// runtime keeps it, and this process stands by for that one (GH #8280).
 	owned, ownedFailures, peerOwned, ownErr := d.filterOwnedRuntimeCandidates(ctx, workspaceID, runtimes, failedProfiles)
+	defer func() {
+		for _, failed := range ownedFailures {
+			d.releaseRuntimeOwnership(runtimeOwnerTargetForEntry(workspaceID, failed))
+		}
+	}()
 	if ownErr != nil {
 		return nil, "", ownErr
 	}
