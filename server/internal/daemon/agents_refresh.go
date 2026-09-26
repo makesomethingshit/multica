@@ -786,7 +786,13 @@ func (d *Daemon) deregisterDroppedRuntimes(ctx context.Context, workspaceID stri
 	if len(runtimeIDs) == 0 {
 		return
 	}
-	if err := d.client.Deregister(ctx, runtimeIDs, offlineReasons, d.ownerGenerations(runtimeIDs, targets)); err != nil {
+	generations := d.ownerGenerations(runtimeIDs, targets)
+	for _, entry := range dropped {
+		if entry.Generation != "" {
+			generations[entry.ID] = entry.Generation
+		}
+	}
+	if err := d.client.Deregister(ctx, runtimeIDs, offlineReasons, generations); err != nil {
 		d.logger.Warn("deregister of dropped runtimes failed",
 			"workspace_id", workspaceID, "runtime_ids", runtimeIDs, "reason", reason, "error", err)
 	}

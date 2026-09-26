@@ -1650,7 +1650,7 @@ func (d *Daemon) applyRegisterResponseInPlace(workspaceID string, resp *Register
 	for _, rt := range resp.Runtimes {
 		if rt.ProfileID == "" && d.providerDemotedLocked(rt.Provider) {
 			rejected[rt.ID] = struct{}{}
-			dropped = append(dropped, droppedRuntime{ID: rt.ID, Target: runtimeOwnerTargetForRuntime(rt, workspaceID)})
+			dropped = append(dropped, droppedRuntime{ID: rt.ID, Target: runtimeOwnerTargetForRuntime(rt, workspaceID), Generation: rt.OwnerGeneration})
 			continue
 		}
 		newIDs = append(newIDs, rt.ID)
@@ -1848,8 +1848,9 @@ type revivedRuntimes struct {
 // workspace + profile), and the local metadata that names it is deleted in the
 // same step that decides the row is going away.
 type droppedRuntime struct {
-	ID     string
-	Target string
+	ID         string
+	Target     string
+	Generation string // late register responses can outlive their ownership claim
 }
 
 // reasonsFor narrows the causes to the rows actually being deregistered. The
