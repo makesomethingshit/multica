@@ -213,7 +213,7 @@ func (d *Daemon) ownsTarget(target string) bool {
 func (d *Daemon) runtimeOwnerToken(target string) string {
 	d.ownerState().mu.Lock()
 	defer d.ownerState().mu.Unlock()
-	if claim := d.ownerState().byTarget[target]; claim != nil && claim.claim != nil {
+	if claim := d.ownerState().byTarget[target]; claim != nil && (claim.claim != nil || !d.scopeLocks.Enabled()) {
 		return claim.token
 	}
 	return ""
