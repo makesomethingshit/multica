@@ -627,12 +627,12 @@ type Daemon struct {
 	// or any task is in handleTask. Together that closes the fetch-then-claim
 	// race where a new task slipping in during the release-metadata fetch
 	// would be cancelled by triggerRestart's root-ctx cancel.
-	claimMu        sync.Mutex
-	pauseClaims    bool // when true, the batch poller skips claiming
-	claimsInFlight int  // pollers that have decided to claim but haven't yet handed the task off to handleTask
-	// claimsDrained is signalled when claimsInFlight reaches zero, so the
-	// legacy-peer standby transition can wait for the claims that already
-	// entered to finish their ClaimTask -> dispatch step instead of polling.
+	claimMu              sync.Mutex
+	pauseClaims          bool // when true, the batch poller skips claiming
+	claimsInFlight       int  // pollers that have decided to claim but haven't yet handed the task off to handleTask
+	ownershipTransitions int  // ownership releases waiting for claims to drain
+	// claimsDrained is signalled when claimsInFlight reaches zero, so ownership
+	// release and legacy-peer standby can wait for active claim transitions.
 	// Created by LoadConfig and, for struct-literal Daemons, by the drain helper
 	// under claimMu.
 	claimsDrained *sync.Cond
@@ -3191,14 +3191,15 @@ func (d *Daemon) registerRuntimesForWorkspaceBatchLocked(ctx context.Context, wo
 	// Ownership gate: only candidates this process owns may be announced to the
 	// server. A sibling process in the same work-state scope that already serves a
 	// runtime keeps it, and this process stands by for that one (GH #8280).
-	owned, peerOwned, ownErr := d.filterOwnedRuntimeCandidates(ctx, workspaceID, runtimes)
+	owned, ownedFailures, peerOwned, ownErr := d.filterOwnedRuntimeCandidates(ctx, workspaceID, runtimes, failedProfiles)
 	if ownErr != nil {
 		return nil, "", ownErr
 	}
 	runtimes = owned
+	failedProfiles = ownedFailures
 	if len(peerOwned) > 0 {
 		d.logger.Info("runtime candidates already owned by a sibling daemon process; standing by",
-			"workspace_id", workspaceID, "providers", peerOwned, "owned", len(runtimes))
+			"workspace_id", workspaceID, "candidates", peerOwned, "owned", len(runtimes))
 	}
 
 	if len(runtimes) == 0 && len(failedProfiles) == 0 {
@@ -3262,7 +3263,7 @@ func (d *Daemon) registerBuiltinRuntimesForWorkspaceLocked(ctx context.Context, 
 	if len(runtimes) == 0 {
 		return nil, ErrNoRuntimesToRegister
 	}
-	owned, _, err := d.filterOwnedRuntimeCandidates(ctx, workspaceID, runtimes)
+	owned, _, _, err := d.filterOwnedRuntimeCandidates(ctx, workspaceID, runtimes, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -5544,7 +5545,7 @@ func (d *Daemon) tryEnterClaim() bool {
 	// the auto-update barrier: the barrier is owned by the update path and is
 	// released on its failure paths, so a standby set through it could be
 	// cleared by an unrelated update that never happened (GH #8280).
-	if d.pauseClaims || d.legacyPeerStandby.Load() {
+	if d.pauseClaims || d.legacyPeerStandby.Load() || d.ownershipTransitions > 0 {
 		return false
 	}
 	d.claimsInFlight++
@@ -5835,6 +5836,26 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 				return
 			}
 			continue
+		}
+		// A runtime may have left the set after the snapshot above and before
+		// this claim entered. Never send an old owner's ID after its release.
+		if d.scopeLocks.Enabled() {
+			current := make(map[string]bool)
+			for _, id := range d.ownedRuntimeIDs() {
+				current[id] = true
+			}
+			kept := runtimeIDs[:0]
+			for _, id := range runtimeIDs {
+				if current[id] {
+					kept = append(kept, id)
+				}
+			}
+			runtimeIDs = kept
+			if len(runtimeIDs) == 0 {
+				d.exitClaim()
+				releaseSlots(slots)
+				continue
+			}
 		}
 
 		claimResult, err := d.claimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots))

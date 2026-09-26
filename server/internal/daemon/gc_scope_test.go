@@ -231,34 +231,50 @@ func TestGCScope_LegacyTaskWithoutScopeClaimIsProtected(t *testing.T) {
 	commit()
 }
 
-// TestGCScope_CodexStoreActiveInAnotherDaemon is case B.
-func TestGCScope_CodexStoreActiveInAnotherDaemon(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
-	lockDir := scopeLockDirForTest(t, "key-b")
-	daemonA := newScopeGuardDaemon(t, lockDir, "")
-	daemonB := newScopeGuardDaemon(t, lockDir, "")
-
-	const namespace = "w_scopetest"
-	store := execenv.CodexSessionStorePath(namespace, execenv.TaskContextForEnv{AgentID: "agent-1", IssueID: "issue-1"})
-	rollout := filepath.Join(store, "sessions", "rollout.jsonl")
-	mustWriteFile(t, rollout, "{}")
-	ageWorkStateTree(t, store, time.Now().Add(-30*24*time.Hour))
-
-	holder, err := daemonB.holdStoreForTask(store)
-	if err != nil {
-		t.Fatalf("task store claim in daemon B: %v", err)
-	}
-	if removed, _ := execenv.PruneCodexSessionStores(namespace, 14*24*time.Hour, time.Now(), daemonA.reserveStoreForDeletion, quietTaskLog()); removed != 0 {
-		t.Fatalf("GC reclaimed a store a task is using in another daemon (removed=%d)", removed)
-	}
-	if _, err := os.Stat(rollout); err != nil {
-		t.Fatalf("store was mutated while another daemon held it: %v", err)
-	}
-
-	holder()
-	if removed, _ := execenv.PruneCodexSessionStores(namespace, 14*24*time.Hour, time.Now(), daemonA.reserveStoreForDeletion, quietTaskLog()); removed != 1 {
-		t.Fatalf("GC refused the released store (removed=%d)", removed)
+// A store held by another daemon survives GC, then becomes collectible on release.
+func TestGCScope_ProviderSessionStoreActiveInAnotherDaemon(t *testing.T) {
+	for _, kind := range []string{"codex", "hermes"} {
+		t.Run(kind, func(t *testing.T) {
+			lockDir := scopeLockDirForTest(t, "session-store-"+kind)
+			daemonA := newScopeGuardDaemon(t, lockDir, "")
+			daemonB := newScopeGuardDaemon(t, lockDir, "")
+			var store, file string
+			var prune func() int
+			if kind == "codex" {
+				t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), ".codex"))
+				const namespace = "w_scopetest"
+				store = execenv.CodexSessionStorePath(namespace, execenv.TaskContextForEnv{AgentID: "agent-1", IssueID: "issue-1"})
+				file = filepath.Join(store, "sessions", "rollout.jsonl")
+				prune = func() int {
+					n, _ := execenv.PruneCodexSessionStores(namespace, 14*24*time.Hour, time.Now(), daemonA.reserveStoreForDeletion, quietTaskLog())
+					return n
+				}
+			} else {
+				root := t.TempDir()
+				store = execenv.HermesSessionStorePath(root, "agent-1", "", execenv.TaskContextForEnv{AgentID: "agent-1", IssueID: "issue-1"})
+				file = filepath.Join(store, "state.db")
+				prune = func() int {
+					n, _ := execenv.PruneHermesSessionStores(root, 14*24*time.Hour, time.Now(), daemonA.reserveStoreForDeletion, quietTaskLog())
+					return n
+				}
+			}
+			mustWriteFile(t, file, "state")
+			ageWorkStateTree(t, store, time.Now().Add(-30*24*time.Hour))
+			release, err := daemonB.holdStoreForTask(store)
+			if err != nil {
+				t.Fatalf("hold store: %v", err)
+			}
+			if removed := prune(); removed != 0 {
+				t.Fatalf("GC reclaimed a held store: %d", removed)
+			}
+			if _, err := os.Stat(file); err != nil {
+				t.Fatalf("held store changed: %v", err)
+			}
+			release()
+			if removed := prune(); removed != 1 {
+				t.Fatalf("GC did not reclaim released store: %d", removed)
+			}
+		})
 	}
 }
 
@@ -294,32 +310,6 @@ func TestGCScope_HermesMemoryStoreKeepsConcurrentUsers(t *testing.T) {
 	releaseC()
 	if removed, _ := execenv.PruneHermesMemoryStores(stateRoot, 90*24*time.Hour, time.Now(), daemonA.reserveStoreForDeletion, quietTaskLog()); removed != 1 {
 		t.Fatalf("GC refused the released memory store (removed=%d)", removed)
-	}
-}
-
-// TestGCScope_HermesSessionStoreActiveInAnotherDaemon is case D.
-func TestGCScope_HermesSessionStoreActiveInAnotherDaemon(t *testing.T) {
-	lockDir := scopeLockDirForTest(t, "key-d")
-	daemonA := newScopeGuardDaemon(t, lockDir, "")
-	daemonB := newScopeGuardDaemon(t, lockDir, "")
-
-	stateRoot := t.TempDir()
-	task := execenv.TaskContextForEnv{AgentID: "agent-1", IssueID: "issue-1"}
-	store := execenv.HermesSessionStorePath(stateRoot, "agent-1", "", task)
-	mustWriteFile(t, filepath.Join(store, "state.db"), "transcript")
-	ageWorkStateTree(t, store, time.Now().Add(-30*24*time.Hour))
-
-	holder, err := daemonB.holdStoreForTask(store)
-	if err != nil {
-		t.Fatalf("session store claim in daemon B: %v", err)
-	}
-	if removed, _ := execenv.PruneHermesSessionStores(stateRoot, 14*24*time.Hour, time.Now(), daemonA.reserveStoreForDeletion, quietTaskLog()); removed != 0 {
-		t.Fatalf("GC reclaimed a session store a conversation is using elsewhere (removed=%d)", removed)
-	}
-
-	holder()
-	if removed, _ := execenv.PruneHermesSessionStores(stateRoot, 14*24*time.Hour, time.Now(), daemonA.reserveStoreForDeletion, quietTaskLog()); removed != 1 {
-		t.Fatalf("GC refused the released session store (removed=%d)", removed)
 	}
 }
 

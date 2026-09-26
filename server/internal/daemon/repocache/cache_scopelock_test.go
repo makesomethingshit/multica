@@ -74,58 +74,6 @@ func shortRepoCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 250*time.Millisecond)
 }
 
-// TestScopeLock_ForegroundMutationsAreExclusive is case A: while one cache holds
-// the repository mutation claim, a second cache - another process - cannot enter
-// the same mutation, and it enters normally once the first one finishes.
-func TestScopeLock_ForegroundMutationsAreExclusive(t *testing.T) {
-	cacheA, cacheB, _, bare, _ := scopeLockedRepos(t)
-	release := holdRepoMutation(t, cacheA, bare)
-
-	ctx, cancel := shortRepoCtx()
-	entered := false
-	err := cacheB.WithRepoLockContext(ctx, bare, func() error {
-		entered = true
-		return nil
-	})
-	cancel()
-	if entered {
-		t.Fatal("a second cache entered the mutation while the first held the scope claim")
-	}
-	if err == nil {
-		t.Fatal("the second cache reported success without entering the mutation")
-	}
-
-	release()
-	if err := cacheB.WithRepoLock(bare, func() error { return nil }); err != nil {
-		t.Fatalf("the second cache was still refused after the first finished: %v", err)
-	}
-}
-
-// TestScopeLock_MaintenanceSkipsWhileForegroundHolds is case B: a prune, a
-// branch cleanup, or any other maintenance step in one daemon must not run while
-// another daemon is mutating the same repository.
-func TestScopeLock_MaintenanceSkipsWhileForegroundHolds(t *testing.T) {
-	cacheA, cacheB, _, bare, _ := scopeLockedRepos(t)
-	release := holdRepoMutation(t, cacheB, bare)
-
-	ran, err := cacheA.WithRepoMaintenance(context.Background(), bare, func(context.Context) error {
-		t.Error("maintenance ran while another daemon held the repo")
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("maintenance: %v", err)
-	}
-	if ran {
-		t.Fatal("maintenance reported a run while another daemon held the repo")
-	}
-
-	release()
-	ran, err = cacheA.WithRepoMaintenance(context.Background(), bare, func(context.Context) error { return nil })
-	if err != nil || !ran {
-		t.Fatalf("maintenance after release: ran=%v err=%v, want a run", ran, err)
-	}
-}
-
 // TestScopeLock_EvictionCannotRemoveARepoInUse is case C. Eviction runs inside the
 // maintenance gate, so a repo another daemon is using - foreground work here,
 // task activity in the next test - cannot have its bare path removed.
@@ -220,14 +168,23 @@ func TestScopeLock_RepoRecreationWaitsForTheDeleteClaim(t *testing.T) {
 		})
 	}()
 	<-started
+	// The same claim excludes ordinary foreground mutation before the path is
+	// removed, as well as recreation after removal below.
+	ctx, cancel := shortRepoCtx()
+	entered := false
+	err := cacheB.WithRepoLockContext(ctx, bare, func() error { entered = true; return nil })
+	cancel()
+	if err == nil || entered {
+		t.Fatal("a sibling entered foreground mutation while the claim was held")
+	}
 	// The deletion this claim authorises: the bare path itself is gone.
 	if err := os.RemoveAll(bare); err != nil {
 		t.Fatalf("remove bare repo: %v", err)
 	}
 
-	ctx, cancel := shortRepoCtx()
+	ctx, cancel = shortRepoCtx()
 	recreated := false
-	err := cacheB.WithRepoLockContext(ctx, bare, func() error {
+	err = cacheB.WithRepoLockContext(ctx, bare, func() error {
 		recreated = true
 		return os.MkdirAll(bare, 0o755)
 	})

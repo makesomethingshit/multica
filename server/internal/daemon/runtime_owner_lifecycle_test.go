@@ -2,15 +2,11 @@ package daemon
 
 import (
 	"context"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
 
@@ -85,24 +81,6 @@ func waitUntil(deadline time.Duration, condition func() bool) bool {
 	return condition()
 }
 
-// stageUnreadablePeerProfile creates a sibling profile whose config exists but
-// cannot be parsed, which is the state that leaves the peer's backend unknown.
-// The directory is what makes the peer discoverable; the broken file is what
-// makes it unattributable.
-func stageUnreadablePeerProfile(t *testing.T, profile string) {
-	t.Helper()
-	path, err := cli.CLIConfigPathForProfile(profile)
-	if err != nil {
-		t.Fatalf("resolve config path for %q: %v", profile, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("create profile dir for %q: %v", profile, err)
-	}
-	if err := os.WriteFile(path, []byte("{ this is not a config"), 0o644); err != nil {
-		t.Fatalf("write unreadable config for %q: %v", profile, err)
-	}
-}
-
 func countString(got []string, want string) int {
 	n := 0
 	for _, v := range got {
@@ -119,7 +97,7 @@ func trackedWorkspaceCount(d *Daemon) int {
 	return len(d.workspaces)
 }
 
-// TestRuntimeOwnership_AllPeerOwnedWorkspaceStartsWithoutPanic is review item 1.
+// An all-standby workspace must remain active for takeover retries.
 //
 // The new-workspace path of syncWorkspacesFromAPI folds errAllRuntimesPeerOwned
 // into "the callback succeeded", which left resp == nil for the steps after it
@@ -183,7 +161,7 @@ func TestRuntimeOwnership_AllPeerOwnedWorkspaceStartsWithoutPanic(t *testing.T) 
 	}
 }
 
-// TestRuntimeOwnership_PartialStandbyTakesOverAfterPeerCrash is review item 2.
+// A daemon serving one runtime must retry its sibling-owned candidates.
 //
 // A workspace whose built-in runtime this process owns while a sibling owns a
 // custom profile used to be a dead end: with a runtime still tracked,
@@ -318,7 +296,7 @@ func TestRuntimeOwnership_StaleStandbyTargetsAreForgotten(t *testing.T) {
 	}
 }
 
-// TestRuntimeOwnership_DisabledProfileReleasesItsClaim is review item 3A: a
+// TestRuntimeOwnership_DisabledProfileReleasesItsClaim checks that a
 // daemon that stops serving a runtime but keeps its ownership claim locks every
 // sibling out of that runtime until the process exits.
 func TestRuntimeOwnership_DisabledProfileReleasesItsClaim(t *testing.T) {
@@ -373,7 +351,7 @@ func TestRuntimeOwnership_DisabledProfileReleasesItsClaim(t *testing.T) {
 	}
 }
 
-// TestRuntimeOwnership_WorkspaceRemovalReleasesItsClaims is review item 3B: a
+// TestRuntimeOwnership_WorkspaceRemovalReleasesItsClaims checks that a
 // workspace the user is no longer a member of drops out of the sync, and the
 // claims for the runtimes it was hosting must go with it.
 func TestRuntimeOwnership_WorkspaceRemovalReleasesItsClaims(t *testing.T) {
@@ -422,10 +400,8 @@ func TestRuntimeOwnership_WorkspaceRemovalReleasesItsClaims(t *testing.T) {
 	}
 }
 
-// TestRuntimeOwnership_ClaimIsReleasedOnlyAfterTheDeregistrationAttempt is review
-// item 3C: releasing the claim first would let a sibling take the runtime over and
-// bring it back online before this process's Deregister landed - the stale-
-// deregister race, in the other direction.
+// Releasing the claim before deregistration would let a sibling bring the
+// runtime back online before this process's Deregister landed.
 func TestRuntimeOwnership_ClaimIsReleasedOnlyAfterTheDeregistrationAttempt(t *testing.T) {
 	isolatedProfileHome(t)
 	fx := newBatchFixture(t)
@@ -477,7 +453,7 @@ func TestRuntimeOwnership_ClaimIsReleasedOnlyAfterTheDeregistrationAttempt(t *te
 	}
 }
 
-// TestRuntimeCoordination_UnresponsivePeerBlocksActivation is review item 4A.
+// An unresponsive peer with a held health port keeps activation blocked.
 //
 // A same-backend peer profile whose health endpoint does not answer used to be
 // read as "no peer there", so a legacy daemon that was merely slow - or whose
@@ -533,7 +509,7 @@ func TestRuntimeCoordination_UnresponsivePeerBlocksActivation(t *testing.T) {
 	}
 }
 
-// TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes is review item 4B.
+// A late legacy peer makes an already active daemon yield its runtimes.
 //
 // The peer check used to return from the sync, which is enough only while this
 // process owns nothing. A legacy daemon that starts AFTER this one is already
@@ -566,7 +542,7 @@ func TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes(t *testing.T) {
 	// advertise the coordination capability.
 	withStagedPeerConfig(t, "legacy-host", fx.server.URL)
 	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
-		return peerCoordinationStatus{Alive: true}
+		return peerCoordinationStatus{Alive: true, Backend: fx.server.URL}
 	}
 	peerHealthPortOwnedFunc = func(int) bool { return true }
 	// Subscribed after the registration above, so the only notification this
@@ -633,8 +609,7 @@ func TestRuntimeCoordination_LateLegacyPeerYieldsRuntimes(t *testing.T) {
 	}
 }
 
-// TestRuntimeCoordination_YieldIsSerializedAgainstRegistration is item 6: the
-// local drop has to happen inside the workspace's registration lock, or a
+// The local drop has to happen inside the workspace's registration lock, or a
 // register response that is already in flight publishes the runtime back into
 // the set the yield just emptied - leaving standby set, the runtime tracked
 // again, and its heartbeat and claim running.
@@ -692,7 +667,7 @@ func TestRuntimeCoordination_YieldIsSerializedAgainstRegistration(t *testing.T) 
 
 	withStagedPeerConfig(t, "legacy-host", fx.server.URL)
 	peerProbeFunc = func(context.Context, string) peerCoordinationStatus {
-		return peerCoordinationStatus{Alive: true}
+		return peerCoordinationStatus{Alive: true, Backend: fx.server.URL}
 	}
 	peerHealthPortOwnedFunc = func(int) bool { return true }
 
@@ -741,7 +716,7 @@ func TestRuntimeCoordination_YieldIsSerializedAgainstRegistration(t *testing.T) 
 	}
 }
 
-// TestRuntimeCoordination_YieldWaitsForClaimsInFlight is item 7: a claim that
+// A claim that
 // entered before the standby barrier is allowed to finish its
 // ClaimTask -> dispatch step, and only then is ownership dropped. The claim
 // accounting (claimMu / claimsInFlight / tryEnterClaim / exitClaim) is the
@@ -877,7 +852,7 @@ func TestRuntimeCoordination_YieldDoesNotWaitForRunningTasks(t *testing.T) {
 	}
 }
 
-// TestRuntimeOwnership_RuntimeGoneRecoversOnlyTheDeletedRuntime is review item 5.
+// Re-registering one deleted runtime must not recover surviving runtimes.
 //
 // reregisterWorkspaceAfterRuntimeGone used to call RecoverOrphans for every
 // runtime the register response returned. That response carries the workspace's
@@ -928,73 +903,5 @@ func TestRuntimeOwnership_RuntimeGoneRecoversOnlyTheDeletedRuntime(t *testing.T)
 	}
 	if !fx.runtimeOnline(codexRuntime) {
 		t.Error("the re-registered runtime was not brought back online")
-	}
-}
-
-// TestRuntimeCoordination_UnreadableProfile covers both halves of the fail-closed
-// rule for a sibling profile whose backend cannot be established: while something
-// holds its health port this daemon stands by, because it cannot prove the peer
-// is unrelated, and a free port means the directory is stale, so normal
-// activation proceeds and a corrupt leftover cannot disable the daemon.
-func TestRuntimeCoordination_UnreadableProfile(t *testing.T) {
-	tests := []struct {
-		name        string
-		profile     string
-		portHeld    bool
-		wantBlocked bool
-	}{
-		{name: "live blocks", profile: "broken-host", portHeld: true, wantBlocked: true},
-		{name: "stale does not block", profile: "stale-host", portHeld: false, wantBlocked: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			isolatedProfileHome(t)
-			fx := newBatchFixture(t)
-			fx.enableStableRuntimeIDs()
-			fx.shareRuntimeOwnership(scopeLockDirForTest(t, "unreadable-"+tc.profile))
-			d := fx.daemon
-			d.cfg.Agents = map[string]AgentEntry{"codex": {Path: "/fake/codex"}}
-			d.cfg.ServerBaseURL = fx.server.URL
-			fx.setWorkspaces(WorkspaceInfo{ID: "ws-1", Name: "one"})
-			stageUnreadablePeerProfile(t, tc.profile)
-			stubRuntimeCoordination(t, nil, func(int) bool { return tc.portHeld })
-
-			decision := d.checkRuntimeCoordinationPeers(context.Background())
-			if decision.Blocked != tc.wantBlocked {
-				t.Fatalf("Blocked = %v, want %v (%v)", decision.Blocked, tc.wantBlocked, decision.Peers)
-			}
-			if tc.wantBlocked {
-				if len(decision.Peers) != 1 {
-					t.Fatalf("decision.Peers = %v, want the unreadable peer named", decision.Peers)
-				}
-				detail := decision.Peers[0]
-				if !strings.Contains(detail, tc.profile) || !strings.Contains(detail, "backend could not be established") {
-					t.Errorf("the block detail does not identify the profile and its config error: %q", detail)
-				}
-				if strings.Contains(detail, "does not advertise runtime coordination") {
-					t.Errorf("the block detail claims a confirmed same-backend legacy peer: %q", detail)
-				}
-			}
-
-			if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
-				t.Fatalf("sync: %v", err)
-			}
-			if tc.wantBlocked {
-				if got := fx.registerCallCount(); got != 0 {
-					t.Errorf("made %d Register calls while an unidentified daemon is running", got)
-				}
-				if d.tryEnterClaim() {
-					t.Error("work could still be claimed while the conflict is unresolved")
-				}
-				return
-			}
-			if got := fx.registerCallCount(); got != 1 {
-				t.Errorf("Register calls = %d, want the normal registration", got)
-			}
-			if !d.ownsTarget(runtimeOwnerTarget("ws-1", "codex", "")) {
-				t.Error("the runtime was not taken after the stale profile was ignored")
-			}
-		})
 	}
 }

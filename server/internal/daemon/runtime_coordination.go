@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/cli"
@@ -51,28 +51,22 @@ type runtimeCoordinationPeer struct {
 	// Port is the peer profile's health port, kept beside the URL because the
 	// local liveness check below has to dial it as a plain TCP port.
 	Port int
-	// ConfigErr is set when this daemon could not establish the peer's backend:
-	// its config could not be read, records no server URL, or does not parse. A
-	// nil ConfigErr means the profile was readable and resolves to THIS backend.
-	ConfigErr error
 }
 
-// runtimeCoordinationPeers returns the sibling profiles that may address this
-// backend: every profile whose config was readable and resolves to it, plus every
-// profile whose backend could not be established (retained with ConfigErr so
-// liveness can still be checked fail-closed). A readable profile proven to use
-// another backend is omitted - it cannot be addressing this daemon's runtime rows.
+// runtimeCoordinationPeers discovers sibling profile candidates. Their saved
+// config cannot identify a running daemon: CLI flags and environment may override
+// its server URL. Only the live health response establishes backend identity.
 //
 // The profile directories are the machine-local inventory of daemon processes;
 // no service discovery or registry is involved.
-func runtimeCoordinationPeers(backend string, ownProfile string) []runtimeCoordinationPeer {
+func runtimeCoordinationPeers(ownProfile string) ([]runtimeCoordinationPeer, error) {
 	root, err := cli.ProfileDir("")
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	entries, err := os.ReadDir(filepath.Join(root, "profiles"))
-	if err != nil {
-		return nil
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -95,30 +89,9 @@ func runtimeCoordinationPeers(backend string, ownProfile string) []runtimeCoordi
 			URL:     fmt.Sprintf("http://127.0.0.1:%d/health", port),
 			Port:    port,
 		}
-		cfg, err := cli.LoadCLIConfigForProfile(name)
-		if err != nil {
-			peer.ConfigErr = err
-			peers = append(peers, peer)
-			continue
-		}
-		raw := strings.TrimSpace(cfg.ServerURL)
-		if raw == "" {
-			peer.ConfigErr = fmt.Errorf("profile config records no server URL")
-			peers = append(peers, peer)
-			continue
-		}
-		peerBackend, err := NormalizeServerBaseURL(raw)
-		if err != nil {
-			peer.ConfigErr = err
-			peers = append(peers, peer)
-			continue
-		}
-		if peerBackend != backend {
-			continue
-		}
 		peers = append(peers, peer)
 	}
-	return peers
+	return peers, nil
 }
 
 // healthPortForProfile mirrors cmd/multica healthPortForProfile. The cmd/multica
@@ -147,6 +120,8 @@ type peerCoordinationStatus struct {
 	// Coordinates is true when the live peer advertises the capability, i.e. it
 	// participates in the runtime-owner claim.
 	Coordinates bool
+	// Backend is the actual server_url advertised by this running daemon.
+	Backend string
 }
 
 // peerProbeFunc performs one health probe. Indirected so tests can model a legacy
@@ -186,9 +161,11 @@ func probeRuntimeCoordinationPeer(ctx context.Context, url string) peerCoordinat
 		return peerCoordinationStatus{Alive: true}
 	}
 	version, ok := payload[runtimeCoordinationKey].(float64)
+	backend, _ := payload["server_url"].(string)
 	return peerCoordinationStatus{
 		Alive:       true,
 		Coordinates: ok && int(version) >= RuntimeCoordinationVersion,
+		Backend:     backend,
 	}
 }
 
@@ -237,16 +214,14 @@ func peerHealthPortOwned(port int) bool {
 // checkRuntimeCoordinationPeers reports whether any sibling profile is a daemon
 // this process must not activate a runtime against.
 //
-// Same-backend peers are capability-probed. A peer that answers with the
-// capability takes the same owner claim, so the claim - not this probe - decides
-// which process serves a runtime. A peer that answers without it is a live
-// legacy daemon, and one that does not answer at all is resolved by its health
-// port: held means a daemon is alive and this process stands by, free means the
-// profile directory is stale. A profile whose backend could not be established
-// blocks while its port is live, because this daemon cannot prove it is
-// unrelated; profiles proven to use another backend are filtered in discovery.
+// The live health response identifies the backend. A same-backend peer with
+// coordination relies on the owner claim; a same-backend legacy peer blocks.
+// An unknown live backend also blocks, while a free port is a stale profile.
 func (d *Daemon) checkRuntimeCoordinationPeers(ctx context.Context) legacyPeerDecision {
-	peers := runtimeCoordinationPeers(d.cfg.ServerBaseURL, d.cfg.Profile)
+	peers, err := runtimeCoordinationPeers(d.cfg.Profile)
+	if err != nil {
+		return legacyPeerDecision{Blocked: true, Peers: []string{fmt.Sprintf("cannot discover sibling profiles: %v", err)}}
+	}
 	if len(peers) == 0 {
 		return legacyPeerDecision{}
 	}
@@ -256,26 +231,21 @@ func (d *Daemon) checkRuntimeCoordinationPeers(ctx context.Context) legacyPeerDe
 		if label == "" {
 			label = "default profile"
 		}
-		if peer.ConfigErr != nil {
-			// Backend unknown, so only local liveness can exclude the peer. Held
-			// port means a daemon this process cannot identify is running: stand
-			// by, and say why, since the backend is not a proven match.
-			if peerHealthPortOwnedFunc(peer.Port) {
-				decision.block(fmt.Sprintf(
-					"%s (%s) is running - port %d is held - but its backend could not be established (%v); "+
-						"refusing runtime activation because this daemon cannot prove the peer is unrelated",
-					label, peer.URL, peer.Port, peer.ConfigErr))
-			}
-			continue
-		}
 		status := peerProbeFunc(ctx, peer.URL)
+		backend, err := NormalizeServerBaseURL(status.Backend)
+		parsed, parseErr := url.Parse(status.Backend)
+		identified := err == nil && parseErr == nil && parsed.Host != ""
 		switch {
-		case status.Alive && status.Coordinates:
+		case status.Alive && identified && backend != d.cfg.ServerBaseURL:
 			continue
-		case status.Alive:
+		case status.Alive && identified && status.Coordinates:
+			continue
+		case status.Alive && identified:
 			decision.block(fmt.Sprintf("%s (%s) is alive but does not advertise runtime coordination", label, peer.URL))
+		case status.Alive:
+			decision.block(fmt.Sprintf("%s (%s) is alive but its backend could not be established", label, peer.URL))
 		case peerHealthPortOwnedFunc(peer.Port):
-			decision.block(fmt.Sprintf("%s (%s) did not answer, but port %d is still held by a running daemon", label, peer.URL, peer.Port))
+			decision.block(fmt.Sprintf("%s (%s) did not answer, but port %d is held and its backend could not be established", label, peer.URL, peer.Port))
 		}
 	}
 	return decision

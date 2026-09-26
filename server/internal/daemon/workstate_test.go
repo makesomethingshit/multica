@@ -154,6 +154,19 @@ func TestWorkStateKey_FollowsURLNormalization(t *testing.T) {
 	if WorkStateKey(upper) != WorkStateKey(lower) {
 		t.Fatalf("two spellings of one backend got keys %q and %q", WorkStateKey(upper), WorkStateKey(lower))
 	}
+	for _, aliases := range [][2]string{{"https://host", "https://host:443"}, {"http://host", "http://host:80"}} {
+		bare, err := NormalizeServerBaseURL(aliases[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		port, err := NormalizeServerBaseURL(aliases[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bare != port || WorkStateKey(bare) != WorkStateKey(port) {
+			t.Fatalf("default port aliases differ: %q and %q", bare, port)
+		}
+	}
 
 	// A path difference is a backend difference, and it must survive both the
 	// normalizer and the key.
@@ -237,19 +250,6 @@ func TestWorkStateScope_DifferentBackendsStaySeparate(t *testing.T) {
 	}
 	if one.CodexNamespace == two.CodexNamespace {
 		t.Fatalf("two backends share Codex namespace %q", one.CodexNamespace)
-	}
-}
-
-func TestWorkStateScope_DefaultPortAliasesShareTree(t *testing.T) {
-	stageWorkStateHome(t)
-	writeProfileConfig(t, "", "https://multica.example", "")
-	writeProfileConfig(t, testDesktop, "https://multica.example:443", "")
-	bare, _ := NormalizeServerBaseURL("https://multica.example")
-	port, _ := NormalizeServerBaseURL("https://multica.example:443")
-	first := resolveScope(t, bare, "", "")
-	second := resolveScope(t, port, testDesktop, "")
-	if first.Key != second.Key || first.WorkspacesRoot != second.WorkspacesRoot || first.StateRoot != second.StateRoot || first.CodexNamespace != second.CodexNamespace {
-		t.Fatalf("default port aliases selected different work state: %+v %+v", first, second)
 	}
 }
 

@@ -1,15 +1,88 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 )
+
+// A request that entered the claim transition must finish before its owner's
+// filesystem claim is released; otherwise the shared daemon_id lets it claim
+// work after a sibling registers the next ownership.
+func TestRuntimeOwnership_ReleaseDrainsOldClaimBeforeTakeover(t *testing.T) {
+	arrived := make(chan struct{})
+	finish := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/daemon/tasks/claim" {
+			close(arrived)
+			<-finish
+			_, _ = w.Write([]byte(`{"tasks":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	lockDir := scopeLockDirForTest(t, "claim-handoff")
+	a := newOwnershipDaemon(t, lockDir, srv.URL)
+	b := newOwnershipDaemon(t, lockDir, srv.URL)
+	target := runtimeOwnerTarget(ownershipWorkspace, "codex", "")
+	if outcome, err := a.acquireRuntimeOwnership(target); err != nil || outcome != runtimeOwnedByThisProcess {
+		t.Fatalf("owner claim: %v %v", outcome, err)
+	}
+	if !a.tryEnterClaim() {
+		t.Fatal("old claim could not enter")
+	}
+	claimed := make(chan struct{})
+	go func() {
+		defer close(claimed)
+		_, err := a.client.ClaimTasks(context.Background(), "machine-1", []string{"runtime-1"}, 1)
+		if err != nil {
+			t.Errorf("old ClaimTasks: %v", err)
+		}
+		a.exitClaim()
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("claim never arrived")
+	}
+	released := make(chan struct{})
+	started := make(chan struct{})
+	go func() { close(started); a.releaseRuntimeOwnership(target); close(released) }()
+	<-started
+	select {
+	case <-released:
+		t.Fatal("ownership was released before the old ClaimTasks finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if a.tryEnterClaim() {
+		t.Fatal("new claim entered during ownership release")
+	}
+	if outcome, err := b.acquireRuntimeOwnership(target); err != nil || outcome != runtimeOwnedByPeer {
+		t.Fatalf("sibling took over while old ClaimTasks was in flight: %v %v", outcome, err)
+	}
+	close(finish)
+	select {
+	case <-claimed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("claim did not finish")
+	}
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ownership was not released")
+	}
+	if outcome, err := b.acquireRuntimeOwnership(target); err != nil || outcome != runtimeOwnedByThisProcess {
+		t.Fatalf("sibling could not take over after old claim drained: %v %v", outcome, err)
+	}
+}
 
 // Cross-profile runtime ownership regression tests (GH #8280).
 //
@@ -110,7 +183,7 @@ func seedOwnedRuntime(t *testing.T, d *Daemon, workspaceID, runtimeID, provider 
 
 const ownershipWorkspace = "11111111-1111-1111-1111-111111111111"
 
-// TestRuntimeOwnership_SiblingCannotTakeOverALiveRuntime is R1/R5: while one
+// TestRuntimeOwnership_SiblingCannotTakeOverALiveRuntime checks that while one
 // process owns the runtime, a second process must not become an owner of it, must
 // not be able to register it, and therefore must never run the startup recovery
 // that hard-fails the first process running tasks.
@@ -139,7 +212,7 @@ func TestRuntimeOwnership_SiblingCannotTakeOverALiveRuntime(t *testing.T) {
 	// A standby process has nothing it may announce, and that must be reported as
 	// standby rather than as "nothing to host" - the latter is what makes a
 	// sibling deregister a live runtime.
-	owned, peerOwned, err := standby.filterOwnedRuntimeCandidates(t.Context(), ownershipWorkspace, []map[string]string{{"type": "codex", "status": "online"}})
+	owned, _, peerOwned, err := standby.filterOwnedRuntimeCandidates(t.Context(), ownershipWorkspace, []map[string]string{{"type": "codex", "status": "online"}}, nil)
 	if err != nil {
 		t.Fatalf("filter candidates: %v", err)
 	}
@@ -157,7 +230,7 @@ func TestRuntimeOwnership_SiblingCannotTakeOverALiveRuntime(t *testing.T) {
 	}
 }
 
-// TestRuntimeOwnership_OwnerRecoversExactlyOnce is R5/R9: the owner recovers
+// TestRuntimeOwnership_OwnerRecoversExactlyOnce checks that the owner recovers
 // orphaned work when it takes a runtime over, and a later registration of the
 // same ownership must not recover again - that second call is what would fail the
 // tasks the owner is itself running.
@@ -181,7 +254,7 @@ func TestRuntimeOwnership_OwnerRecoversExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestRuntimeOwnership_TakeoverAfterOwnerCrash is R8: when the owner dies its OS
+// TestRuntimeOwnership_TakeoverAfterOwnerCrash checks that when the owner dies its OS
 // claim is released, a standby takes over, registers, and recovers exactly once -
 // so only genuinely orphaned work is reclaimed.
 func TestRuntimeOwnership_TakeoverAfterOwnerCrash(t *testing.T) {
@@ -217,7 +290,7 @@ func TestRuntimeOwnership_TakeoverAfterOwnerCrash(t *testing.T) {
 	}
 }
 
-// TestRuntimeOwnership_NonOwnerShutdownLeavesRuntimeOnline is R2: a standby
+// TestRuntimeOwnership_NonOwnerShutdownLeavesRuntimeOnline checks that a standby
 // process exiting must not take a sibling runtime offline.
 func TestRuntimeOwnership_NonOwnerShutdownLeavesRuntimeOnline(t *testing.T) {
 	lockDir := scopeLockDirForTest(t, "runtime-owner-shutdown")

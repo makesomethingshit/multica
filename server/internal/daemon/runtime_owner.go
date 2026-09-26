@@ -72,22 +72,15 @@ func runtimeOwnerTargetWorkspace(target string) string {
 	return parts[2]
 }
 
-// runtimeOwnerClaim is one held ownership: the OS claim plus the generation it
-// belongs to.
+// runtimeOwnerClaim is one held ownership and its server-visible fencing token.
 //
-// The generation exists because "registration succeeded" is not the same fact as
-// "this process just became the owner". Startup orphan recovery is only correct
-// for the latter, so a periodic re-register, a profile refresh or a version
-// refresh by a process that has been serving the runtime all along must not
-// re-run it - that would fail the very tasks it is running.
+// Startup orphan recovery runs once for this claim. A new claim gets a new
+// token and a fresh recovery decision; re-registration under the same claim
+// must not recover tasks the owner is executing.
 type runtimeOwnerClaim struct {
-	target string
-	claim  *execenv.ScopeClaim
-	token  string
-	// generation increments on every acquisition by this process.
-	generation uint64
-	// recovered is the generation whose startup recovery has already run.
-	recovered uint64
+	claim     *execenv.ScopeClaim
+	token     string
+	recovered bool
 }
 
 // runtimeOwners is the process-local view of the claims this daemon holds.
@@ -96,13 +89,13 @@ type runtimeOwners struct {
 	byTarget map[string]*runtimeOwnerClaim
 	// standbyTargets records runtimes a sibling process owns, so the daemon
 	// retries them later instead of concluding "nothing to host".
-	standbyTargets map[string]string
+	standbyTargets map[string]struct{}
 }
 
 func newRuntimeOwners() *runtimeOwners {
 	return &runtimeOwners{
 		byTarget:       make(map[string]*runtimeOwnerClaim),
-		standbyTargets: make(map[string]string),
+		standbyTargets: make(map[string]struct{}),
 	}
 }
 
@@ -143,10 +136,7 @@ func (d *Daemon) acquireRuntimeOwnership(target string) (runtimeOwnershipOutcome
 		claim.Release()
 		return runtimeOwnedByPeer, fmt.Errorf("runtime ownership token: %w", err)
 	}
-	entry := &runtimeOwnerClaim{target: target, claim: claim, token: hex.EncodeToString(nonce[:]), generation: 1}
-	if previous, existed := d.ownerState().byTarget[target]; existed {
-		entry.generation = previous.generation + 1
-	}
+	entry := &runtimeOwnerClaim{claim: claim, token: hex.EncodeToString(nonce[:])}
 	d.ownerState().byTarget[target] = entry
 	delete(d.ownerState().standbyTargets, target)
 	return runtimeOwnedByThisProcess, nil
@@ -154,10 +144,10 @@ func (d *Daemon) acquireRuntimeOwnership(target string) (runtimeOwnershipOutcome
 
 // noteRuntimeStandby records that a sibling owns target, so the workspace keeps
 // being reconciled instead of converging to "nothing to host".
-func (d *Daemon) noteRuntimeStandby(target, label string) {
+func (d *Daemon) noteRuntimeStandby(target string) {
 	d.ownerState().mu.Lock()
 	defer d.ownerState().mu.Unlock()
-	d.ownerState().standbyTargets[target] = label
+	d.ownerState().standbyTargets[target] = struct{}{}
 }
 
 // clearRuntimeStandby forgets a standby target that is no longer a candidate.
@@ -243,16 +233,27 @@ func (d *Daemon) markOwnershipRecovered(target string) bool {
 	if !ok || claim.claim == nil {
 		return false
 	}
-	if claim.recovered == claim.generation {
+	if claim.recovered {
 		return false
 	}
-	claim.recovered = claim.generation
+	claim.recovered = true
 	return true
 }
 
 // releaseRuntimeOwnership drops the claim for target. The server fences any
 // delayed deregistration by this claim's owner token after a sibling takes over.
 func (d *Daemon) releaseRuntimeOwnership(target string) {
+	// A ClaimTasks request already sent under this ownership must finish before
+	// a sibling can acquire the claim. The poller rechecks its snapshot after
+	// entering the gate, so an old ID cannot be sent once this release ends.
+	d.claimMu.Lock()
+	d.ownershipTransitions++
+	if d.claimsDrained == nil {
+		d.claimsDrained = sync.NewCond(&d.claimMu)
+	}
+	for d.claimsInFlight > 0 {
+		d.claimsDrained.Wait()
+	}
 	d.ownerState().mu.Lock()
 	claim, ok := d.ownerState().byTarget[target]
 	if ok {
@@ -262,6 +263,8 @@ func (d *Daemon) releaseRuntimeOwnership(target string) {
 	if ok && claim.claim != nil {
 		claim.claim.Release()
 	}
+	d.ownershipTransitions--
+	d.claimMu.Unlock()
 }
 
 // releaseAllRuntimeOwnership drops every claim this process holds.
@@ -311,34 +314,46 @@ var errAllRuntimesPeerOwned = errors.New("all runtime candidates are owned by a 
 //
 // Duplicate candidates for one target (the same provider twice, or a built-in
 // repeated across a batch) collapse to a single claim.
-func (d *Daemon) filterOwnedRuntimeCandidates(ctx context.Context, workspaceID string, candidates []map[string]string) ([]map[string]string, []string, error) {
+func (d *Daemon) filterOwnedRuntimeCandidates(ctx context.Context, workspaceID string, candidates, failures []map[string]string) ([]map[string]string, []map[string]string, []string, error) {
 	owned := make([]map[string]string, 0, len(candidates))
+	ownedFailures := make([]map[string]string, 0, len(failures))
 	var peerOwned []string
-	seen := make(map[string]bool, len(candidates))
-	for _, entry := range candidates {
-		target := runtimeOwnerTargetForEntry(workspaceID, entry)
-		if seen[target] {
-			continue
+	seen := make(map[string]bool, len(candidates)+len(failures))
+	for groupIndex, group := range [][]map[string]string{candidates, failures} {
+		for _, entry := range group {
+			failure := groupIndex == 1
+			target := runtimeOwnerTargetForEntry(workspaceID, entry)
+			if seen[target] {
+				continue
+			}
+			seen[target] = true
+			outcome, err := d.acquireRuntimeOwnership(target)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if outcome == runtimeOwnedByPeer {
+				d.noteRuntimeStandby(target)
+				label := entry["type"]
+				if failure {
+					label = entry["profile_id"]
+				}
+				peerOwned = append(peerOwned, label)
+				continue
+			}
+			d.clearRuntimeStandby(target)
+			entry["owner_generation"] = d.runtimeOwnerToken(target)
+			if entry["owner_generation"] == "" {
+				return nil, nil, nil, fmt.Errorf("runtime ownership claim %s disappeared before registration", target)
+			}
+			if failure {
+				ownedFailures = append(ownedFailures, entry)
+			} else {
+				owned = append(owned, entry)
+			}
 		}
-		seen[target] = true
-		outcome, err := d.acquireRuntimeOwnership(target)
-		if err != nil {
-			return nil, nil, err
-		}
-		if outcome == runtimeOwnedByPeer {
-			d.noteRuntimeStandby(target, entry["type"])
-			peerOwned = append(peerOwned, entry["type"])
-			continue
-		}
-		d.clearRuntimeStandby(target)
-		entry["owner_generation"] = d.runtimeOwnerToken(target)
-		if entry["owner_generation"] == "" {
-			return nil, nil, fmt.Errorf("runtime ownership claim %s disappeared before registration", target)
-		}
-		owned = append(owned, entry)
 	}
 	d.pruneRuntimeStandby(workspaceID, seen)
-	return owned, peerOwned, nil
+	return owned, ownedFailures, peerOwned, nil
 }
 
 // recoverOrphansOncePerOwnership runs startup orphan recovery for a runtime this

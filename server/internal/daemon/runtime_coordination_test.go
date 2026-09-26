@@ -2,17 +2,13 @@ package daemon
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/cli"
 )
-
-// Mixed-version coordination tests (GH #8280 spec items 11-12).
-//
-// The owner claim is an OS lock, so it can only exclude processes that take it.
-// A peer from a release that predates it registers and serves runtimes without
-// ever looking at the lock, which is why a new daemon must refuse to activate a
-// runtime while such a peer is alive.
 
 func withStagedPeerConfig(t *testing.T, profile, serverURL string) {
 	t.Helper()
@@ -21,20 +17,10 @@ func withStagedPeerConfig(t *testing.T, profile, serverURL string) {
 	}
 }
 
-// stubRuntimeCoordination replaces the remote peer probe and the local liveness
-// probe for one test, restoring both when it ends. A nil argument leaves that
-// probe as the production implementation.
-func stubRuntimeCoordination(
-	t *testing.T,
-	probe func(context.Context, string) peerCoordinationStatus,
-	portOwned func(int) bool,
-) {
+func stubRuntimeCoordination(t *testing.T, probe func(context.Context, string) peerCoordinationStatus, portOwned func(int) bool) {
 	t.Helper()
 	originalProbe, originalPort := peerProbeFunc, peerHealthPortOwnedFunc
-	t.Cleanup(func() {
-		peerProbeFunc = originalProbe
-		peerHealthPortOwnedFunc = originalPort
-	})
+	t.Cleanup(func() { peerProbeFunc, peerHealthPortOwnedFunc = originalProbe, originalPort })
 	if probe != nil {
 		peerProbeFunc = probe
 	}
@@ -43,123 +29,85 @@ func stubRuntimeCoordination(
 	}
 }
 
-// TestRuntimeCoordination_LegacyPeerBlocksActivation is spec case 11: a live
-// same-machine, same-backend peer that does not advertise the capability stops
-// this daemon from activating a runtime.
-func TestRuntimeCoordination_LegacyPeerBlocksActivation(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	const backend = "https://same.example"
-	withStagedPeerConfig(t, "desktop-host", backend)
-
-	d := &Daemon{
-		cfg:    Config{ServerBaseURL: backend, Profile: ""},
-		logger: quietTaskLog(),
+func TestRuntimeCoordination_PeerDecision(t *testing.T) {
+	const same = "https://same.example"
+	const other = "https://other.example"
+	cases := []struct {
+		name, saved string
+		status      peerCoordinationStatus
+		portHeld    bool
+		blocked     bool
+	}{
+		{"same legacy", same, peerCoordinationStatus{Alive: true, Backend: same}, true, true},
+		{"same coordinating", same, peerCoordinationStatus{Alive: true, Backend: same, Coordinates: true}, true, false},
+		{"saved differs from actual match", other, peerCoordinationStatus{Alive: true, Backend: same}, true, true},
+		{"saved matches but actual differs", same, peerCoordinationStatus{Alive: true, Backend: other}, true, false},
+		{"unresponsive held", same, peerCoordinationStatus{}, true, true},
+		{"stale port free", same, peerCoordinationStatus{}, false, false},
+		{"missing config held", "", peerCoordinationStatus{}, true, true},
+		{"missing config unrelated", "", peerCoordinationStatus{Alive: true, Backend: other}, true, false},
+		{"unreadable config held", "invalid", peerCoordinationStatus{}, true, true},
+		{"unreadable config unrelated", "invalid", peerCoordinationStatus{Alive: true, Backend: other}, true, false},
+		{"live unknown backend", same, peerCoordinationStatus{Alive: true, Coordinates: true}, true, true},
+		{"malformed backend", same, peerCoordinationStatus{Alive: true, Backend: "http://"}, true, true},
 	}
-
-	// The peer is alive but cannot be coordinated with (a pre-claim daemon).
-	probed := 0
-	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
-		probed++
-		return peerCoordinationStatus{Alive: true}
-	}, nil)
-	decision := d.checkRuntimeCoordinationPeers(context.Background())
-	if probed == 0 {
-		t.Fatal("no peer was probed")
-	}
-	if !decision.Blocked {
-		t.Fatal("a live legacy peer did not block activation")
-	}
-	if len(decision.Peers) != 1 {
-		t.Fatalf("decision.Peers = %v, want the legacy peer named", decision.Peers)
-	}
-}
-
-// TestRuntimeCoordination_CoordinatingPeerDoesNotBlock is the other half: a peer
-// that takes the same claim is not a blocker, because the claim itself decides
-// which of the two serves a runtime.
-func TestRuntimeCoordination_CoordinatingPeerDoesNotBlock(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	const backend = "https://same.example"
-	withStagedPeerConfig(t, "desktop-host", backend)
-
-	d := &Daemon{
-		cfg:    Config{ServerBaseURL: backend, Profile: ""},
-		logger: quietTaskLog(),
-	}
-	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
-		return peerCoordinationStatus{Alive: true, Coordinates: true}
-	}, nil)
-	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
-		t.Fatalf("a coordinating peer blocked activation: %v", decision.Peers)
-	}
-}
-
-// TestRuntimeCoordination_PeerOnAnotherBackendIsIgnored pins the scope: only
-// peers aimed at the SAME backend can contend, because a different backend is a
-// different work-state scope and a different server runtime.
-func TestRuntimeCoordination_PeerOnAnotherBackendIsIgnored(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	withStagedPeerConfig(t, "desktop-host", "https://other.example")
-
-	d := &Daemon{
-		cfg:    Config{ServerBaseURL: "https://same.example", Profile: ""},
-		logger: quietTaskLog(),
-	}
-	// The port is live: a readable profile that provably serves another backend
-	// must be filtered out during discovery no matter how alive it is, and must
-	// not be probed.
-	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
-		t.Error("a peer on another backend was probed")
-		return peerCoordinationStatus{Alive: true}
-	}, func(int) bool { return true })
-	if peers := runtimeCoordinationPeers("https://same.example", ""); len(peers) != 0 {
-		t.Fatalf("peers on another backend were retained: %+v", peers)
-	}
-	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
-		t.Fatalf("a live peer on another backend blocked activation: %v", decision.Peers)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			if tc.saved != "" && tc.saved != "invalid" {
+				withStagedPeerConfig(t, "desktop-host", tc.saved)
+			} else {
+				profileDir, err := cli.ProfileDir("desktop-host")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(profileDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if tc.saved == "invalid" {
+					configPath, err := cli.CLIConfigPathForProfile("desktop-host")
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(configPath, []byte("{broken"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			d := &Daemon{cfg: Config{ServerBaseURL: same}, logger: quietTaskLog()}
+			stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus { return tc.status }, func(int) bool { return tc.portHeld })
+			decision := d.checkRuntimeCoordinationPeers(context.Background())
+			if decision.Blocked != tc.blocked {
+				t.Fatalf("Blocked = %v, want %v (%v)", decision.Blocked, tc.blocked, decision.Peers)
+			}
+		})
 	}
 }
 
-// TestRuntimeCoordination_LegacyPeerGoneAllowsActivation is spec case 12: once the
-// legacy peer stops answering, this daemon may take ownership normally.
-//
-// "Stopped" is the second half of the rule and needs both signals: the health
-// probe is unanswered AND nothing holds the profile's health port. A profile
-// directory outliving its daemon is stale; a peer whose port is still held is
-// alive and only prevented from answering, which must keep this process in
-// standby (see TestRuntimeCoordination_UnresponsivePeerBlocksActivation).
-func TestRuntimeCoordination_LegacyPeerGoneAllowsActivation(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	const backend = "https://same.example"
-	withStagedPeerConfig(t, "desktop-host", backend)
-
-	d := &Daemon{
-		cfg:    Config{ServerBaseURL: backend, Profile: ""},
-		logger: quietTaskLog(),
-	}
-	// Not alive, and the port is free: no process is running under that profile,
-	// so the profile directory is stale and activation may proceed.
-	stubRuntimeCoordination(t, func(context.Context, string) peerCoordinationStatus {
-		return peerCoordinationStatus{}
-	}, func(int) bool { return false })
-	if decision := d.checkRuntimeCoordinationPeers(context.Background()); decision.Blocked {
-		t.Fatalf("a stopped peer blocked activation: %v", decision.Peers)
+func TestRuntimeCoordination_ProbeUsesLiveServerURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"server_url":"https://actual.example","runtime_coordination_version":1}`))
+	}))
+	defer srv.Close()
+	got := probeRuntimeCoordinationPeer(context.Background(), srv.URL)
+	if !got.Alive || !got.Coordinates || got.Backend != "https://actual.example" {
+		t.Fatalf("health identity = %+v", got)
 	}
 }
 
-// TestRuntimeCoordination_HealthPortsMatchTheCLI pins the peer-inventory port
-// derivation against the CLI copy in cmd/multica, so a peer can never be probed
-// on a port its daemon does not listen on.
+func TestRuntimeCoordination_DefaultPeerExistsWithoutProfilesDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	peers, err := runtimeCoordinationPeers("desktop-host")
+	if err != nil || len(peers) != 1 || peers[0].Profile != "" {
+		t.Fatalf("default peer discovery = %+v, %v", peers, err)
+	}
+}
+
 func TestRuntimeCoordination_HealthPortsMatchTheCLI(t *testing.T) {
-	// Values pinned by cmd/multica.TestWorkStateSharedWhileProfilesStayIsolated.
 	if got := healthPortForProfile(""); got != DefaultHealthPort {
 		t.Fatalf("default health port = %d, want %d", got, DefaultHealthPort)
 	}

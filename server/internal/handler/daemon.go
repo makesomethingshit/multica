@@ -217,9 +217,10 @@ type DaemonRegisterRequest struct {
 		OwnerGeneration string `json:"owner_generation"`
 	} `json:"runtimes"`
 	FailedProfiles []struct {
-		ProfileID   string `json:"profile_id"`
-		CommandName string `json:"command_name"`
-		Reason      string `json:"reason"`
+		ProfileID       string `json:"profile_id"`
+		CommandName     string `json:"command_name"`
+		Reason          string `json:"reason"`
+		OwnerGeneration string `json:"owner_generation"`
 	} `json:"failed_profiles"`
 }
 
@@ -701,6 +702,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 					"runtime_profile_registration_error": true,
 					"runtime_profile_failure_reason":     reason,
 					"command_name":                       resolvedCommandName,
+					"owner_generation":                   failed.OwnerGeneration,
 				})
 				return db.UpsertAgentRuntimeWithProfileParams{
 					WorkspaceID: wsUUID,

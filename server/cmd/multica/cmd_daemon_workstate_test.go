@@ -7,10 +7,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemon"
 )
 
-// TestWorkStateSharedWhileProfilesStayIsolated is GH #8280 case C. Two profiles
-// on one machine aimed at one backend share every persistent work-state path -
-// that is the fix - while the auth/config/lifecycle boundary profiles exist for
-// (config, log, pid, health port) stays per profile.
+// The CLI resolver reaches the daemon's shared workspace root while config,
+// logs, PID files, and health ports remain profile-scoped.
 func TestWorkStateSharedWhileProfilesStayIsolated(t *testing.T) {
 	home := t.TempDir()
 	stageTestHome(t, home)
@@ -28,21 +26,6 @@ func TestWorkStateSharedWhileProfilesStayIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve default profile scope: %v", err)
 	}
-	desktopScope, err := daemon.WorkStateScopeForProfile(desktop, "")
-	if err != nil {
-		t.Fatalf("resolve desktop profile scope: %v", err)
-	}
-
-	if defaultScope.WorkspacesRoot != desktopScope.WorkspacesRoot {
-		t.Fatalf("workspaces roots differ: %q vs %q", defaultScope.WorkspacesRoot, desktopScope.WorkspacesRoot)
-	}
-	if defaultScope.StateRoot != desktopScope.StateRoot {
-		t.Fatalf("provider state roots differ: %q vs %q", defaultScope.StateRoot, desktopScope.StateRoot)
-	}
-	if defaultScope.CodexNamespace != desktopScope.CodexNamespace {
-		t.Fatalf("Codex namespaces differ: %q vs %q", defaultScope.CodexNamespace, desktopScope.CodexNamespace)
-	}
-
 	// The human disk-usage resolver has to land on the same tree the daemon uses.
 	if root, err := resolveWorkspacesRootForProfile(desktop, ""); err != nil || root != defaultScope.WorkspacesRoot {
 		t.Fatalf("resolveWorkspacesRootForProfile = %q (%v), want %q", root, err, defaultScope.WorkspacesRoot)

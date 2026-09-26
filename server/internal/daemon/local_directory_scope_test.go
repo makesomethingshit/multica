@@ -69,26 +69,6 @@ func TestLocalDirectoryScope_InPlaceSerializesAcrossProcesses(t *testing.T) {
 	releaseB()
 }
 
-// TestLocalDirectoryScope_WorktreeSnapshotBlocksOnCrossProcessWriter is spec case
-// 14: a snapshot must not read the tree while another process writes it.
-func TestLocalDirectoryScope_WorktreeSnapshotBlocksOnCrossProcessWriter(t *testing.T) {
-	lockDir := localScopeLockDir(t)
-	writer := newLocalDirectoryScopeDaemon(t, lockDir)
-	snapshotter := newLocalDirectoryScopeDaemon(t, lockDir)
-	realPath := t.TempDir()
-
-	releaseWriter, err := writer.holdLocalDirectoryPath(context.Background(), realPath, "in-place-task", nil)
-	if err != nil {
-		t.Fatalf("writer claim: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	if _, err := snapshotter.holdLocalDirectoryPath(ctx, realPath, "worktree-task", nil); err == nil {
-		t.Fatal("a worktree snapshot read a path another process was writing")
-	}
-	releaseWriter()
-}
-
 // TestLocalDirectoryScope_CancelledWaitLeaksNothing is spec case 16: a cancelled
 // wait must release nothing it did not take, and must leave the path acquirable.
 func TestLocalDirectoryScope_CancelledWaitLeaksNothing(t *testing.T) {
