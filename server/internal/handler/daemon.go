@@ -1351,45 +1351,6 @@ func runtimeGoneHeartbeatAck(runtimeID string) *protocol.DaemonHeartbeatAckPaylo
 	}
 }
 
-// recordHeartbeat marks the runtime as alive. When LivenessStore is available
-// (Redis configured and reachable) it writes a TTL'd liveness key and skips
-// the DB row write on most beats — the DB is only updated on the
-// offline→online transition or once per runtimeHeartbeatDBFlushInterval to
-// keep last_seen_at fresh enough for the UI and the DB-fallback sweeper.
-//
-// When LivenessStore is unavailable (no Redis configured) or any Touch call
-// errors, recordHeartbeat falls back to writing the DB on every beat — that
-// is the original behavior and keeps the sweeper's DB-only path correct.
-//
-// The actual DB write is delegated to h.HeartbeatScheduler so production can
-// coalesce many runtimes' bumps into one bulk UPDATE per tick. See
-// heartbeat_scheduler.go for the two implementations.
-func (h *Handler) recordHeartbeat(ctx context.Context, rt db.AgentRuntime) error {
-	return h.recordHeartbeatState(ctx, rt.ID, uuidToString(rt.ID), heartbeatLivenessState{
-		Status:          rt.Status,
-		LastSeenAt:      rt.LastSeenAt.Time,
-		LastSeenAtValid: rt.LastSeenAt.Valid,
-		WorkspaceID:     rt.WorkspaceID,
-	}, nil)
-}
-
-func (h *Handler) recordHeartbeatLease(ctx context.Context, runtimeID string, lease *daemonws.RuntimeLease) error {
-	runtimeUUID, err := util.ParseUUID(runtimeID)
-	if err != nil {
-		return fmt.Errorf("invalid runtime_id: %w", err)
-	}
-	state := lease.Snapshot()
-	// Lenient parse: the workspace ID only feeds the recovery refresh payload.
-	// An invalid value suppresses the event instead of failing the heartbeat.
-	wsUUID, _ := util.ParseUUID(state.WorkspaceID)
-	return h.recordHeartbeatState(ctx, runtimeUUID, runtimeID, heartbeatLivenessState{
-		Status:          state.Status,
-		LastSeenAt:      state.LastSeenAt,
-		LastSeenAtValid: state.LastSeenAtValid,
-		WorkspaceID:     wsUUID,
-	}, lease.MarkDBWriteScheduled)
-}
-
 type heartbeatLivenessState struct {
 	Status          string
 	LastSeenAt      time.Time
