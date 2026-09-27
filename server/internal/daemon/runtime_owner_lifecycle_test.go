@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -278,6 +279,7 @@ func TestRuntimeOwnership_StaleStandbyTargetsAreForgotten(t *testing.T) {
 	if err := d.syncWorkspacesFromAPI(context.Background(), false); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
+	runtime.KeepAlive(peer)
 	if !d.workspaceHasStandbyRuntime("ws-1") {
 		t.Fatal("precondition: the sibling-owned profile was not recorded as standby")
 	}
