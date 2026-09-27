@@ -1334,7 +1334,7 @@ func (h *Handler) heartbeatForOwner(ctx context.Context, runtimeUUID pgtype.UUID
 		return nil, metrics, err
 	}
 	if ownerKey != "" {
-		ctx = withPendingOwner(ctx, &h.runtimeOwnerGate, ownerKey, generation)
+		ctx = withPendingOwner(ctx, h.runtimeOwnerGate, ownerKey, generation)
 	}
 	ack, metrics, err := h.processHeartbeat(ctx, runtimeID, supportsBatchImport)
 	if err != nil {

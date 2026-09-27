@@ -236,7 +236,7 @@ type Handler struct {
 	// (MUL-6243)
 	IssueStatusCatalog issuestatus.Querier
 	LivenessStore      LivenessStore
-	runtimeOwnerGate   localRuntimeOwnerGate
+	runtimeOwnerGate   *localRuntimeOwnerGate
 	HeartbeatScheduler HeartbeatScheduler
 	Storage            storage.Storage
 	CFSigner           *auth.CloudFrontSigner
@@ -503,6 +503,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		LocalSkillListStore:          NewInMemoryLocalSkillListStore(),
 		LocalSkillImportStore:        NewInMemoryLocalSkillImportStore(),
 		LivenessStore:                NewNoopLivenessStore(),
+		runtimeOwnerGate:             &localRuntimeOwnerGate{},
 		HeartbeatScheduler:           NewPassthroughHeartbeatScheduler(queries),
 		Storage:                      store,
 		CFSigner:                     cfSigner,
