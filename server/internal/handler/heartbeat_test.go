@@ -71,7 +71,7 @@ type recordingHeartbeatScheduler struct {
 	err error
 }
 
-func (s *recordingHeartbeatScheduler) Schedule(_ context.Context, id, _ pgtype.UUID) error {
+func (s *recordingHeartbeatScheduler) Schedule(_ context.Context, id, _ pgtype.UUID, _ ...string) error {
 	s.ids = append(s.ids, id)
 	return s.err
 }

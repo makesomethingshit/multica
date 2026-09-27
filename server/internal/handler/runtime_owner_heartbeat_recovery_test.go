@@ -42,6 +42,36 @@ type delayedRuntimeTx struct {
 	release chan struct{}
 }
 
+type delayedHeartbeatDBTX struct {
+	db.DBTX
+	started chan struct{}
+	release chan struct{}
+}
+
+type gatedHeartbeatUpdateStore struct {
+	UpdateStore
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *gatedHeartbeatUpdateStore) HasPending(ctx context.Context, runtimeID string) (bool, error) {
+	close(s.entered)
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	return s.UpdateStore.HasPending(ctx, runtimeID)
+}
+
+func (d delayedHeartbeatDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: GetAgentRuntimeHeartbeatState :one") {
+		close(d.started)
+		<-d.release
+	}
+	return d.DBTX.QueryRow(ctx, sql, args...)
+}
+
 func (tx delayedRuntimeTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	if tx.query == "LockAgentRuntime" && strings.Contains(sql, "-- name: LockAgentRuntime :one") {
 		close(tx.started)
@@ -224,6 +254,7 @@ func TestHeartbeatRejectsStaleHTTPAndWebSocketOwners(t *testing.T) {
 	store := &fakeLivenessStore{available: true, aliveOK: true}
 	h := New(db.New(testPool), testPool, testHandler.Hub, testHandler.Bus, testHandler.EmailService, nil, nil, analytics.NoopClient{}, Config{})
 	h.LivenessStore = store
+	h.runtimeOwnerGate = testHandler.runtimeOwnerGate
 	updates := NewInMemoryUpdateStore()
 	h.UpdateStore = updates
 	pending, err := updates.Create(context.Background(), runtimeID, "1.2.3", testUserID)
@@ -237,9 +268,10 @@ func TestHeartbeatRejectsStaleHTTPAndWebSocketOwners(t *testing.T) {
 	if !ok || identity.RuntimeLeases[runtimeID] == nil {
 		t.Fatal("owner A WebSocket lease was rejected")
 	}
-	gate := delayedRuntimeTxStarter{query: "LockAgentRuntime", started: make(chan struct{}), release: make(chan struct{})}
-	staleHandler := New(db.New(testPool), gate, testHandler.Hub, testHandler.Bus, testHandler.EmailService, nil, nil, analytics.NoopClient{}, Config{})
+	gate := delayedHeartbeatDBTX{DBTX: testPool, started: make(chan struct{}), release: make(chan struct{})}
+	staleHandler := New(db.New(gate), testPool, testHandler.Hub, testHandler.Bus, testHandler.EmailService, nil, nil, analytics.NoopClient{}, Config{})
 	staleHandler.LivenessStore = store
+	staleHandler.runtimeOwnerGate = testHandler.runtimeOwnerGate
 	staleHandler.UpdateStore = updates
 	staleHTTP := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -252,7 +284,7 @@ func TestHeartbeatRejectsStaleHTTPAndWebSocketOwners(t *testing.T) {
 	select {
 	case <-gate.started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("old HTTP heartbeat did not reach runtime lock")
+		t.Fatal("old HTTP heartbeat did not reach owner check")
 	}
 	registerFenceOwner(t, runtimeID, daemonID, fenceOwnerB, "offline")
 	close(gate.release)
@@ -321,5 +353,64 @@ func TestHeartbeatRejectsStaleHTTPAndWebSocketOwners(t *testing.T) {
 	}
 	if _, ok := h.buildDaemonWebSocketIdentity(httptest.NewRecorder(), wsReq, []string{runtimeID}, ""); !ok {
 		t.Fatal("legacy WebSocket lease was rejected")
+	}
+}
+
+func TestHeartbeatPendingStoreDoesNotHoldRuntimeRow(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	runtimeID, _, daemonID := runtimeFenceFixture(t)
+	registerFenceOwner(t, runtimeID, daemonID, fenceOwnerA, "online")
+	h := New(db.New(testPool), testPool, testHandler.Hub, testHandler.Bus, testHandler.EmailService, nil, nil, analytics.NoopClient{}, Config{})
+	h.runtimeOwnerGate = testHandler.runtimeOwnerGate
+	store := &gatedHeartbeatUpdateStore{UpdateStore: h.UpdateStore, entered: make(chan struct{}), release: make(chan struct{})}
+	h.UpdateStore = store
+	pending, err := store.Create(context.Background(), runtimeID, "v2", testUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		h.DaemonHeartbeat(w, newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]string{
+			"runtime_id": runtimeID, "owner_generation": fenceOwnerA,
+		}, testWorkspaceID, daemonID))
+		finished <- w
+	}()
+	select {
+	case <-store.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat did not enter pending store")
+	}
+	defer func() {
+		select {
+		case <-store.release:
+		default:
+			close(store.release)
+		}
+	}()
+	if _, err := testPool.Exec(context.Background(), `SELECT id FROM agent_runtime WHERE id = $1 FOR UPDATE NOWAIT`, runtimeID); err != nil {
+		t.Fatalf("pending store held runtime row lock: %v", err)
+	}
+	takeover := httptest.NewRecorder()
+	h.DaemonRegister(takeover, newDaemonTokenRequest(http.MethodPost, "/api/daemon/register", map[string]any{
+		"workspace_id": testWorkspaceID, "daemon_id": daemonID,
+		"runtimes": []map[string]any{{"name": "codex", "type": "codex", "status": "online", "owner_generation": fenceOwnerB}},
+	}, testWorkspaceID, daemonID))
+	if takeover.Code != http.StatusOK {
+		t.Fatalf("takeover while pending blocked = %d: %s", takeover.Code, takeover.Body.String())
+	}
+	close(store.release)
+	select {
+	case w := <-finished:
+		if w.Code != http.StatusConflict {
+			t.Fatalf("stale heartbeat = %d: %s", w.Code, w.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat did not finish")
+	}
+	if got, err := store.Get(context.Background(), pending.ID); err != nil || got.Status != UpdatePending {
+		t.Fatalf("stale heartbeat claimed pending work: %+v, %v", got, err)
 	}
 }

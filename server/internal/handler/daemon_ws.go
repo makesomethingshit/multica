@@ -101,6 +101,7 @@ func (h *Handler) buildDaemonWebSocketIdentity(w http.ResponseWriter, r *http.Re
 			rt.LastSeenAt.Time,
 			rt.LastSeenAt.Valid,
 			generations[runtimeID],
+			runtimeOwnerGateKey(workspaceID, rt.DaemonID.String, rt.Provider, uuidToString(rt.ProfileID)),
 		)
 	}
 

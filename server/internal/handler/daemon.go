@@ -506,6 +506,10 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			if !pok {
 				return
 			}
+			if err := h.advanceRuntimeOwner(r.Context(), runtimeOwnerGateKey(req.WorkspaceID, req.DaemonID, "", uuidToString(profileUUID)), runtime.OwnerGeneration); err != nil {
+				writeRuntimeOwnerAdvanceError(w, err)
+				return
+			}
 			// The profile must exist in this workspace and be enabled. Trust
 			// the profile's stored runtime identity over the daemon-sent type so
 			// the provider used for task routing cannot drift from the profile.
@@ -575,6 +579,10 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				ProfileID:      prow.ProfileID,
 			}
 		} else {
+			if err := h.advanceRuntimeOwner(r.Context(), runtimeOwnerGateKey(req.WorkspaceID, req.DaemonID, provider, ""), runtime.OwnerGeneration); err != nil {
+				writeRuntimeOwnerAdvanceError(w, err)
+				return
+			}
 			row, err := h.Queries.UpsertAgentRuntime(r.Context(), db.UpsertAgentRuntimeParams{
 				WorkspaceID: wsUUID,
 				DaemonID:    strToText(req.DaemonID),
@@ -680,6 +688,10 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 		}
 		profileUUID, pok := parseUUIDOrBadRequest(w, profileID, "profile_id")
 		if !pok {
+			return
+		}
+		if err := h.advanceRuntimeOwner(r.Context(), runtimeOwnerGateKey(req.WorkspaceID, req.DaemonID, "", uuidToString(profileUUID)), failed.OwnerGeneration); err != nil {
+			writeRuntimeOwnerAdvanceError(w, err)
 			return
 		}
 		reason := strings.TrimSpace(failed.Reason)
@@ -1206,7 +1218,7 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	authMs = time.Since(start).Milliseconds()
 
 	updateStart := time.Now()
-	ack, m, err := h.heartbeatForOwner(r.Context(), runtimeUUID, runtimeID, req.OwnerGeneration, req.SupportsBatchImport, nil)
+	ack, m, err := h.heartbeatForOwner(r.Context(), runtimeUUID, runtimeID, runtimeOwnerGateKey(uuidToString(rt.WorkspaceID), rt.DaemonID.String, rt.Provider, uuidToString(rt.ProfileID)), req.OwnerGeneration, req.SupportsBatchImport, nil)
 	if errors.Is(err, service.ErrStaleRuntimeOwner) {
 		outcome = "stale_owner"
 		writeError(w, http.StatusConflict, err.Error())
@@ -1274,7 +1286,8 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 	if err != nil {
 		return nil, err
 	}
-	ack, _, err := h.heartbeatForOwner(ctx, runtimeUUID, runtimeID, lease.Snapshot().OwnerGeneration, supportsBatchImport, lease)
+	state := lease.Snapshot()
+	ack, _, err := h.heartbeatForOwner(ctx, runtimeUUID, runtimeID, state.OwnerGateKey, state.OwnerGeneration, supportsBatchImport, lease)
 	if errors.Is(err, service.ErrStaleRuntimeOwner) {
 		return runtimeGoneHeartbeatAck(runtimeID), nil
 	}
@@ -1291,55 +1304,41 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 	return ack, nil
 }
 
-// heartbeatForOwner holds the runtime row through liveness and pending-work
-// processing. Register cannot install a new generation between validation and
-// a Redis touch, DB transition, or pending claim.
-func (h *Handler) heartbeatForOwner(ctx context.Context, runtimeUUID pgtype.UUID, runtimeID, generation string, supportsBatchImport bool, lease *daemonws.RuntimeLease) (*protocol.DaemonHeartbeatAckPayload, heartbeatMetrics, error) {
+// Register advances the pending/liveness gate before its DB write. A heartbeat
+// reads the current owner without locking the runtime through shared-store I/O;
+// its DB writes and Redis claims independently compare the same generation.
+func (h *Handler) heartbeatForOwner(ctx context.Context, runtimeUUID pgtype.UUID, runtimeID, ownerKey, generation string, supportsBatchImport bool, lease *daemonws.RuntimeLease) (*protocol.DaemonHeartbeatAckPayload, heartbeatMetrics, error) {
 	var metrics heartbeatMetrics
-	tx, err := h.TxStarter.Begin(ctx)
+	runtime, err := h.Queries.GetAgentRuntimeHeartbeatState(ctx, runtimeUUID)
 	if err != nil {
 		return nil, metrics, err
 	}
-	defer tx.Rollback(ctx)
-	qtx := h.Queries.WithTx(tx)
-	runtime, err := qtx.LockAgentRuntime(ctx, runtimeUUID)
-	if err != nil {
-		return nil, metrics, err
-	}
-	if !service.RuntimeOwnerMatches(runtime.Metadata, generation) {
+	if !service.RuntimeOwnerGenerationMatches(runtime.OwnerGeneration, generation) {
 		return nil, metrics, service.ErrStaleRuntimeOwner
 	}
-
-	now := time.Now()
-	needDBWrite := !h.LivenessStore.Available() || runtime.Status != "online" ||
-		!runtime.LastSeenAt.Valid || now.Sub(runtime.LastSeenAt.Time) >= runtimeHeartbeatDBFlushInterval
-	if h.LivenessStore.Available() {
-		if err := h.LivenessStore.Touch(ctx, runtimeID, runtimeLivenessTTL); err != nil {
-			slog.Warn("liveness touch failed; falling back to DB heartbeat", "runtime_id", runtimeID, "error", err)
-			needDBWrite = true
+	if !strings.HasPrefix(runtime.OwnerGeneration, "g") {
+		ownerKey, generation = "", ""
+	}
+	if _, redisStore := h.LivenessStore.(*RedisLivenessStore); !redisStore {
+		if ownerKey != "" && !h.runtimeOwnerGate.current(ownerKey, generation) {
+			return nil, metrics, service.ErrStaleRuntimeOwner
 		}
 	}
-	if needDBWrite {
-		if runtime.Status != "online" || !runtime.LastSeenAt.Valid {
-			if _, err := qtx.MarkAgentRuntimeOnline(ctx, runtimeUUID); err != nil {
-				return nil, metrics, err
-			}
-		} else if _, err := qtx.TouchAgentRuntimeLastSeen(ctx, runtimeUUID); err != nil {
-			return nil, metrics, err
-		}
+	state := heartbeatLivenessState{Status: runtime.Status, LastSeenAt: runtime.LastSeenAt.Time,
+		LastSeenAtValid: runtime.LastSeenAt.Valid, WorkspaceID: runtime.WorkspaceID}
+	var mark func(time.Time)
+	if lease != nil {
+		mark = lease.MarkDBWriteScheduled
+	}
+	if err := h.recordHeartbeatState(ctx, runtimeUUID, runtimeID, state, mark, ownerKey, generation); err != nil {
+		return nil, metrics, err
+	}
+	if ownerKey != "" {
+		ctx = withPendingOwner(ctx, &h.runtimeOwnerGate, ownerKey, generation)
 	}
 	ack, metrics, err := h.processHeartbeat(ctx, runtimeID, supportsBatchImport)
 	if err != nil {
 		return nil, metrics, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, metrics, err
-	}
-	if needDBWrite && lease != nil {
-		lease.MarkDBWriteScheduled(now)
-	}
-	if runtime.Status != "online" {
-		h.PublishRuntimeRefresh(uuidToString(runtime.WorkspaceID), "system", "", "heartbeat_recovery")
 	}
 	return ack, metrics, nil
 }
@@ -1406,8 +1405,13 @@ func (h *Handler) recordHeartbeatState(
 	runtimeID string,
 	state heartbeatLivenessState,
 	markDBWriteScheduled func(time.Time),
+	owner ...string,
 ) error {
 	now := time.Now()
+	ownerKey, generation := "", ""
+	if len(owner) == 2 {
+		ownerKey, generation = owner[0], owner[1]
+	}
 
 	// Decide whether the DB row needs a write *before* touching Redis, so a
 	// Touch failure can simply force needDBWrite=true without re-evaluating
@@ -1418,7 +1422,21 @@ func (h *Handler) recordHeartbeatState(
 		now.Sub(state.LastSeenAt) >= runtimeHeartbeatDBFlushInterval
 
 	if h.LivenessStore.Available() {
-		if err := h.LivenessStore.Touch(ctx, runtimeID, runtimeLivenessTTL); err != nil {
+		var touchErr error
+		if ownerKey != "" {
+			touchErr = h.touchRuntimeOwner(ctx, runtimeID, ownerKey, generation)
+		} else {
+			touchErr = h.LivenessStore.Touch(ctx, runtimeID, runtimeLivenessTTL)
+		}
+		if errors.Is(touchErr, service.ErrStaleRuntimeOwner) {
+			return touchErr
+		}
+		if touchErr != nil && ownerKey != "" {
+			if _, redisStore := h.LivenessStore.(*RedisLivenessStore); redisStore {
+				return touchErr
+			}
+		}
+		if err := touchErr; err != nil {
 			// Redis hiccup: degrade transparently to the DB-only path for
 			// this beat. The sweeper falls back to its DB threshold the
 			// same way when IsAliveBatch fails, so end-to-end correctness
@@ -1442,7 +1460,7 @@ func (h *Handler) recordHeartbeatState(
 		// refresh; a beat that lost the race (or a never-seen row already
 		// online) stays silent and keeps the unconditional update below so
 		// last_seen_at is bumped and pgx.ErrNoRows is preserved for deletions.
-		flipped, err := h.Queries.MarkAgentRuntimeOnlineIfOffline(ctx, runtimeUUID)
+		flipped, err := h.Queries.MarkAgentRuntimeOnlineIfOfflineAndOwner(ctx, db.MarkAgentRuntimeOnlineIfOfflineAndOwnerParams{ID: runtimeUUID, OwnerGeneration: generation})
 		if err != nil {
 			return err
 		}
@@ -1452,7 +1470,7 @@ func (h *Handler) recordHeartbeatState(
 			if state.WorkspaceID.Valid {
 				h.PublishRuntimeRefresh(uuidToString(state.WorkspaceID), "system", "", "heartbeat_recovery")
 			}
-		} else if _, err := h.Queries.MarkAgentRuntimeOnline(ctx, runtimeUUID); err != nil {
+		} else if _, err := h.Queries.MarkAgentRuntimeOnlineIfOwner(ctx, db.MarkAgentRuntimeOnlineIfOwnerParams{ID: runtimeUUID, OwnerGeneration: generation}); err != nil {
 			return err
 		}
 		if markDBWriteScheduled != nil {
@@ -1460,7 +1478,7 @@ func (h *Handler) recordHeartbeatState(
 		}
 		return nil
 	}
-	if err := h.HeartbeatScheduler.Schedule(ctx, runtimeUUID, state.WorkspaceID); err != nil {
+	if err := h.HeartbeatScheduler.Schedule(ctx, runtimeUUID, state.WorkspaceID, generation); err != nil {
 		return err
 	}
 	if markDBWriteScheduled != nil {
@@ -1497,6 +1515,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, runtimeID string, suppor
 	switch {
 	case probeUpdateErr == nil && hasUpdate:
 		pending, popUpdateErr := h.UpdateStore.PopPending(ctx, runtimeID)
+		if errors.Is(popUpdateErr, service.ErrStaleRuntimeOwner) {
+			return nil, m, popUpdateErr
+		}
 		if popUpdateErr != nil {
 			slog.Warn("update PopPending failed", "error", popUpdateErr, "runtime_id", runtimeID)
 		} else if pending != nil {
@@ -1526,6 +1547,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, runtimeID string, suppor
 	case probeModelErr == nil && hasModel:
 		popStart := time.Now()
 		pendingModel, popErr := h.ModelListStore.PopPending(ctx, runtimeID)
+		if errors.Is(popErr, service.ErrStaleRuntimeOwner) {
+			return nil, m, popErr
+		}
 		m.PopModelMs = time.Since(popStart).Milliseconds()
 		if popErr != nil {
 			slog.Warn("model list PopPending failed", "error", popErr, "runtime_id", runtimeID)
@@ -1554,6 +1578,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, runtimeID string, suppor
 	case probeErr == nil && hasSkills:
 		popStart := time.Now()
 		pendingSkills, popErr := h.LocalSkillListStore.PopPending(ctx, runtimeID)
+		if errors.Is(popErr, service.ErrStaleRuntimeOwner) {
+			return nil, m, popErr
+		}
 		m.PopSkillsMs = time.Since(popStart).Milliseconds()
 		if popErr != nil {
 			slog.Warn("local skill list PopPending failed", "error", popErr, "runtime_id", runtimeID)
@@ -1579,6 +1606,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, runtimeID string, suppor
 		popStart := time.Now()
 		if supportsBatchImport {
 			pendingImports, popErr := h.LocalSkillImportStore.PopPendingBatch(ctx, runtimeID, maxLocalSkillImportBatch)
+			if errors.Is(popErr, service.ErrStaleRuntimeOwner) && len(pendingImports) == 0 {
+				return nil, m, popErr
+			}
 			m.PopImportMs = time.Since(popStart).Milliseconds()
 			if popErr != nil {
 				slog.Warn("local skill import PopPendingBatch failed", "error", popErr, "runtime_id", runtimeID, "claimed", len(pendingImports))
@@ -1605,6 +1635,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, runtimeID string, suppor
 			}
 		} else {
 			pendingImport, popErr := h.LocalSkillImportStore.PopPending(ctx, runtimeID)
+			if errors.Is(popErr, service.ErrStaleRuntimeOwner) {
+				return nil, m, popErr
+			}
 			m.PopImportMs = time.Since(popStart).Milliseconds()
 			if popErr != nil {
 				slog.Warn("local skill import PopPending failed", "error", popErr, "runtime_id", runtimeID)

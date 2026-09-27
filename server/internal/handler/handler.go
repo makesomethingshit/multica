@@ -236,6 +236,7 @@ type Handler struct {
 	// (MUL-6243)
 	IssueStatusCatalog issuestatus.Querier
 	LivenessStore      LivenessStore
+	runtimeOwnerGate   localRuntimeOwnerGate
 	HeartbeatScheduler HeartbeatScheduler
 	Storage            storage.Storage
 	CFSigner           *auth.CloudFrontSigner

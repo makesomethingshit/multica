@@ -49,6 +49,7 @@ type RuntimeLease struct {
 
 	workspaceID     string
 	ownerGeneration string
+	ownerGateKey    string
 	status          string
 	lastSeenAt      time.Time
 	lastSeenAtValid bool
@@ -58,6 +59,7 @@ type RuntimeLease struct {
 type RuntimeLeaseState struct {
 	WorkspaceID     string
 	OwnerGeneration string
+	OwnerGateKey    string
 	Status          string
 	LastSeenAt      time.Time
 	LastSeenAtValid bool
@@ -65,12 +67,17 @@ type RuntimeLeaseState struct {
 
 func NewRuntimeLease(workspaceID, status string, lastSeenAt time.Time, lastSeenAtValid bool, ownerGeneration ...string) *RuntimeLease {
 	generation := ""
+	gateKey := ""
 	if len(ownerGeneration) > 0 {
 		generation = ownerGeneration[0]
+	}
+	if len(ownerGeneration) > 1 {
+		gateKey = ownerGeneration[1]
 	}
 	return &RuntimeLease{
 		workspaceID:     workspaceID,
 		ownerGeneration: generation,
+		ownerGateKey:    gateKey,
 		status:          status,
 		lastSeenAt:      lastSeenAt,
 		lastSeenAtValid: lastSeenAtValid,
@@ -86,6 +93,7 @@ func (l *RuntimeLease) Snapshot() RuntimeLeaseState {
 	return RuntimeLeaseState{
 		WorkspaceID:     l.workspaceID,
 		OwnerGeneration: l.ownerGeneration,
+		OwnerGateKey:    l.ownerGateKey,
 		Status:          l.status,
 		LastSeenAt:      l.lastSeenAt,
 		LastSeenAtValid: l.lastSeenAtValid,

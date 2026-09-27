@@ -35,10 +35,15 @@ WHERE id = ANY(@ids::uuid[]);
 -- WebSocket authenticates its whole runtime set in one round trip and then
 -- keeps these ownership fields plus liveness state in its connection lease;
 -- each heartbeat checks the captured generation against the current row.
-SELECT id, workspace_id, daemon_id, status, last_seen_at,
+SELECT id, workspace_id, daemon_id, provider, profile_id, status, last_seen_at,
        COALESCE(metadata->>'owner_generation', '')::text AS owner_generation
 FROM agent_runtime
 WHERE id = ANY(@ids::uuid[]);
+
+-- name: GetAgentRuntimeHeartbeatState :one
+SELECT status, last_seen_at, workspace_id,
+       COALESCE(metadata->>'owner_generation', '')::text AS owner_generation
+FROM agent_runtime WHERE id = $1;
 
 -- name: LockAgentRuntime :one
 -- Acquires a row-level exclusive lock on the runtime row. Used at the
@@ -201,6 +206,12 @@ UPDATE agent_runtime
 SET last_seen_at = now()
 WHERE id = $1 AND status = 'online';
 
+-- name: TouchAgentRuntimeLastSeenIfOwner :execrows
+UPDATE agent_runtime SET last_seen_at = now()
+WHERE id = @id AND status = 'online'
+  AND (COALESCE(metadata->>'owner_generation', '') NOT LIKE 'g%'
+       OR metadata->>'owner_generation' = @owner_generation::text);
+
 -- name: TouchAgentRuntimesLastSeenBatch :many
 -- Bulk variant of TouchAgentRuntimeLastSeen used by the BatchedHeartbeatScheduler:
 -- coalesces N per-runtime "bump last_seen_at" requests into a single UPDATE so a
@@ -215,6 +226,14 @@ UPDATE agent_runtime
 SET last_seen_at = now()
 WHERE id = ANY(@ids::uuid[]) AND status = 'online'
 RETURNING id;
+
+-- name: TouchAgentRuntimesLastSeenBatchIfOwner :many
+UPDATE agent_runtime AS runtime SET last_seen_at = now()
+FROM jsonb_each_text(@receipts::jsonb) AS receipt(id, generation)
+WHERE runtime.id = receipt.id::uuid AND runtime.status = 'online'
+  AND (COALESCE(runtime.metadata->>'owner_generation', '') NOT LIKE 'g%'
+       OR runtime.metadata->>'owner_generation' = receipt.generation)
+RETURNING runtime.id;
 
 -- name: MarkAgentRuntimeOnline :one
 -- Used on the offline→online transition (and on first heartbeat after
@@ -233,6 +252,19 @@ RETURNING *;
 UPDATE agent_runtime
 SET status = 'online', last_seen_at = now(), updated_at = now()
 WHERE id = $1 AND status <> 'online';
+
+-- name: MarkAgentRuntimeOnlineIfOwner :one
+UPDATE agent_runtime SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = @id
+  AND (COALESCE(metadata->>'owner_generation', '') NOT LIKE 'g%'
+       OR metadata->>'owner_generation' = @owner_generation::text)
+RETURNING *;
+
+-- name: MarkAgentRuntimeOnlineIfOfflineAndOwner :execrows
+UPDATE agent_runtime SET status = 'online', last_seen_at = now(), updated_at = now()
+WHERE id = @id AND status <> 'online'
+  AND (COALESCE(metadata->>'owner_generation', '') NOT LIKE 'g%'
+       OR metadata->>'owner_generation' = @owner_generation::text);
 
 -- name: SetAgentRuntimeOffline :exec
 UPDATE agent_runtime
@@ -271,7 +303,8 @@ WHERE id = $1;
 -- sweeper uses this as a candidate set, then optionally filters via the
 -- LivenessStore before flipping rows to offline (a fresh Redis liveness
 -- record means the DB row is just lagging, not actually dead).
-SELECT id, workspace_id, owner_id, daemon_id, provider FROM agent_runtime
+SELECT id, workspace_id, owner_id, daemon_id, provider,
+       COALESCE(metadata->>'owner_generation', '')::text AS owner_generation FROM agent_runtime
 WHERE status = 'online'
   AND last_seen_at < now() - make_interval(secs => @stale_seconds::double precision);
 

@@ -5952,7 +5952,11 @@ func RuntimeOwnerMatches(metadata []byte, generation string) bool {
 	if err := json.Unmarshal(metadata, &owner); err != nil {
 		return false
 	}
-	return !strings.HasPrefix(owner.OwnerGeneration, "g") || owner.OwnerGeneration == generation
+	return RuntimeOwnerGenerationMatches(owner.OwnerGeneration, generation)
+}
+
+func RuntimeOwnerGenerationMatches(current, generation string) bool {
+	return !strings.HasPrefix(current, "g") || current == generation
 }
 
 // RecoverOrphanedTasksForRuntime holds the runtime row through task failure and
