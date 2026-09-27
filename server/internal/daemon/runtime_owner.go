@@ -272,18 +272,18 @@ func (d *Daemon) ownerGenerations(runtimeIDs []string, targets map[string]string
 // Exactly one caller per generation gets true. That is what keeps a periodic
 // re-register, a profile refresh or a version refresh from re-running recovery
 // against tasks the owner is still executing.
-func (d *Daemon) markOwnershipRecovered(target string) bool {
+func (d *Daemon) markOwnershipRecovered(target string) (string, bool) {
 	d.ownerState().mu.Lock()
 	defer d.ownerState().mu.Unlock()
 	claim, ok := d.ownerState().byTarget[target]
 	if !ok || claim.claim == nil {
-		return false
+		return "", false
 	}
 	if claim.recovered {
-		return false
+		return "", false
 	}
 	claim.recovered = true
-	return true
+	return claim.token, true
 }
 
 // releaseRuntimeOwnership drops the claim for target. The server fences any
@@ -412,12 +412,17 @@ func (d *Daemon) filterOwnedRuntimeCandidates(ctx context.Context, workspaceID s
 // itself executing, so the generation gate is the contract, not an optimisation.
 func (d *Daemon) recoverOrphansOncePerOwnership(ctx context.Context, workspaceID string, rt Runtime) {
 	target := runtimeOwnerTargetForRuntime(rt, workspaceID)
-	if !d.markOwnershipRecovered(target) {
+	generation, marked := d.markOwnershipRecovered(target)
+	if !marked {
 		return
 	}
 	d.logger.Info("recovering orphaned tasks for newly owned runtime",
 		"workspace_id", workspaceID, "runtime_id", rt.ID, "provider", rt.Provider)
-	if err := d.client.RecoverOrphans(ctx, rt.ID); err != nil {
+	if err := d.client.RecoverOrphans(ctx, rt.ID, generation); err != nil {
+		if isStaleRuntimeOwnerError(err) {
+			go d.handleRuntimeGone(rt.ID)
+			return
+		}
 		d.logger.Warn("recover-orphans failed", "runtime_id", rt.ID, "error", err)
 	}
 }

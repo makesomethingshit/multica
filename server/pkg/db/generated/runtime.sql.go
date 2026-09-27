@@ -493,23 +493,25 @@ func (q *Queries) GetAgentRuntimeForWorkspace(ctx context.Context, arg GetAgentR
 }
 
 const getAgentRuntimeHeartbeatLeases = `-- name: GetAgentRuntimeHeartbeatLeases :many
-SELECT id, workspace_id, daemon_id, status, last_seen_at
+SELECT id, workspace_id, daemon_id, status, last_seen_at,
+       COALESCE(metadata->>'owner_generation', '')::text AS owner_generation
 FROM agent_runtime
 WHERE id = ANY($1::uuid[])
 `
 
 type GetAgentRuntimeHeartbeatLeasesRow struct {
-	ID          pgtype.UUID        `json:"id"`
-	WorkspaceID pgtype.UUID        `json:"workspace_id"`
-	DaemonID    pgtype.Text        `json:"daemon_id"`
-	Status      string             `json:"status"`
-	LastSeenAt  pgtype.Timestamptz `json:"last_seen_at"`
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	DaemonID        pgtype.Text        `json:"daemon_id"`
+	Status          string             `json:"status"`
+	LastSeenAt      pgtype.Timestamptz `json:"last_seen_at"`
+	OwnerGeneration string             `json:"owner_generation"`
 }
 
 // Narrow connection-time and heartbeat-reconciliation projection. The daemon
 // WebSocket authenticates its whole runtime set in one round trip and then
-// keeps these immutable ownership fields plus liveness state in its connection
-// lease, avoiding a GetAgentRuntime call on every heartbeat.
+// keeps these ownership fields plus liveness state in its connection lease;
+// each heartbeat checks the captured generation against the current row.
 func (q *Queries) GetAgentRuntimeHeartbeatLeases(ctx context.Context, ids []pgtype.UUID) ([]GetAgentRuntimeHeartbeatLeasesRow, error) {
 	rows, err := q.db.Query(ctx, getAgentRuntimeHeartbeatLeases, ids)
 	if err != nil {
@@ -525,6 +527,7 @@ func (q *Queries) GetAgentRuntimeHeartbeatLeases(ctx context.Context, ids []pgty
 			&i.DaemonID,
 			&i.Status,
 			&i.LastSeenAt,
+			&i.OwnerGeneration,
 		); err != nil {
 			return nil, err
 		}

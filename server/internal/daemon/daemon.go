@@ -4869,10 +4869,14 @@ func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) bool {
 		return false
 	}
 	d.logger.Debug("heartbeat: HTTP tick", "runtime_id", rid)
-	resp, err := d.client.SendHeartbeat(ctx, rid)
+	generation := ""
+	if rt := d.findRuntime(rid); rt != nil {
+		generation = rt.OwnerGeneration
+	}
+	resp, err := d.client.SendHeartbeat(ctx, rid, generation)
 	if err != nil {
 		if ctx.Err() == nil {
-			if isRuntimeNotFoundError(err) {
+			if isRuntimeNotFoundError(err) || isStaleRuntimeOwnerError(err) {
 				// Server says this runtime is gone — recover instead of
 				// looping on the dead UUID. handleRuntimeGone coalesces
 				// concurrent callers and runs the recovery HTTP call under
@@ -5014,10 +5018,14 @@ func (d *Daemon) handlePendingWorkHint(runtimeID, kind string) {
 		return
 	}
 	hbCtx, cancel := context.WithTimeout(ctx, pendingWorkHeartbeatTimeout)
-	resp, err := d.client.SendHeartbeat(hbCtx, runtimeID)
+	generation := ""
+	if rt := d.findRuntime(runtimeID); rt != nil {
+		generation = rt.OwnerGeneration
+	}
+	resp, err := d.client.SendHeartbeat(hbCtx, runtimeID, generation)
 	cancel()
 	if err != nil {
-		if isRuntimeNotFoundError(err) {
+		if isRuntimeNotFoundError(err) || isStaleRuntimeOwnerError(err) {
 			go d.handleRuntimeGone(runtimeID)
 			return
 		}

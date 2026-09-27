@@ -48,6 +48,7 @@ type RuntimeLease struct {
 	mu sync.Mutex
 
 	workspaceID     string
+	ownerGeneration string
 	status          string
 	lastSeenAt      time.Time
 	lastSeenAtValid bool
@@ -56,14 +57,20 @@ type RuntimeLease struct {
 // RuntimeLeaseState is an atomic snapshot used by the heartbeat handler.
 type RuntimeLeaseState struct {
 	WorkspaceID     string
+	OwnerGeneration string
 	Status          string
 	LastSeenAt      time.Time
 	LastSeenAtValid bool
 }
 
-func NewRuntimeLease(workspaceID, status string, lastSeenAt time.Time, lastSeenAtValid bool) *RuntimeLease {
+func NewRuntimeLease(workspaceID, status string, lastSeenAt time.Time, lastSeenAtValid bool, ownerGeneration ...string) *RuntimeLease {
+	generation := ""
+	if len(ownerGeneration) > 0 {
+		generation = ownerGeneration[0]
+	}
 	return &RuntimeLease{
 		workspaceID:     workspaceID,
+		ownerGeneration: generation,
 		status:          status,
 		lastSeenAt:      lastSeenAt,
 		lastSeenAtValid: lastSeenAtValid,
@@ -78,6 +85,7 @@ func (l *RuntimeLease) Snapshot() RuntimeLeaseState {
 	defer l.mu.Unlock()
 	return RuntimeLeaseState{
 		WorkspaceID:     l.workspaceID,
+		OwnerGeneration: l.ownerGeneration,
 		Status:          l.status,
 		LastSeenAt:      l.lastSeenAt,
 		LastSeenAtValid: l.lastSeenAtValid,

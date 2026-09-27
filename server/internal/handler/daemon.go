@@ -1071,6 +1071,7 @@ func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 
 type DaemonHeartbeatRequest struct {
 	RuntimeID           string `json:"runtime_id"`
+	OwnerGeneration     string `json:"owner_generation,omitempty"`
 	SupportsBatchImport bool   `json:"supports_batch_import,omitempty"`
 }
 
@@ -1205,15 +1206,24 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	authMs = time.Since(start).Milliseconds()
 
 	updateStart := time.Now()
-	if err := h.recordHeartbeat(r.Context(), rt); err != nil {
+	ack, m, err := h.heartbeatForOwner(r.Context(), runtimeUUID, runtimeID, req.OwnerGeneration, req.SupportsBatchImport, nil)
+	if errors.Is(err, service.ErrStaleRuntimeOwner) {
+		outcome = "stale_owner"
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if isNotFound(err) {
+		outcome = "runtime_not_found"
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+	if err != nil {
 		updateMs = time.Since(updateStart).Milliseconds()
 		outcome = "error_update"
 		writeError(w, http.StatusInternalServerError, "heartbeat failed")
 		return
 	}
 	updateMs = time.Since(updateStart).Milliseconds()
-
-	ack, m, err := h.processHeartbeat(r.Context(), runtimeID, req.SupportsBatchImport)
 	probeModelMs = m.ProbeModelMs
 	popModelMs = m.PopModelMs
 	probeSkillsMs = m.ProbeSkillsMs
@@ -1223,12 +1233,6 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	probeModelTimedOut = m.ProbeModelTimedOut
 	probeSkillsTimedOut = m.ProbeSkillsTimedOut
 	probeImportTimedOut = m.ProbeImportTimedOut
-	if err != nil {
-		outcome = "error_update"
-		writeError(w, http.StatusInternalServerError, "heartbeat failed")
-		return
-	}
-
 	outcome = "ok"
 	// Preserve the existing HTTP response shape: the runtime_id field is new
 	// in the WS path and would be redundant noise on the HTTP path where the
@@ -1253,10 +1257,9 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleDaemonWSHeartbeat is the daemonws.HeartbeatHandler entry point. The
-// WebSocket upgrade already batch-authenticated the fixed runtime set and
-// captured each runtime's liveness state in a connection lease, so the hot
-// path never reads agent_runtime. HTTP heartbeat remains the stateless lookup
-// fallback for a daemon that stops receiving WebSocket acknowledgements.
+// WebSocket upgrade batch-authenticated the fixed runtime set and captured its
+// owner generations. Each heartbeat locks the current row before touching
+// liveness or pending work so an old lease cannot revive a replacement owner.
 func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws.ClientIdentity, runtimeID string, supportsBatchImport bool) (*protocol.DaemonHeartbeatAckPayload, error) {
 	lease := identity.RuntimeLeases[runtimeID]
 	if lease == nil {
@@ -1267,7 +1270,15 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 	if !identity.AllowsWorkspace(lease.Snapshot().WorkspaceID) {
 		return nil, fmt.Errorf("runtime not in connection workspace")
 	}
-	if err := h.recordHeartbeatLease(ctx, runtimeID, lease); err != nil {
+	runtimeUUID, err := util.ParseUUID(runtimeID)
+	if err != nil {
+		return nil, err
+	}
+	ack, _, err := h.heartbeatForOwner(ctx, runtimeUUID, runtimeID, lease.Snapshot().OwnerGeneration, supportsBatchImport, lease)
+	if errors.Is(err, service.ErrStaleRuntimeOwner) {
+		return runtimeGoneHeartbeatAck(runtimeID), nil
+	}
+	if err != nil {
 		if isNotFound(err) {
 			if h.DaemonRuntimeGone != nil {
 				h.NotifyRuntimeGone(runtimeID)
@@ -1277,8 +1288,60 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 		}
 		return nil, err
 	}
-	ack, _, err := h.processHeartbeat(ctx, runtimeID, supportsBatchImport)
-	return ack, err
+	return ack, nil
+}
+
+// heartbeatForOwner holds the runtime row through liveness and pending-work
+// processing. Register cannot install a new generation between validation and
+// a Redis touch, DB transition, or pending claim.
+func (h *Handler) heartbeatForOwner(ctx context.Context, runtimeUUID pgtype.UUID, runtimeID, generation string, supportsBatchImport bool, lease *daemonws.RuntimeLease) (*protocol.DaemonHeartbeatAckPayload, heartbeatMetrics, error) {
+	var metrics heartbeatMetrics
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return nil, metrics, err
+	}
+	defer tx.Rollback(ctx)
+	qtx := h.Queries.WithTx(tx)
+	runtime, err := qtx.LockAgentRuntime(ctx, runtimeUUID)
+	if err != nil {
+		return nil, metrics, err
+	}
+	if !service.RuntimeOwnerMatches(runtime.Metadata, generation) {
+		return nil, metrics, service.ErrStaleRuntimeOwner
+	}
+
+	now := time.Now()
+	needDBWrite := !h.LivenessStore.Available() || runtime.Status != "online" ||
+		!runtime.LastSeenAt.Valid || now.Sub(runtime.LastSeenAt.Time) >= runtimeHeartbeatDBFlushInterval
+	if h.LivenessStore.Available() {
+		if err := h.LivenessStore.Touch(ctx, runtimeID, runtimeLivenessTTL); err != nil {
+			slog.Warn("liveness touch failed; falling back to DB heartbeat", "runtime_id", runtimeID, "error", err)
+			needDBWrite = true
+		}
+	}
+	if needDBWrite {
+		if runtime.Status != "online" || !runtime.LastSeenAt.Valid {
+			if _, err := qtx.MarkAgentRuntimeOnline(ctx, runtimeUUID); err != nil {
+				return nil, metrics, err
+			}
+		} else if _, err := qtx.TouchAgentRuntimeLastSeen(ctx, runtimeUUID); err != nil {
+			return nil, metrics, err
+		}
+	}
+	ack, metrics, err := h.processHeartbeat(ctx, runtimeID, supportsBatchImport)
+	if err != nil {
+		return nil, metrics, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, metrics, err
+	}
+	if needDBWrite && lease != nil {
+		lease.MarkDBWriteScheduled(now)
+	}
+	if runtime.Status != "online" {
+		h.PublishRuntimeRefresh(uuidToString(runtime.WorkspaceID), "system", "", "heartbeat_recovery")
+	}
+	return ack, metrics, nil
 }
 
 func runtimeGoneHeartbeatAck(runtimeID string) *protocol.DaemonHeartbeatAckPayload {

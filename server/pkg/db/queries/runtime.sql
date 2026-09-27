@@ -33,9 +33,10 @@ WHERE id = ANY(@ids::uuid[]);
 -- name: GetAgentRuntimeHeartbeatLeases :many
 -- Narrow connection-time and heartbeat-reconciliation projection. The daemon
 -- WebSocket authenticates its whole runtime set in one round trip and then
--- keeps these immutable ownership fields plus liveness state in its connection
--- lease, avoiding a GetAgentRuntime call on every heartbeat.
-SELECT id, workspace_id, daemon_id, status, last_seen_at
+-- keeps these ownership fields plus liveness state in its connection lease;
+-- each heartbeat checks the captured generation against the current row.
+SELECT id, workspace_id, daemon_id, status, last_seen_at,
+       COALESCE(metadata->>'owner_generation', '')::text AS owner_generation
 FROM agent_runtime
 WHERE id = ANY(@ids::uuid[]);
 
