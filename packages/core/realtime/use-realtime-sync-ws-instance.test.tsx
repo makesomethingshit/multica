@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, type InvalidateQueryFilters } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
@@ -17,7 +17,14 @@ import {
   markWorkspaceDeletePending,
   unmarkWorkspaceDeletePending,
 } from "../workspace/pending-delete";
+import { setApiInstance } from "../api";
+import type { ApiClient } from "../api/client";
+import { forgetLocalSearchIndex } from "../search-index/instance";
 import { useRealtimeSync, type RealtimeSyncStores } from "./use-realtime-sync";
+
+vi.mock("../search-index/instance", () => ({
+  forgetLocalSearchIndex: vi.fn(async () => undefined),
+}));
 
 vi.mock("../platform/workspace-storage", () => ({
   getCurrentWsId: () => "ws-1",
@@ -283,6 +290,11 @@ describe("useRealtimeSync — ws instance change", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: issueStatusKeys.all("ws-1"),
     });
+    const groupRefresh = invalidateSpy.mock.calls.find(([options]: [InvalidateQueryFilters?]) => options?.predicate);
+    expect(groupRefresh?.[0]?.queryKey).toEqual([...issueKeys.tableAll("ws-1"), "groups"]);
+    const predicate = groupRefresh![0]!.predicate!;
+    expect(predicate({ queryKey: ["issues", "ws-1", "table-query", "groups", {}, { kind: "status" }] } as never)).toBe(true);
+    expect(predicate({ queryKey: ["issues", "ws-1", "table-query", "groups", {}, { kind: "assignee" }] } as never)).toBe(false);
     // Deliberately NOT the issue caches. A row stores the status KEY; its name,
     // color and category are resolved from the catalog at render time, so no
     // cached issue field can go stale here. Dragging every board and list along
@@ -427,6 +439,7 @@ describe("useRealtimeSync — workspace:deleted self-initiated suppression", () 
   afterEach(() => {
     unmarkWorkspaceDeletePending("ws-2");
     localStorage.clear();
+    vi.mocked(forgetLocalSearchIndex).mockClear();
   });
 
   // getCurrentWsId is mocked to "ws-1" at module level, so deleting "ws-2"
@@ -455,6 +468,7 @@ describe("useRealtimeSync — workspace:deleted self-initiated suppression", () 
     // useDeleteWorkspace.onSuccess owns cleanup for self-initiated deletes;
     // the handler must not have touched storage.
     expect(defaultStorage.getItem("multica_issue_draft:delete-me")).toBe("draft");
+    expect(forgetLocalSearchIndex).not.toHaveBeenCalled();
   });
 
   it("still cleans up for a delete initiated elsewhere", () => {
@@ -468,5 +482,34 @@ describe("useRealtimeSync — workspace:deleted self-initiated suppression", () 
     dispatchWorkspaceDeleted(ws, "ws-2");
 
     expect(defaultStorage.getItem("multica_issue_draft:delete-me")).toBeNull();
+    // Not the current workspace, but its local search copy must still go.
+    expect(forgetLocalSearchIndex).toHaveBeenCalledWith("ws-2");
+  });
+});
+
+describe("useRealtimeSync — member:removed", () => {
+  afterEach(() => {
+    vi.mocked(forgetLocalSearchIndex).mockClear();
+  });
+
+  const dispatchMemberRemoved = (ws: WSClient, payload: Record<string, string>) => {
+    const call = vi.mocked(ws.on).mock.calls.find(([event]) => event === "member:removed");
+    expect(call).toBeDefined();
+    (call![1] as (p: unknown) => void)(payload);
+  };
+
+  it("destroys the local search copy when this user is removed", async () => {
+    setApiInstance({ listWorkspaces: vi.fn().mockResolvedValue([]) } as unknown as ApiClient);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const ws = createMockWs();
+    renderHook(() => useRealtimeSync(ws, createStores()), { wrapper: createWrapper(qc) });
+
+    dispatchMemberRemoved(ws, { member_id: "m2", user_id: "someone-else", workspace_id: "ws-1" });
+    expect(forgetLocalSearchIndex).not.toHaveBeenCalled();
+
+    dispatchMemberRemoved(ws, { member_id: "m1", user_id: "u1", workspace_id: "ws-1" });
+    expect(forgetLocalSearchIndex).toHaveBeenCalledWith("ws-1");
+    // Let the relocate lookup settle before the test tears down.
+    await waitFor(() => expect(qc.getQueryData(workspaceKeys.list())).toEqual([]));
   });
 });

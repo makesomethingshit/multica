@@ -39,7 +39,12 @@ import { Textarea } from "@multica/ui/components/ui/textarea";
 import { Switch } from "@multica/ui/components/ui/switch";
 import { mcpHooks, PluginHookActivity, PluginMCPApproval, PluginScheduleActivity } from "../../plugins";
 import { useLocale, useT } from "../../i18n";
-import { SettingsCard, SettingsSection, SettingsTab } from "./settings-layout";
+import {
+  SettingsCard,
+  SettingsReadOnlyNotice,
+  SettingsSection,
+  SettingsTab,
+} from "./settings-layout";
 
 /**
  * The scope list is the entire trust model: there is no signature, no
@@ -373,7 +378,7 @@ function PublishAndInstall({ wsId, canManage }: { wsId: string; canManage: boole
   };
 
   return (
-    <SettingsSection title={t(($) => $.plugins.publish.title)} description={t(($) => $.plugins.publish.description)}>
+    <SettingsSection title={t(($) => $.plugins.publish.title)} >
       <SettingsCard>
         <div className="flex flex-col gap-2 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-caption text-muted-foreground">{t(($) => $.plugins.publish.hint)}</p>
@@ -679,14 +684,8 @@ export function PluginsTab() {
   const installations = useMemo(() => data?.plugins ?? [], [data]);
 
   return (
-    <SettingsTab title={t(($) => $.plugins.title)} description={t(($) => $.plugins.description)}>
-      {!canManage ? (
-        <Alert>
-          <AlertCircle />
-          <AlertTitle>{t(($) => $.plugins.read_only)}</AlertTitle>
-          <AlertDescription>{t(($) => $.plugins.read_only_description)}</AlertDescription>
-        </Alert>
-      ) : null}
+    <SettingsTab title={t(($) => $.plugins.title)} scope="workspace">
+      {role && !canManage ? <SettingsReadOnlyNotice wsId={wsId} /> : null}
 
       {canManage ? <PublishAndInstall wsId={wsId} canManage={canManage} /> : null}
 
