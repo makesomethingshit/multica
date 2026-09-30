@@ -26,7 +26,7 @@ export default function IssuesLayout({ children }: { children: ReactNode }) {
           className={routeId ? "contents" : "hidden"}
         >
           <ErrorBoundary resetKeys={[detailId]}>
-            <IssueDetailRoute routeId={detailId} />
+            <IssueDetailRoute routeId={detailId} active={!!routeId} />
           </ErrorBoundary>
         </div>
       )}

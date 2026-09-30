@@ -12,10 +12,10 @@ vi.mock("next/navigation", () => ({
 vi.mock("@multica/views/issues/components", async () => {
   const { useEffect, useState } = await import("react");
   return {
-    IssueDetailRoute: ({ routeId }: { routeId: string }) => {
+    IssueDetailRoute: ({ routeId, active }: { routeId: string; active: boolean }) => {
       const [instance] = useState(() => crypto.randomUUID());
       useEffect(() => unmounted, []);
-      return <div data-testid="detail">{`${routeId}:${instance}`}</div>;
+      return <div data-testid="detail" data-active={active}>{`${routeId}:${instance}`}</div>;
     },
   };
 });
@@ -33,10 +33,12 @@ describe("IssuesLayout", () => {
     view.rerender(<IssuesLayout><div>Issue list</div></IssuesLayout>);
     expect(view.getByText("Issue list")).toBeInTheDocument();
     expect(unmounted).not.toHaveBeenCalled();
+    expect(view.getByTestId("detail")).toHaveAttribute("data-active", "false");
 
     route.id = "MUL-1";
     view.rerender(<IssuesLayout>Issue list</IssuesLayout>);
     expect(view.getByTestId("detail")).toHaveTextContent(`MUL-1:${instance}`);
+    expect(view.getByTestId("detail")).toHaveAttribute("data-active", "true");
     expect(unmounted).not.toHaveBeenCalled();
   });
 });
