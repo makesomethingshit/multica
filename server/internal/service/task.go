@@ -4544,11 +4544,9 @@ func (s *TaskService) CompleteTaskWithTransition(ctx context.Context, taskID pgt
 					"agent_id", util.UUIDToString(existing.AgentID),
 				)
 				return &existing, false, nil
-			case errors.Is(classifyErr, ErrTaskClaimGenerationMismatch):
+			default:
 				return nil, false, classifyErr
 			}
-			// A failed classification lookup leaves the outcome unknown; fall
-			// through to the pre-fence handling so the callback stays retryable.
 		}
 		// When parallel agents race, a task may already be completed,
 		// cancelled, or failed by the time this call runs. The UPDATE
@@ -5204,11 +5202,9 @@ func (s *TaskService) FailTaskWithTransition(ctx context.Context, taskID pgtype.
 					"agent_id", util.UUIDToString(existing.AgentID),
 				)
 				return &existing, false, nil
-			case errors.Is(classifyErr, ErrTaskClaimGenerationMismatch):
+			default:
 				return nil, false, classifyErr
 			}
-			// A failed classification lookup leaves the outcome unknown; fall
-			// through to the pre-fence handling so the callback stays retryable.
 		}
 		if existing, lookupErr := s.Queries.GetAgentTask(ctx, taskID); lookupErr == nil {
 			if errors.Is(err, pgx.ErrNoRows) {
