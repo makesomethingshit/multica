@@ -359,13 +359,9 @@ func (c *Cache) lockRepoForMutation(ctx context.Context, barePath string) (func(
 // acquireRepoMutationClaim takes the scope-level mutation claim, bounded by the
 // caller's deadline when it has one.
 func (c *Cache) acquireRepoMutationClaim(ctx context.Context, barePath string) (*execenv.ScopeClaim, error) {
-	wait := repoMutationClaimWait
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining > 0 && remaining < wait {
-			wait = remaining
-		}
-	}
-	return c.locks.AcquireTargetExclusive(execenv.RepoMutationTarget(barePath), wait)
+	claimCtx, cancel := context.WithTimeout(ctx, repoMutationClaimWait)
+	defer cancel()
+	return c.locks.AcquireTargetExclusiveContext(claimCtx, execenv.RepoMutationTarget(barePath))
 }
 
 // lockForRepo returns the mutex dedicated to the given bare repo path. See

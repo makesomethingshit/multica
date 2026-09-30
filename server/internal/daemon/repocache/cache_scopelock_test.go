@@ -2,6 +2,7 @@ package repocache
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -72,6 +73,54 @@ func holdRepoMutation(t *testing.T, cache *Cache, bare string) (release func()) 
 // shortRepoCtx is the bounded wait a caller advertises as retryable.
 func shortRepoCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 250*time.Millisecond)
+}
+
+func TestScopeLock_CancelledForegroundWaitReleasesLocalLock(t *testing.T) {
+	cacheA, cacheB, _, bare, _ := scopeLockedRepos(t)
+	release := holdRepoMutation(t, cacheB, bare)
+	defer func() { release() }()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	cause := errors.New("task stopped")
+	done := make(chan error, 1)
+	go func() {
+		done <- cacheA.WithRepoLockContext(ctx, bare, func() error {
+			t.Error("cancelled caller entered repository mutation")
+			return nil
+		})
+	}()
+	local := cacheA.lockForRepo(bare)
+	deadline := time.After(5 * time.Second)
+	for {
+		local.mu.Lock()
+		held := local.held
+		local.mu.Unlock()
+		if held {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("caller never reached the scope claim wait")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel(cause)
+	select {
+	case err := <-done:
+		if !errors.Is(err, cause) {
+			t.Fatalf("cancel cause lost: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		release()
+		release = func() {}
+		<-done
+		t.Fatal("scope claim wait ignored cancellation")
+	}
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	if local.held {
+		t.Fatal("cancelled scope claim wait retained the local repo lock")
+	}
 }
 
 // TestScopeLock_EvictionCannotRemoveARepoInUse is case C. Eviction runs inside the
