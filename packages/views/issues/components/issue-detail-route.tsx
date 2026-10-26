@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { useCanonicalIssue } from "@multica/core/issues/canonical-id";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { useNavigation } from "../../navigation";
 import { IssueDetail, IssueDetailSkeleton, IssueNotFound } from "./issue-detail";
+import { IssuePeekHost } from "./issue-peek";
 
 interface IssueDetailRouteProps {
   /**
@@ -58,14 +59,7 @@ export function parseCommentHighlightHash(hash: string): string | undefined {
 }
 
 function useCommentHighlightHash(): { hash: string; commentId?: string } {
-  const read = () => typeof window === "undefined" ? "" : window.location.hash;
-  const [hash, setHash] = useState(read);
-
-  useEffect(() => {
-    const onHashChange = () => setHash(read());
-    window.addEventListener("hashchange", onHashChange);
-    return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
+  const { hash } = useNavigation();
 
   return { hash, commentId: parseCommentHighlightHash(hash) };
 }
@@ -96,12 +90,17 @@ export function IssueDetailRoute({ routeId, active = true, onDelete }: IssueDeta
   // unbounded request loop that never settles. See `CanonicalIssue.notFound`.
   if (notFound || !canonicalId) return <IssueNotFound showBackLink={!onDelete} />;
 
+  // The page hosts a side peek so Shift+Click on an issue mention in the
+  // description or comments opens it floating over the page. Keyed so moving
+  // to another issue closes the peek.
   return (
-    <IssueDetail
-      issueId={canonicalId}
-      active={active}
-      onDelete={onDelete}
-      highlightCommentId={highlight.commentId}
-    />
+    <IssuePeekHost key={canonicalId}>
+      <IssueDetail
+        issueId={canonicalId}
+        active={active}
+        onDelete={onDelete}
+        highlightCommentId={highlight.commentId}
+      />
+    </IssuePeekHost>
   );
 }
