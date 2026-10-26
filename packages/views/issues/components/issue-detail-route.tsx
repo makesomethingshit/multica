@@ -99,6 +99,7 @@ export function IssueDetailRoute({ routeId, active = true, onDelete }: IssueDeta
   return (
     <IssueDetail
       issueId={canonicalId}
+      active={active}
       onDelete={onDelete}
       highlightCommentId={highlight.commentId}
     />

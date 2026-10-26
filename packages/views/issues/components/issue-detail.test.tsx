@@ -1387,6 +1387,28 @@ describe("IssueDetail (shared)", () => {
     });
   });
 
+  it("closes the metadata portal when retained detail becomes inactive", async () => {
+    mockApiObj.getIssue.mockResolvedValue({ ...mockIssue, metadata: { source: "agent" } });
+    const queryClient = createTestQueryClient();
+    const detail = (active: boolean) => (
+      <I18nProvider locale="en" resources={TEST_RESOURCES}>
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail issueId="issue-1" active={active} />
+        </QueryClientProvider>
+      </I18nProvider>
+    );
+    const view = render(detail(true));
+    fireEvent.click(await screen.findByRole("button", { name: /^Metadata\b/ }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+
+    view.rerender(detail(false));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    view.rerender(detail(true));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Metadata\b/ }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+  });
+
   it("hides the Metadata button entirely when the bag is empty", async () => {
     // Default fixture already has metadata: {}, asserted explicitly here.
     renderIssueDetail();

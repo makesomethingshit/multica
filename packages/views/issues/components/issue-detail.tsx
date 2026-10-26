@@ -1135,6 +1135,8 @@ function SubIssueDisplayPopover({
 
 interface IssueDetailProps {
   issueId: string;
+  /** Whether this retained detail currently owns the route. */
+  active?: boolean;
   onDelete?: () => void;
   /** Called after the issue is marked as done via the toolbar button. */
   onDone?: () => void;
@@ -1301,7 +1303,7 @@ export function IssueDetailSkeleton({
 // IssueDetail
 // ---------------------------------------------------------------------------
 
-export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = true, layoutId = "multica_issue_detail_layout", highlightCommentId, highlightRequestToken, leadingAction, variant = "page", trailingActions }: IssueDetailProps) {
+export function IssueDetail({ issueId, active = true, onDelete, onDone, defaultSidebarOpen = true, layoutId = "multica_issue_detail_layout", highlightCommentId, highlightRequestToken, leadingAction, variant = "page", trailingActions }: IssueDetailProps) {
   const isPeek = variant === "peek";
   const { t } = useT("issues");
   const locale = useLocale();
@@ -1363,6 +1365,9 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   const [parentIssueOpen, setParentIssueOpen] = useState(true);
   const [pullRequestsOpen, setPullRequestsOpen] = useState(true);
   const [metadataOpen, setMetadataOpen] = useState(false);
+  useEffect(() => {
+    if (!active) setMetadataOpen(false);
+  }, [active]);
   const githubSettings = useGitHubSettings();
 
   // Per-issue, per-session set of optional properties currently visible in
@@ -2998,7 +3003,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
               · {Object.keys(issue.metadata ?? {}).length}
             </span>
           </button>
-          <Dialog open={metadataOpen} onOpenChange={setMetadataOpen}>
+          <Dialog open={active && metadataOpen} onOpenChange={setMetadataOpen}>
             <DialogContent className="max-w-2xl">
               <DialogHeader>
                 <DialogTitle>{t(($) => $.detail.section_metadata)}</DialogTitle>
