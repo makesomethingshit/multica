@@ -1955,13 +1955,6 @@ SET status = 'completed', completed_at = now(), result = $2,
     retired_session_id = COALESCE($8, retired_session_id),
     prepare_lease_expires_at = NULL
 WHERE id = $1 AND status = 'running'
-  -- Claim-generation fence (#8157 follow-up). The daemon round-trips the
-  -- server-issued dispatched_at of the claim that produced this result, so a
-  -- terminal report from an older claim generation can never settle a later
-  -- reclaim of the same task id. The comparison belongs to THIS UPDATE: a
-  -- dispatched_at read followed by a terminal write would race a reclaim
-  -- landing between the two. A NULL argument keeps the legacy callback
-  -- contract for daemons that do not send the field.
   AND (
     $9::timestamptz IS NULL
     OR dispatched_at = $9::timestamptz
@@ -3380,9 +3373,6 @@ SET status = 'failed',
     retired_session_id = COALESCE($9, retired_session_id),
     prepare_lease_expires_at = NULL
 WHERE id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
-  -- See CompleteAgentTask for the claim-generation fence. The status set is
-  -- wider because a failure can legitimately settle a task the daemon never got
-  -- as far as running.
   AND (
     $10::timestamptz IS NULL
     OR dispatched_at = $10::timestamptz
