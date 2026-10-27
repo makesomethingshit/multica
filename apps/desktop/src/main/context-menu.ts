@@ -12,16 +12,23 @@ import { isSafeExternalHttpUrl, openExternalSafely } from "./external-url";
 // in the renderer has no way to copy it. Mirror Chrome's minimal clipboard
 // menu using `roles`, which keeps i18n + accelerator handling native.
 //
-// Custom (non-role) link items below are NOT auto-localized by Electron —
-// roles like "copy" pull labels from the OS, but a custom MenuItem only
-// shows the `label` you give it. We translate by OS-preferred language so
-// the link items at least track Chinese / Japanese / Korean speakers
+// Custom (non-role) link and image items below are NOT auto-localized by
+// Electron — roles like "copy" pull labels from the OS, but a custom
+// MenuItem only shows the `label` you give it. We translate by OS-preferred
+// language so those items at least track Chinese / Japanese / Korean speakers
 // alongside the English default; everything else falls through to English,
 // which matches Chrome's behavior on those locales without app-level
 // translation files.
 export function installContextMenu(webContents: WebContents): void {
   webContents.on("context-menu", (_event, params) => {
-    const { editFlags, selectionText, isEditable, linkURL } = params;
+    const {
+      editFlags,
+      selectionText,
+      isEditable,
+      linkURL,
+      mediaType,
+      hasImageContents,
+    } = params;
     const hasSelection = selectionText.trim().length > 0;
     // params.linkURL is the resolved absolute URL of the anchor under the
     // cursor; Electron normalizes relative hrefs against the page URL for
@@ -77,7 +84,29 @@ export function installContextMenu(webContents: WebContents): void {
         new MenuItem({
           label: labels.copyLinkAddress,
           click: () => {
-            clipboard.writeText(linkURL);
+            // Electron 44 made clipboard writes async (W3C Clipboard API
+            // alignment); catch so a failed write can't surface as an
+            // unhandled rejection in the main process.
+            clipboard.writeText(linkURL).catch((err: unknown) => {
+              console.warn("[context-menu] copy link address failed", err);
+            });
+          },
+        }),
+      );
+    }
+
+    // Image items — only for an <img> whose pixels have loaded. Copies the
+    // decoded bitmap Chromium already holds, so it works for any format and
+    // any origin (signed CDN URLs, blob: URLs) without refetching.
+    if (mediaType === "image" && hasImageContents) {
+      if (menu.items.length > 0) {
+        menu.append(new MenuItem({ type: "separator" }));
+      }
+      menu.append(
+        new MenuItem({
+          label: labels.copyImage,
+          click: () => {
+            webContents.copyImageAt(params.x, params.y);
           },
         }),
       );
@@ -89,32 +118,42 @@ export function installContextMenu(webContents: WebContents): void {
   });
 }
 
-// Labels for the two link-related menu items in the user's OS-preferred
-// language, with English as the fallback. Kept inline because the main
-// process has no shared i18n loader (the renderer's i18next is per-window
-// and not reachable from here), and pulling one in for two strings would
-// be more rope than payload. Matches the four locales the renderer ships.
+// Labels for the custom menu items in the user's OS-preferred language,
+// with English as the fallback. Kept inline because the main process has
+// no shared i18n loader (the renderer's i18next is per-window and not
+// reachable from here), and pulling one in for three strings would be
+// more rope than payload. Matches the four locales the renderer ships.
 type ContextMenuLabels = {
   openLink: string;
   copyLinkAddress: string;
+  copyImage: string;
 };
 
 const labelsByLocale: Record<string, ContextMenuLabels> = {
   en: {
     openLink: "Open Link in Browser",
     copyLinkAddress: "Copy Link Address",
+    copyImage: "Copy Image",
   },
   "zh-Hans": {
     openLink: "在浏览器中打开链接",
     copyLinkAddress: "复制链接地址",
+    copyImage: "复制图片",
+  },
+  "zh-Hant": {
+    openLink: "在瀏覽器中開啟連結",
+    copyLinkAddress: "複製連結網址",
+    copyImage: "複製圖片",
   },
   ja: {
     openLink: "ブラウザでリンクを開く",
     copyLinkAddress: "リンクのアドレスをコピー",
+    copyImage: "画像をコピー",
   },
   ko: {
     openLink: "브라우저에서 링크 열기",
     copyLinkAddress: "링크 주소 복사",
+    copyImage: "이미지 복사",
   },
 };
 
@@ -127,10 +166,11 @@ const labelsByLocale: Record<string, ContextMenuLabels> = {
 function pickLabels(): ContextMenuLabels {
   const preferred = app.getPreferredSystemLanguages()[0]?.toLowerCase() ?? "";
   if (preferred.startsWith("zh")) {
-    // All Chinese variants get the Simplified copy — Multica only
-    // ships zh-Hans, and zh-Hant users falling through to en would be
-    // worse than reading Simplified Chinese.
-    return labelsByLocale["zh-Hans"];
+    // Traditional-script and Taiwan/Hong Kong/Macau tags get zh-Hant; every
+    // other Chinese variant gets the Simplified copy.
+    return /^zh-(hant|tw|hk|mo)\b/.test(preferred)
+      ? labelsByLocale["zh-Hant"]
+      : labelsByLocale["zh-Hans"];
   }
   if (preferred.startsWith("ja")) return labelsByLocale.ja;
   if (preferred.startsWith("ko")) return labelsByLocale.ko;
