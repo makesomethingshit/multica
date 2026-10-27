@@ -114,6 +114,15 @@ func terminalReportFileName(taskID string) string {
 	return hex.EncodeToString(sum[:]) + ".json"
 }
 
+func laterTerminalReportClaim(report, existing terminalTaskReport) bool {
+	current, err := time.Parse(time.RFC3339Nano, report.claimDispatchedAt)
+	if err != nil {
+		return false
+	}
+	previous, err := time.Parse(time.RFC3339Nano, existing.claimDispatchedAt)
+	return err == nil && current.After(previous)
+}
+
 func terminalReportKindName(kind terminalTaskReportKind) (string, error) {
 	switch kind {
 	case terminalTaskReportComplete:
@@ -231,6 +240,9 @@ func (s *terminalReportStore) enqueue(report terminalTaskReport) error {
 			return fmt.Errorf("existing terminal report %s is invalid: %w", name, decodeErr)
 		}
 		if existingReport != report {
+			if laterTerminalReportClaim(report, existingReport) {
+				return writeTerminalReportRecord(s.dir, name, record)
+			}
 			return fmt.Errorf("terminal report for task %s conflicts with the original pending payload", report.taskID)
 		}
 		return nil
@@ -385,6 +397,14 @@ func (s *terminalReportStore) recoverTempFiles(entries []os.DirEntry) error {
 				continue
 			}
 			existingReport, decodeErr := existing.terminalReport()
+			if decodeErr == nil && laterTerminalReportClaim(report, existingReport) {
+				if err := os.Rename(tempPath, targetPath); err != nil {
+					errs = append(errs, fmt.Errorf("recover newer terminal report %s: %w", name, err))
+					continue
+				}
+				changed = true
+				continue
+			}
 			if decodeErr != nil || existingReport != report {
 				errs = append(errs, fmt.Errorf("interrupted terminal report %s conflicts with existing payload", name))
 				continue
@@ -424,6 +444,21 @@ func (s *terminalReportStore) acknowledge(item pendingTerminalTaskReport) error 
 		return errors.New("terminal report acknowledgement does not match task id")
 	}
 	path := filepath.Join(s.dir, item.fileName)
+	body, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read acknowledged terminal report: %w", err)
+	}
+	record, err := decodePersistedTerminalReport(body)
+	if err != nil {
+		return fmt.Errorf("decode acknowledged terminal report: %w", err)
+	}
+	report, err := record.terminalReport()
+	if err != nil || report != item.report {
+		return errors.New("acknowledged terminal report no longer matches queued payload")
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove acknowledged terminal report: %w", err)
 	}

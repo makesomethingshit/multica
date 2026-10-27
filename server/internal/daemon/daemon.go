@@ -6350,12 +6350,6 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 	if _, err := persistedTerminalReport(report, time.Now()); err != nil {
 		return err
 	}
-	release, ok := d.beginTerminalReportDelivery(report.taskID)
-	if !ok {
-		return fmt.Errorf("terminal task report for %s is already being delivered", report.taskID)
-	}
-	defer release()
-
 	persisted := false
 	if d.terminalReports != nil {
 		if err := d.terminalReports.enqueue(report); err != nil {
@@ -6371,6 +6365,14 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 			persisted = true
 		}
 	}
+	release, ok := d.beginTerminalReportDelivery(report.taskID)
+	if !ok {
+		if persisted {
+			d.signalTerminalReportReplay()
+		}
+		return fmt.Errorf("terminal task report for %s is already being delivered", report.taskID)
+	}
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), terminalTaskReportTimeout)
 	defer cancel()
